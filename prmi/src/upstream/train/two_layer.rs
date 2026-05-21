@@ -1,10 +1,7 @@
-// < begin copyright >
-// Copyright Ryan Marcus 2020
+// Copyright Ryan Marcus 2020          (origin: learnedsystems/RMI)
+// Copyright 2022 Youngmok Jung et al. (origin: kaist-ina/BWA-MEME RMI fork)
 // Modified by Fulcrum Genomics 2026
-//
-// See root directory of this project for license terms.
-//
-// < end copyright >
+// SPDX-License-Identifier: MIT
 
 use super::super::models::TrainingKey;
 use super::super::models::*;
@@ -27,6 +24,98 @@ fn build_models_from<T: TrainingKey>(
     first_model_idx: usize,
     num_models: usize,
 ) -> Vec<Box<dyn Model>> {
+    assert!(
+        end_idx > start_idx,
+        "start index was {} but end index was {}",
+        start_idx,
+        end_idx
+    );
+    assert!(end_idx <= data.len());
+    assert!(start_idx <= data.len());
+
+    let dummy_md = RMITrainingData::<T>::empty();
+    let mut leaf_models: Vec<Box<dyn Model>> = Vec::with_capacity(num_models as usize);
+    let mut second_layer_data = Vec::with_capacity((end_idx - start_idx) / num_models as usize);
+    let mut last_target = first_model_idx;
+
+    let bounded_it = data.iter().skip(start_idx).take(end_idx - start_idx);
+
+    for (x, y) in bounded_it {
+        let model_pred = top_model.predict_to_int(&x.to_model_input()) as usize;
+        assert!(
+            top_model.needs_bounds_check() || model_pred < first_model_idx + num_models,
+            "Top model gave an index of {} which is out of bounds of {}. \
+                Subset range: {} to {}",
+            model_pred,
+            start_idx + num_models,
+            start_idx,
+            end_idx
+        );
+        let target = usize::min(first_model_idx + num_models - 1, model_pred);
+        assert!(target >= last_target);
+
+        if target > last_target {
+            // this is the first datapoint for the next leaf model.
+            // train the previous leaf model.
+
+            // include the first point of the next leaf node to
+            // support lower bound searches (not required, but reduces error)
+            let last_item = second_layer_data.last().copied();
+            second_layer_data.push((x, y));
+
+            let container = RMITrainingData::new(Box::new(second_layer_data));
+            let leaf_model = train_model(model_type, &container);
+            leaf_models.push(leaf_model);
+
+            // leave empty models for any we skipped.
+            for _skipped_idx in (last_target + 1)..target {
+                leaf_models.push(train_model(model_type, &dummy_md));
+            }
+            assert_eq!(leaf_models.len() + first_model_idx, target);
+
+            second_layer_data = Vec::new();
+
+            // include the last item of this leaf in the next leaf
+            // to support lower bound searches.
+            if let Some(v) = last_item {
+                second_layer_data.push(v);
+            }
+        }
+
+        second_layer_data.push((x, y));
+        last_target = target;
+    }
+
+    // train the last remaining model
+    assert!(!second_layer_data.is_empty());
+    let container = RMITrainingData::new(Box::new(second_layer_data));
+    let leaf_model = train_model(model_type, &container);
+    leaf_models.push(leaf_model);
+    assert!(leaf_models.len() <= num_models);
+
+    // add models at the end with nothing mapped into them
+    for _skipped_idx in (last_target + 1)..(first_model_idx + num_models) as usize {
+        leaf_models.push(train_model(model_type, &dummy_md));
+    }
+    assert_eq!(num_models as usize, leaf_models.len());
+    return leaf_models;
+}
+
+// called in build_partial_3layer_models_from (Task 15.5e)
+#[allow(dead_code)]
+fn build_partial_models_from<T: TrainingKey>(
+    data: &RMITrainingData<T>,
+    top_model: &Box<dyn Model>,
+    model_type: &str,
+    start_idx: usize,
+    end_idx: usize,
+    first_model_idx: usize,
+    num_models: usize,
+    top_model_offset: u64,
+) -> Vec<Box<dyn Model>> {
+    // reserved for future use; matches BWA-MEME signature for call compatibility
+    let _ = top_model_offset;
+
     assert!(
         end_idx > start_idx,
         "start index was {} but end index was {}",
