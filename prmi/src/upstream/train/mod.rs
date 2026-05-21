@@ -1,10 +1,7 @@
-// < begin copyright >
-// Copyright Ryan Marcus 2020
+// Copyright Ryan Marcus 2020          (origin: learnedsystems/RMI)
+// Copyright 2022 Youngmok Jung et al. (origin: kaist-ina/BWA-MEME RMI fork)
 // Modified by Fulcrum Genomics 2026
-//
-// See root directory of this project for license terms.
-//
-// < end copyright >
+// SPDX-License-Identifier: MIT
 
 #![allow(
     clippy::all,
@@ -53,6 +50,13 @@ fn train_model<T: TrainingKey>(model_type: &str, data: &RMITrainingData<T>) -> B
         "loglinear" => Box::new(LogLinearModel::new(data)),
         "normal" => Box::new(NormalModel::new(data)),
         "lognormal" => Box::new(LogNormalModel::new(data)),
+        "pwl" => Box::new(PiecewiselinearModel::new(data, 28)),
+        "pwl20" => Box::new(PiecewiselinearModel::new(data, 20)),
+        "pwl22" => Box::new(PiecewiselinearModel::new(data, 22)),
+        "pwl24" => Box::new(PiecewiselinearModel::new(data, 24)),
+        "pwl26" => Box::new(PiecewiselinearModel::new(data, 26)),
+        "pwl28" => Box::new(PiecewiselinearModel::new(data, 28)),
+        "pwl30" => Box::new(PiecewiselinearModel::new(data, 30)),
         "radix" => Box::new(RadixModel::new(data)),
         "radix8" => Box::new(RadixTable::new(data, 8)),
         "radix18" => Box::new(RadixTable::new(data, 18)),

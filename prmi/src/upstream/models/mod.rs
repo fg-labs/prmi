@@ -1,10 +1,7 @@
-// < begin copyright >
-// Copyright Ryan Marcus 2020
+// Copyright Ryan Marcus 2020          (origin: learnedsystems/RMI)
+// Copyright 2022 Youngmok Jung et al. (origin: kaist-ina/BWA-MEME RMI fork)
 // Modified by Fulcrum Genomics 2026
-//
-// See root directory of this project for license terms.
-//
-// < end copyright >
+// SPDX-License-Identifier: MIT
 
 #![allow(
     clippy::all,
@@ -20,6 +17,7 @@ mod histogram;
 mod linear;
 mod linear_spline;
 mod normal;
+mod piecewiselinear;
 mod radix;
 mod stdlib;
 mod utils;
@@ -33,6 +31,7 @@ pub use linear::RobustLinearModel;
 pub use linear_spline::LinearSplineModel;
 pub use normal::LogNormalModel;
 pub use normal::NormalModel;
+pub use piecewiselinear::PiecewiselinearModel;
 pub use radix::RadixModel;
 pub use radix::RadixTable;
 pub use stdlib::StdFunctions;
