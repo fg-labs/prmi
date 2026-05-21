@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 
 use prmi::Error;
-use std::error::Error as _;
 
 #[test]
 fn error_display_includes_kind() {

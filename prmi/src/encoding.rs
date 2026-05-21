@@ -33,13 +33,17 @@ pub fn base_to_2bit(b: u8) -> Option<u8> {
 /// the remaining low-bit slots are padded with `BASE_T` (0b11) so that keys
 /// sort identically to their underlying sequences as `u64`.
 ///
+/// The `len` parameter controls how many bases are active: pass `len < bases.len()`
+/// to use only a prefix of the slice (e.g., for SA positions near the genome end);
+/// `bases[..len]` is the active window. The caller may pass any value of `len`;
+/// it is clamped to `min(KMER_LEN, bases.len())` internally.
+///
 /// Panics in debug if any byte in `bases[..len]` is > 3.
 #[inline]
 pub fn tokenize_32mer(bases: &[u8], len: usize) -> u64 {
-    let len = len.min(KMER_LEN);
+    let len = len.min(KMER_LEN).min(bases.len());
     let mut key: u64 = 0;
-    for i in 0..KMER_LEN {
-        let shift = 2 * (KMER_LEN - 1 - i);
+    for (i, shift) in (0..KMER_LEN).map(|i| (i, 2 * (KMER_LEN - 1 - i))) {
         let b = if i < len {
             let v = bases[i];
             debug_assert!(v <= 3, "tokenize_32mer: base byte {v} > 3");

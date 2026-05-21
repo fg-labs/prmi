@@ -5,8 +5,10 @@
 // See root directory of this project for license terms.
 //
 // < end copyright >
- 
- 
+
+// Legacy Marcus binary — silence all lints; this file is replaced in Task 19.
+#![allow(clippy::all, unused_imports, unused_variables, dead_code)]
+
 use memmap::MmapOptions;
 use crate::upstream::{RMITrainingData, RMITrainingDataIteratorProvider, KeyType};
 use byteorder::{LittleEndian, ReadBytesExt};

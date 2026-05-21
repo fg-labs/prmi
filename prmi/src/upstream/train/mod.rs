@@ -3,9 +3,17 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
+
+#![allow(
+    clippy::all,
+    unused_imports,
+    unused_variables,
+    unused_assignments,
+    dead_code,
+    dropping_references
+)]
 
 use super::models::*;
 use super::cache_fix::cache_fix;

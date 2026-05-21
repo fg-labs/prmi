@@ -8,7 +8,8 @@
  
  
 
-#![allow(clippy::needless_return)]
+// Legacy Marcus binary — silence all lints; this file is replaced in Task 19.
+#![allow(clippy::all, unused_imports, unused_variables, dead_code)]
 
 #[macro_use]
 mod load;

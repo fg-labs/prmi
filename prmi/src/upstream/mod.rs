@@ -1,11 +1,19 @@
 // Copyright Ryan Marcus 2020
 // Modified by Fulcrum Genomics 2026
 
+#![allow(clippy::all)]
+#![allow(unused_imports, unused_variables, unused_assignments, dead_code)]
+
+#[allow(clippy::all, unused_imports, unused_variables, unused_assignments, dead_code)]
 mod codegen;
+#[allow(clippy::all, unused_imports, unused_variables, unused_assignments, dead_code)]
 mod models;
+#[allow(clippy::all, unused_imports, unused_variables, unused_assignments, dead_code)]
 mod train;
+#[allow(clippy::all, unused_imports, unused_variables, unused_assignments, dead_code)]
 mod cache_fix;
 
+#[allow(clippy::all, unused_imports, unused_variables, unused_assignments, dead_code)]
 pub mod optimizer;
 pub use models::{RMITrainingData, RMITrainingDataIteratorProvider, ModelInput};
 pub use models::KeyType;
