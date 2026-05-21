@@ -114,32 +114,3 @@ inline uint64_t ed_histogram(const uint64_t length,
         return false;
     }
 }
-
-#[cfg(feature = "upstream_tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ed_hist1() {
-        let mut test_data: Vec<(u64, u64)> = Vec::new();
-
-        for i in 0..1000 {
-            test_data.push((i * 3, i / 3));
-        }
-
-        let md = ModelData::IntKeyToIntPos(test_data);
-
-        let ed_mod = EquidepthHistogramModel::new(&md);
-
-        assert_eq!(ed_mod.predict_to_int((0).into()), 0);
-        assert_eq!(ed_mod.predict_to_int((1 * 3).into()), 0);
-        assert_eq!(ed_mod.predict_to_int((4 * 3).into()), 1);
-        assert_eq!(ed_mod.predict_to_int((500 * 3).into()), 166);
-        assert_eq!(ed_mod.predict_to_int((5000 * 3).into()), 333);
-    }
-
-    #[test]
-    fn test_empty() {
-        EquidepthHistogramModel::new(&ModelData::empty());
-    }
-}

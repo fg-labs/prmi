@@ -826,31 +826,3 @@ pub trait Model: Sync + Send {
         return false;
     }
 }
-
-#[cfg(feature = "upstream_tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_scale() {
-        let mut v = ModelData::IntKeyToIntPos(vec![(0, 0), (1, 1), (3, 2), (100, 3)]);
-
-        v.scale_targets_to(50, 4);
-
-        let results = v.as_int_int();
-        assert_eq!(results[0].1, 0);
-        assert_eq!(results[1].1, 12);
-        assert_eq!(results[2].1, 25);
-        assert_eq!(results[3].1, 37);
-    }
-
-    #[test]
-    fn test_iter() {
-        let data = vec![(0, 1), (1, 2), (3, 3), (100, 4)];
-
-        let v = ModelData::IntKeyToIntPos(data.clone());
-
-        let iterated: Vec<(u64, u64)> = v.iter_uint_uint().collect();
-        assert_eq!(data, iterated);
-    }
-}

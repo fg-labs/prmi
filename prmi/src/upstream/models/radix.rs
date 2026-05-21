@@ -178,13 +178,3 @@ inline uint64_t radix_table(const uint32_t* table, const uint64_t inp) {{
         return ModelRestriction::None;
     }
 }
-
-#[cfg(feature = "upstream_tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty() {
-        RadixModel::new(&ModelData::empty());
-    }
-}

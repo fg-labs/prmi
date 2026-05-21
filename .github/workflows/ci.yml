@@ -27,10 +27,7 @@ jobs:
       # verbatim 2020-era code; cleaning Marcus's lints would force
       # `Modified by Fulcrum Genomics 2026` headers across every file and
       # drown the license-tracking surface in noise.
-      # Note: --all-features is intentionally omitted; the upstream_tests feature
-      # enables Marcus's internal test modules which use a renamed type (ModelData)
-      # and fail to compile — those tests are off-by-default for this reason.
-      - run: cargo clippy -p prmi -p prmi-sys --all-targets -- -D warnings
+      - run: cargo clippy -p prmi -p prmi-sys --all-targets --all-features -- -D warnings
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 

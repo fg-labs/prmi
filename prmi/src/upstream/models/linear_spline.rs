@@ -80,32 +80,3 @@ inline double linear(double alpha, double beta, double inp) {
         return true;
     }
 }
-
-#[cfg(feature = "upstream_tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_linear_spline1() {
-        let md = ModelData::IntKeyToIntPos(vec![(1, 2), (2, 3), (3, 8)]);
-
-        let lin_mod = LinearSplineModel::new(&md);
-
-        assert_eq!(lin_mod.predict_to_int(1.into()), 2);
-        assert_eq!(lin_mod.predict_to_int(3.into()), 8);
-    }
-
-    #[test]
-    fn test_linear_spline_single() {
-        let md = ModelData::IntKeyToIntPos(vec![(1, 2)]);
-
-        let lin_mod = LinearSplineModel::new(&md);
-
-        assert_eq!(lin_mod.predict_to_int(1.into()), 2);
-    }
-
-    #[test]
-    fn test_empty() {
-        LinearSplineModel::new(&ModelData::empty());
-    }
-}

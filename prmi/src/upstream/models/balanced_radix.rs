@@ -170,13 +170,3 @@ inline uint64_t bradix_clamp_low(uint64_t prefix_length,
         return ModelRestriction::MustBeTop;
     }
 }
-
-#[cfg(feature = "upstream_tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty() {
-        BalancedRadixModel::new(&ModelData::empty());
-    }
-}

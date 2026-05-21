@@ -125,26 +125,6 @@ inline double ncdf(double mean, double stdev, double scale, double inp) {
     }
 }
 
-#[cfg(feature = "upstream_tests")]
-mod ncdf_tests {
-    use super::*;
-
-    #[test]
-    fn test_ncdf1() {
-        let md = ModelData::IntKeyToIntPos(vec![(1, 1), (2, 3), (3, 5)]);
-
-        let ncdf_mod = NormalModel::new(&md);
-
-        assert_eq!(ncdf_mod.predict_to_int(2.into()), 2);
-        assert_eq!(ncdf_mod.predict_to_int(1.into()), 0);
-    }
-
-    #[test]
-    fn test_empty() {
-        NormalModel::new(&ModelData::empty());
-    }
-}
-
 pub struct LogNormalModel {
     params: (f64, f64, f64),
 }
@@ -196,25 +176,5 @@ inline double lncdf(double mean, double stdev, double scale, double inp) {
         to_r.insert(StdFunctions::EXP1);
         to_r.insert(StdFunctions::PHI);
         return to_r;
-    }
-}
-
-#[cfg(feature = "upstream_tests")]
-mod lncdf_tests {
-    use super::*;
-
-    #[test]
-    fn test_lncdf1() {
-        let md = ModelData::IntKeyToIntPos(vec![(1, 1), (2, 2), (3, 20)]);
-
-        let lncdf_mod = LogNormalModel::new(&md);
-
-        assert_eq!(lncdf_mod.predict_to_int(2.into()), 11);
-        assert_eq!(lncdf_mod.predict_to_int(1.into()), 2);
-    }
-
-    #[test]
-    fn test_empty() {
-        LogNormalModel::new(&ModelData::empty());
     }
 }

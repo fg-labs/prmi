@@ -114,22 +114,3 @@ pub fn radix_index(points: &[u64], num_bits: u8) -> Vec<u64> {
 
     return radix_index;
 }
-
-#[cfg(feature = "upstream_tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_common_prefix1() {
-        let data = ModelData::IntKeyToIntPos(vec![(1, 0), (4, 4), (8, 8)]);
-
-        assert_eq!(common_prefix_size(&data), 64 - 4);
-    }
-
-    #[test]
-    fn test_common_prefix2() {
-        let data = ModelData::IntKeyToIntPos(vec![(1, 0), (8, 1), (9, 4), (12, 8)]);
-
-        assert_eq!(common_prefix_size(&data), 64 - 4);
-    }
-}

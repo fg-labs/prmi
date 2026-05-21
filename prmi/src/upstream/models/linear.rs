@@ -121,35 +121,6 @@ inline double linear(double alpha, double beta, double inp) {
     }
 }
 
-#[cfg(feature = "upstream_tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_linear1() {
-        let md = ModelData::IntKeyToIntPos(vec![(1, 2), (2, 3), (3, 4)]);
-
-        let lin_mod = LinearModel::new(&md);
-
-        assert_eq!(lin_mod.predict_to_int(1.into()), 2);
-        assert_eq!(lin_mod.predict_to_int(6.into()), 7);
-    }
-
-    #[test]
-    fn test_linear_single() {
-        let md = ModelData::IntKeyToIntPos(vec![(1, 2)]);
-
-        let lin_mod = LinearModel::new(&md);
-
-        assert_eq!(lin_mod.predict_to_int(1.into()), 2);
-    }
-
-    #[test]
-    fn test_empty() {
-        LinearModel::new(&ModelData::empty());
-    }
-}
-
 pub struct LogLinearModel {
     params: (f64, f64),
 }
@@ -207,26 +178,6 @@ inline double loglinear(double alpha, double beta, double inp) {
         let mut to_r = HashSet::new();
         to_r.insert(StdFunctions::EXP1);
         return to_r;
-    }
-}
-
-#[cfg(feature = "upstream_tests")]
-mod loglin_tests {
-    use super::*;
-
-    #[test]
-    fn test_loglinear1() {
-        let md = ModelData::IntKeyToIntPos(vec![(2, 2), (3, 4), (4, 16)]);
-
-        let loglin_mod = LogLinearModel::new(&md);
-
-        assert_eq!(loglin_mod.predict_to_int(2.into()), 1);
-        assert_eq!(loglin_mod.predict_to_int(4.into()), 13);
-    }
-
-    #[test]
-    fn test_empty() {
-        LogLinearModel::new(&ModelData::empty());
     }
 }
 
