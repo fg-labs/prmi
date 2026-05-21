@@ -3,10 +3,8 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
- 
+//
+// < end copyright >
 
 use super::*;
 
@@ -28,8 +26,8 @@ fn linear_splines<T: TrainingKey>(data: &RMITrainingData<T>) -> (f64, f64) {
         return (data.get(0).1 as f64, 0.0);
     }
 
-    let slope = (first_pt.1 as f64 - last_pt.1 as f64)
-        / (first_pt.0.as_float() - last_pt.0.as_float());
+    let slope =
+        (first_pt.1 as f64 - last_pt.1 as f64) / (first_pt.0.as_float() - last_pt.0.as_float());
     let intercept = first_pt.1 as f64 - slope * first_pt.0.as_float();
 
     return (intercept, slope);
@@ -110,5 +108,4 @@ mod tests {
     fn test_empty() {
         LinearSplineModel::new(&ModelData::empty());
     }
-
 }

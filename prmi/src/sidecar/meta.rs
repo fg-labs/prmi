@@ -130,7 +130,9 @@ impl Meta {
             });
         }
         if !KNOWN_PRIORS_V01.contains(&self.priors.kind.as_str()) {
-            return Err(Error::FormatTooNew { kind: self.priors.kind.clone() });
+            return Err(Error::FormatTooNew {
+                kind: self.priors.kind.clone(),
+            });
         }
         if self.sa.bytes_per_entry != 5 {
             return Err(Error::SizeMismatch {
@@ -150,4 +152,3 @@ impl Meta {
         Ok(())
     }
 }
-

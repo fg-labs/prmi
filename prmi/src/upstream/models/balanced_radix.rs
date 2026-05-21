@@ -3,9 +3,8 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
 
 use super::utils::{common_prefix_size, num_bits};
 use super::*;
@@ -18,9 +17,11 @@ pub struct BalancedRadixModel {
     high: bool,
 }
 
-fn chi2<T: TrainingKey>(data: &RMITrainingData<T>,
-                       max_bin: u64,
-                       model: &BalancedRadixModel) -> f64 {
+fn chi2<T: TrainingKey>(
+    data: &RMITrainingData<T>,
+    max_bin: u64,
+    model: &BalancedRadixModel,
+) -> f64 {
     // compute the x^2 value of the distribution
     // induced by this model.
     let mut counts = vec![0; max_bin as usize];
@@ -178,5 +179,4 @@ mod tests {
     fn test_empty() {
         BalancedRadixModel::new(&ModelData::empty());
     }
-
 }

@@ -3,15 +3,12 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
- 
+//
+// < end copyright >
 
 use super::*;
 
 fn slr<T: Iterator<Item = (f64, f64)>>(loc_data: T) -> (f64, f64) {
-
     // compute the covariance of x and y as well as the variance of x in
     // a single pass.
 
@@ -43,10 +40,13 @@ fn slr<T: Iterator<Item = (f64, f64)>>(loc_data: T) -> (f64, f64) {
         return (mean_y, 0.0);
     }
 
-
     let cov = c / ((n - 1) as f64);
     let var = m2 / ((n - 1) as f64);
-    assert!(var >= 0.0, "variance of model with {} data items was negative", n);
+    assert!(
+        var >= 0.0,
+        "variance of model with {} data items was negative",
+        n
+    );
 
     if var == 0.0 {
         // variance is zero. pick the mean (only) value.
@@ -78,8 +78,9 @@ pub struct LinearModel {
 
 impl LinearModel {
     pub fn new<T: TrainingKey>(data: &RMITrainingData<T>) -> LinearModel {
-        let params = slr(data.iter()
-                         .map(|(inp, offset)| (inp.as_float(), offset as f64)));
+        let params = slr(data
+            .iter()
+            .map(|(inp, offset)| (inp.as_float(), offset as f64)));
         return LinearModel { params };
     }
 }
@@ -147,7 +148,6 @@ mod tests {
     fn test_empty() {
         LinearModel::new(&ModelData::empty());
     }
-
 }
 
 pub struct LogLinearModel {
@@ -230,33 +230,26 @@ mod loglin_tests {
     }
 }
 
-
 pub struct RobustLinearModel {
     params: (f64, f64),
 }
-
 
 impl RobustLinearModel {
     pub fn new<T: TrainingKey>(data: &RMITrainingData<T>) -> RobustLinearModel {
         let total_items = data.len();
         if data.len() == 0 {
-            return RobustLinearModel {
-                params: (0.0, 0.0)
-            };
+            return RobustLinearModel { params: (0.0, 0.0) };
         }
-        
-        let bnd = usize::max(1, ((total_items as f64) * 0.0001) as usize);
-        assert!(bnd*2+1 < data.len());
-        
-        let iter = data.iter()
-            .skip(bnd)
-            .take(data.len() - 2*bnd);
 
-        let robust_params = slr(iter
-                                .map(|(inp, offset)| (inp.as_float(), offset as f64)));
-        
+        let bnd = usize::max(1, ((total_items as f64) * 0.0001) as usize);
+        assert!(bnd * 2 + 1 < data.len());
+
+        let iter = data.iter().skip(bnd).take(data.len() - 2 * bnd);
+
+        let robust_params = slr(iter.map(|(inp, offset)| (inp.as_float(), offset as f64)));
+
         return RobustLinearModel {
-            params: robust_params
+            params: robust_params,
         };
     }
 }
@@ -286,7 +279,7 @@ inline double linear(double alpha, double beta, double inp) {
 }",
         );
     }
-    
+
     fn function_name(&self) -> String {
         return String::from("linear");
     }

@@ -22,8 +22,10 @@ pub const MAX_PACKED_POSITION: u64 = (1u64 << 40) - 1;
 /// Panics if `pos > MAX_PACKED_POSITION`.
 #[inline]
 pub fn pack_position(pos: u64) -> [u8; BYTES_PER_PACKED_ENTRY] {
-    assert!(pos <= MAX_PACKED_POSITION,
-            "SA position {pos} exceeds 40-bit packing limit");
+    assert!(
+        pos <= MAX_PACKED_POSITION,
+        "SA position {pos} exceeds 40-bit packing limit"
+    );
     let mut out = [0u8; BYTES_PER_PACKED_ENTRY];
     let hi = (pos >> 8) as u32;
     let lo = (pos & 0xff) as u8;

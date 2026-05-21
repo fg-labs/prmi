@@ -1,0 +1,2 @@
+max_width = 100
+ignore = ["prmi/src/upstream", "prmi/src/main.rs", "prmi/src/load.rs"]

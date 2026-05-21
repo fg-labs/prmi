@@ -1,15 +1,15 @@
 // Copyright Ryan Marcus 2020
 // Modified by Fulcrum Genomics 2026
 
+use super::codegen;
 use super::models::*;
 use super::train;
-use super::codegen;
-use log::*;
+use indicatif::ProgressBar;
 use json::*;
-use indicatif::{ProgressBar};
+use log::*;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
-use tabular::{Table, row};
+use tabular::{row, Table};
 
 //const TOP_ONLY_LAYERS: &[&str] = &["radix", "radix18", "radix22", "robust_linear"];
 //const ANYWHERE_LAYERS: &[&str] = &["linear", "cubic", "linear_spline"];
@@ -18,42 +18,43 @@ use tabular::{Table, row};
 fn top_only_layers() -> Vec<&'static str> {
     return match std::env::var_os("RMI_OPTIMIZER_PROFILE") {
         None => vec!["radix", "radix18", "radix22", "robust_linear"],
-        Some(x) => {
-            match x.to_str().unwrap() {
-                "fast" => vec!["robust_linear"],
-                "memory" => vec!["radix", "radix18", "radix22", "robust_linear"],
-                "disk" => vec!["radix", "radix18", "radix22", "robust_linear",
-                               "normal", "lognormal", "loglinear"],
-                _ => panic!("Invalid optimizer profile {}", x.to_str().unwrap())
-            }
-        }
+        Some(x) => match x.to_str().unwrap() {
+            "fast" => vec!["robust_linear"],
+            "memory" => vec!["radix", "radix18", "radix22", "robust_linear"],
+            "disk" => vec![
+                "radix",
+                "radix18",
+                "radix22",
+                "robust_linear",
+                "normal",
+                "lognormal",
+                "loglinear",
+            ],
+            _ => panic!("Invalid optimizer profile {}", x.to_str().unwrap()),
+        },
     };
 }
 
 fn anywhere_layers() -> Vec<&'static str> {
     return match std::env::var_os("RMI_OPTIMIZER_PROFILE") {
         None => vec!["linear", "cubic", "linear_spline"],
-        Some(x) => {
-            match x.to_str().unwrap() {
-                "fast" => vec!["linear", "cubic"],
-                "memory" | "disk" => vec!["linear", "cubic", "linear_spline"],
-                _ => panic!("Invalid optimizer profile {}", x.to_str().unwrap())
-            }
-        }
+        Some(x) => match x.to_str().unwrap() {
+            "fast" => vec!["linear", "cubic"],
+            "memory" | "disk" => vec!["linear", "cubic", "linear_spline"],
+            _ => panic!("Invalid optimizer profile {}", x.to_str().unwrap()),
+        },
     };
 }
 
 fn get_branching_factors() -> Vec<u64> {
     let range = match std::env::var_os("RMI_OPTIMIZER_PROFILE") {
         None => (6..25).step_by(1),
-        Some(x) => {
-            match x.to_str().unwrap() {
-                "fast" => (6..25).step_by(2),
-                "memory" => (6..25).step_by(1),
-                "disk" => (6..28).step_by(1),
-                _ => panic!("Invalid optimizer profile {}", x.to_str().unwrap())
-            }
-        }
+        Some(x) => match x.to_str().unwrap() {
+            "fast" => (6..25).step_by(2),
+            "memory" => (6..25).step_by(1),
+            "disk" => (6..28).step_by(1),
+            _ => panic!("Invalid optimizer profile {}", x.to_str().unwrap()),
+        },
     };
 
     return range.map(|i| (2 as u64).pow(i)).collect();
@@ -81,18 +82,22 @@ fn narrow_front(results: &[RMIStatistics], desired_size: usize) -> Vec<RMIStatis
     }
 
     let mut tmp = results.to_vec();
-    tmp.sort_by(
-        |a, b| a.size.partial_cmp(&b.size).unwrap()
-    );
+    tmp.sort_by(|a, b| a.size.partial_cmp(&b.size).unwrap());
 
     let best_mod = tmp.remove(0);
     while tmp.len() > desired_size - 1 {
         // find the two items closest in size and remove less accuracte one.
-        let smallest_gap =
-            (0..tmp.len()-1).zip(1..tmp.len())
-            .map(|(idx1, idx2)| (idx1, idx2,
-                                 (tmp[idx2].size as f64) / (tmp[idx1].size as f64)))
-            .min_by(|(_, _, v1), (_, _, v2)| v1.partial_cmp(v2).unwrap()).unwrap();
+        let smallest_gap = (0..tmp.len() - 1)
+            .zip(1..tmp.len())
+            .map(|(idx1, idx2)| {
+                (
+                    idx1,
+                    idx2,
+                    (tmp[idx2].size as f64) / (tmp[idx1].size as f64),
+                )
+            })
+            .min_by(|(_, _, v1), (_, _, v2)| v1.partial_cmp(v2).unwrap())
+            .unwrap();
 
         let err1 = tmp[smallest_gap.0].average_log2_error;
         let err2 = tmp[smallest_gap.1].average_log2_error;
@@ -105,9 +110,6 @@ fn narrow_front(results: &[RMIStatistics], desired_size: usize) -> Vec<RMIStatis
     tmp.insert(0, best_mod);
 
     return tmp;
-
-    
-
 }
 
 fn first_phase_configs() -> Vec<(String, u64)> {
@@ -115,7 +117,7 @@ fn first_phase_configs() -> Vec<(String, u64)> {
     let mut all_top_models = Vec::new();
     all_top_models.extend(top_only_layers());
     all_top_models.extend(anywhere_layers());
-    
+
     for top_model in all_top_models {
         for bottom_model in anywhere_layers() {
             for branching_factor in get_branching_factors().iter().step_by(5) {
@@ -137,19 +139,25 @@ fn second_phase_configs(first_phase: &[RMIStatistics]) -> Vec<(String, u64)> {
         qualifying
     };
 
-    info!("Qualifying model types for phase 2: {:?}", qualifying_model_configs);
+    info!(
+        "Qualifying model types for phase 2: {:?}",
+        qualifying_model_configs
+    );
     let mut results = Vec::new();
 
     for model in qualifying_model_configs.iter() {
         for branching_factor in get_branching_factors() {
-            if first_phase.iter().any(|v| v.has_config(&model, branching_factor)) {
+            if first_phase
+                .iter()
+                .any(|v| v.has_config(&model, branching_factor))
+            {
                 continue;
             }
 
             results.push((model.clone(), branching_factor));
         }
     }
-    
+
     return results;
 }
 
@@ -159,7 +167,7 @@ pub struct RMIStatistics {
     pub branching_factor: u64,
     pub average_log2_error: f64,
     pub max_log2_error: f64,
-    pub size: u64
+    pub size: u64,
 }
 
 impl RMIStatistics {
@@ -169,13 +177,17 @@ impl RMIStatistics {
             max_log2_error: rmi.model_max_log2_error,
             size: codegen::rmi_size(&rmi),
             models: rmi.models.clone(),
-            branching_factor: rmi.branching_factor
+            branching_factor: rmi.branching_factor,
         };
     }
 
     fn dominated_by(&self, other: &RMIStatistics) -> bool {
-        if self.size < other.size { return false; }
-        if self.average_log2_error < other.average_log2_error { return false; }
+        if self.size < other.size {
+            return false;
+        }
+        if self.average_log2_error < other.average_log2_error {
+            return false;
+        }
 
         if self.size == other.size && self.average_log2_error <= other.average_log2_error {
             return false;
@@ -195,19 +207,26 @@ impl RMIStatistics {
 
     pub fn display_table(itms: &[RMIStatistics]) {
         let mut table = Table::new("{:<} {:>} {:>} {:>} {:>}");
-        table.add_row(row!("Models", "Branch", "   AvgLg2",
-                           "   MaxLg2", "   Size (b)"));
+        table.add_row(row!(
+            "Models",
+            "Branch",
+            "   AvgLg2",
+            "   MaxLg2",
+            "   Size (b)"
+        ));
         for itm in itms {
-            table.add_row(row!(itm.models.clone(),
-                               format!("{:10}", itm.branching_factor),
-                               format!("     {:2.5}", itm.average_log2_error),
-                               format!("     {:2.5}", itm.max_log2_error),
-                               format!("     {}", itm.size)));
+            table.add_row(row!(
+                itm.models.clone(),
+                format!("{:10}", itm.branching_factor),
+                format!("     {:2.5}", itm.average_log2_error),
+                format!("     {:2.5}", itm.max_log2_error),
+                format!("     {}", itm.size)
+            ));
         }
 
         print!("{}", table);
     }
-    
+
     pub fn to_grid_spec(&self, namespace: &str) -> JsonValue {
         return object!(
             "layers" => self.models.clone(),
@@ -220,33 +239,40 @@ impl RMIStatistics {
     }
 }
 
-fn measure_rmis<T: TrainingKey>(data: &RMITrainingData<T>,
-                configs: &[(String, u64)]) -> Vec<RMIStatistics> {
+fn measure_rmis<T: TrainingKey>(
+    data: &RMITrainingData<T>,
+    configs: &[(String, u64)],
+) -> Vec<RMIStatistics> {
     let pbar = ProgressBar::new(configs.len() as u64);
-    
-   configs.par_iter()
+
+    configs
+        .par_iter()
         .map(|(models, branch_factor)| {
             let mut loc_data = data.soft_copy();
             let res = train::train(&mut loc_data, models, *branch_factor);
             pbar.inc(1);
             RMIStatistics::from_trained(&res)
-        }).collect()
+        })
+        .collect()
 }
 
 pub fn find_pareto_efficient_configs<T: TrainingKey>(
-    data: &RMITrainingData<T>, restrict: usize)
-    -> Vec<RMIStatistics>{
-    let initial_configs  = first_phase_configs();
+    data: &RMITrainingData<T>,
+    restrict: usize,
+) -> Vec<RMIStatistics> {
+    let initial_configs = first_phase_configs();
     let first_phase_results = measure_rmis(data, &initial_configs);
 
     let next_configs = second_phase_configs(&first_phase_results);
     let second_phase_results = measure_rmis(data, &next_configs);
-    
+
     let mut final_front = pareto_front(&second_phase_results);
     final_front = narrow_front(&final_front, restrict);
-    final_front.sort_by(
-        |a, b| a.average_log2_error.partial_cmp(&b.average_log2_error).unwrap()
-    );
+    final_front.sort_by(|a, b| {
+        a.average_log2_error
+            .partial_cmp(&b.average_log2_error)
+            .unwrap()
+    });
 
     return final_front;
 }

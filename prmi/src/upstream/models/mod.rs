@@ -6,7 +6,13 @@
 //
 // < end copyright >
 
-#![allow(clippy::all, unused_imports, unused_variables, unused_assignments, dead_code)]
+#![allow(
+    clippy::all,
+    unused_imports,
+    unused_variables,
+    unused_assignments,
+    dead_code
+)]
 
 mod balanced_radix;
 mod cubic_spline;
@@ -22,8 +28,8 @@ pub use balanced_radix::BalancedRadixModel;
 pub use cubic_spline::CubicSplineModel;
 pub use histogram::EquidepthHistogramModel;
 pub use linear::LinearModel;
-pub use linear::RobustLinearModel;
 pub use linear::LogLinearModel;
+pub use linear::RobustLinearModel;
 pub use linear_spline::LinearSplineModel;
 pub use normal::LogNormalModel;
 pub use normal::NormalModel;
@@ -31,16 +37,18 @@ pub use radix::RadixModel;
 pub use radix::RadixTable;
 pub use stdlib::StdFunctions;
 
+use byteorder::{LittleEndian, WriteBytesExt};
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::io::Write;
-use byteorder::{WriteBytesExt, LittleEndian};
-
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub enum KeyType {
-    U32, U64, F64, U128
+    U32,
+    U64,
+    F64,
+    U128,
 }
 
 impl KeyType {
@@ -49,7 +57,7 @@ impl KeyType {
             KeyType::U32 => "uint32_t",
             KeyType::U64 => "uint64_t",
             KeyType::F64 => "double",
-            KeyType::U128 => "uint128_t"
+            KeyType::U128 => "uint128_t",
         }
     }
 
@@ -58,7 +66,7 @@ impl KeyType {
             KeyType::U32 => ModelDataType::Int,
             KeyType::U64 => ModelDataType::Int,
             KeyType::U128 => ModelDataType::Int128,
-            KeyType::F64 => ModelDataType::Float
+            KeyType::F64 => ModelDataType::Float,
         }
     }
 }
@@ -71,49 +79,91 @@ pub trait TrainingKey: PartialEq + Copy + Send + Sync + std::fmt::Debug + 'stati
 
     fn as_float(&self) -> f64;
     fn as_uint(&self) -> u64;
-    
+
     fn to_model_input(&self) -> ModelInput;
 }
 
 impl TrainingKey for u64 {
-    fn minus_epsilon(&self) -> Self { *self - 1 }
-    fn zero_value() -> Self { 0 }
-    fn plus_epsilon(&self) -> Self { *self + 1 }
-    fn max_value() -> Self { std::u64::MAX }
+    fn minus_epsilon(&self) -> Self {
+        *self - 1
+    }
+    fn zero_value() -> Self {
+        0
+    }
+    fn plus_epsilon(&self) -> Self {
+        *self + 1
+    }
+    fn max_value() -> Self {
+        std::u64::MAX
+    }
 
-    fn as_float(&self) -> f64 { *self as f64 }
-    fn as_uint(&self) -> u64 { *self }
-    
-    fn to_model_input(&self) -> ModelInput { (*self).into() }
+    fn as_float(&self) -> f64 {
+        *self as f64
+    }
+    fn as_uint(&self) -> u64 {
+        *self
+    }
+
+    fn to_model_input(&self) -> ModelInput {
+        (*self).into()
+    }
 }
 
 impl TrainingKey for u32 {
-    fn minus_epsilon(&self) -> Self { *self - 1 }
-    fn zero_value() -> Self { 0 }
-    fn plus_epsilon(&self) -> Self { *self + 1 }
-    fn max_value() -> Self { std::u32::MAX }
+    fn minus_epsilon(&self) -> Self {
+        *self - 1
+    }
+    fn zero_value() -> Self {
+        0
+    }
+    fn plus_epsilon(&self) -> Self {
+        *self + 1
+    }
+    fn max_value() -> Self {
+        std::u32::MAX
+    }
 
-    fn as_float(&self) -> f64 { *self as f64 }
-    fn as_uint(&self) -> u64 { *self as u64 }
-    
-    fn to_model_input(&self) -> ModelInput { (*self).into() }
+    fn as_float(&self) -> f64 {
+        *self as f64
+    }
+    fn as_uint(&self) -> u64 {
+        *self as u64
+    }
+
+    fn to_model_input(&self) -> ModelInput {
+        (*self).into()
+    }
 }
 
 impl TrainingKey for f64 {
-    fn minus_epsilon(&self) -> Self { *self - std::f64::EPSILON }
-    fn zero_value() -> Self { 0.0 }
-    fn plus_epsilon(&self) -> Self { *self + std::f64::EPSILON }
-    fn max_value() -> Self { std::f64::MAX }
+    fn minus_epsilon(&self) -> Self {
+        *self - std::f64::EPSILON
+    }
+    fn zero_value() -> Self {
+        0.0
+    }
+    fn plus_epsilon(&self) -> Self {
+        *self + std::f64::EPSILON
+    }
+    fn max_value() -> Self {
+        std::f64::MAX
+    }
 
-    fn as_float(&self) -> f64 { *self }
-    fn as_uint(&self) -> u64 { *self as u64 }
-    
-    fn to_model_input(&self) -> ModelInput { (*self).into() }
+    fn as_float(&self) -> f64 {
+        *self
+    }
+    fn as_uint(&self) -> u64 {
+        *self as u64
+    }
+
+    fn to_model_input(&self) -> ModelInput {
+        (*self).into()
+    }
 }
 
 pub trait RMITrainingDataIteratorProvider: Send + Sync {
     type InpType: TrainingKey;
-    
+
     fn len(&self) -> usize;
     fn cdf_iter(&self) -> Box<dyn Iterator<Item = (Self::InpType, usize)> + '_>;
     fn key_type(&self) -> KeyType;
@@ -122,118 +172,129 @@ pub trait RMITrainingDataIteratorProvider: Send + Sync {
     }
 }
 
-impl <K: TrainingKey> RMITrainingDataIteratorProvider for Vec<(K, usize)> {
+impl<K: TrainingKey> RMITrainingDataIteratorProvider for Vec<(K, usize)> {
     type InpType = K;
     fn len(&self) -> usize {
         return Vec::len(&self);
     }
 
     fn cdf_iter(&self) -> Box<dyn Iterator<Item = (Self::InpType, usize)> + '_> {
-        return Box::new(self.iter()
-                        .cloned()
-                        .map(|(key, offset)| (key.into(), offset)));
+        return Box::new(
+            self.iter()
+                .cloned()
+                .map(|(key, offset)| (key.into(), offset)),
+        );
     }
 
-    fn key_type(&self) -> KeyType { return KeyType::U64; }
+    fn key_type(&self) -> KeyType {
+        return KeyType::U64;
+    }
     fn get(&self, idx: usize) -> Option<(Self::InpType, usize)> {
-        self.as_slice().get(idx).map(|(key, offset)| ((*key).into(), *offset))
+        self.as_slice()
+            .get(idx)
+            .map(|(key, offset)| ((*key).into(), *offset))
     }
 }
 
-
-struct FixDupsIter<K, T: Iterator<Item=(K, usize)>> {
+struct FixDupsIter<K, T: Iterator<Item = (K, usize)>> {
     iter: T,
-    last_item: Option<(K, usize)>
+    last_item: Option<(K, usize)>,
 }
 
-impl <K, T: Iterator<Item=(K, usize)>> FixDupsIter<K, T> {
+impl<K, T: Iterator<Item = (K, usize)>> FixDupsIter<K, T> {
     fn new(iter: T) -> FixDupsIter<K, T> {
-        return FixDupsIter { iter: iter, last_item: None };
+        return FixDupsIter {
+            iter: iter,
+            last_item: None,
+        };
     }
 }
 
-impl <K, T> Iterator for FixDupsIter<K, T> where
-    T: Iterator<Item=(K, usize)>,
-    K: TrainingKey {
+impl<K, T> Iterator for FixDupsIter<K, T>
+where
+    T: Iterator<Item = (K, usize)>,
+    K: TrainingKey,
+{
     type Item = (K, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.last_item {
-            None => {
-                match self.iter.next() {
-                    None => { return None },
-                    Some(itm) => {
-                        self.last_item = Some(itm);
-                        return Some(itm);
-                    }
+            None => match self.iter.next() {
+                None => return None,
+                Some(itm) => {
+                    self.last_item = Some(itm);
+                    return Some(itm);
                 }
             },
-            Some(last) => {
+            Some(last) => match self.iter.next() {
+                Some(nxt) => {
+                    if nxt.0 == last.0 {
+                        Some((nxt.0, last.1))
+                    } else {
+                        self.last_item = Some(nxt);
+                        return Some(nxt);
+                    }
+                }
+                None => self.last_item.take(),
+            },
+        }
+    }
+}
+
+struct DedupIter<K, T: Iterator<Item = (K, usize)>> {
+    iter: T,
+    last_item: Option<(K, usize)>,
+}
+
+impl<K, T: Iterator<Item = (K, usize)>> DedupIter<K, T> {
+    fn new(iter: T) -> DedupIter<K, T> {
+        return DedupIter {
+            iter: iter,
+            last_item: None,
+        };
+    }
+}
+
+impl<K, T> Iterator for DedupIter<K, T>
+where
+    T: Iterator<Item = (K, usize)>,
+    K: TrainingKey,
+{
+    type Item = (K, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.last_item {
+            None => match self.iter.next() {
+                None => {
+                    return None;
+                }
+                Some(nxt) => {
+                    self.last_item = Some(nxt);
+                    return Some(nxt);
+                }
+            },
+            Some(last) => loop {
                 match self.iter.next() {
                     Some(nxt) => {
                         if nxt.0 == last.0 {
-                            Some((nxt.0, last.1))
+                            continue;
                         } else {
                             self.last_item = Some(nxt);
                             return Some(nxt);
                         }
                     }
-                    None => { self.last_item.take() }
-                }
-            }
-        }
-    }
-}
-
-struct DedupIter<K, T: Iterator<Item=(K, usize)>> {
-    iter: T,
-    last_item: Option<(K, usize)>
-}
-
-impl <K, T: Iterator<Item=(K, usize)>> DedupIter<K, T> {
-    fn new(iter: T) -> DedupIter<K, T> {
-        return DedupIter { iter: iter, last_item: None };
-    }
-}
-
-impl <K, T> Iterator for DedupIter<K, T> where
-    T: Iterator<Item=(K, usize)>,
-    K: TrainingKey {
-    type Item = (K, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.last_item {
-            None => {
-                match self.iter.next() {
-                    None => { return None; }
-                    Some(nxt) => {
-                        self.last_item = Some(nxt);
-                        return Some(nxt)
+                    None => {
+                        return None;
                     }
                 }
             },
-            Some(last) => {
-                loop {
-                    match self.iter.next() {
-                        Some(nxt) => {
-                            if nxt.0 == last.0 {
-                                continue;
-                            } else {
-                                self.last_item = Some(nxt);
-                                return Some(nxt);
-                            }
-                        }
-                        None => { return None; }
-                    }
-                }
-            }
         }
     }
 }
 
 pub struct RMITrainingData<T> {
-    iterable: Arc<Box<dyn RMITrainingDataIteratorProvider<InpType=T>>>,
-    scale: f64
+    iterable: Arc<Box<dyn RMITrainingDataIteratorProvider<InpType = T>>>,
+    scale: f64,
 }
 
 macro_rules! map_scale {
@@ -241,26 +302,32 @@ macro_rules! map_scale {
         let sf = ($self).scale;
         let use_sf = (sf - 1.0).abs() > std::f64::EPSILON;
         ($inp).map(move |(key, offset)| {
-                if use_sf {
-                    (key, (offset as f64 * sf) as usize)
-                } else {
-                    (key, offset)
-                }
-            })
-    }}
+            if use_sf {
+                (key, (offset as f64 * sf) as usize)
+            } else {
+                (key, offset)
+            }
+        })
+    }};
 }
 
-impl <T: TrainingKey> RMITrainingData<T> {
-    pub fn new(iterable: Box<dyn RMITrainingDataIteratorProvider<InpType=T>>)
-               -> RMITrainingData<T> {
-        return RMITrainingData { iterable: Arc::new(iterable), scale: 1.0 };
+impl<T: TrainingKey> RMITrainingData<T> {
+    pub fn new(
+        iterable: Box<dyn RMITrainingDataIteratorProvider<InpType = T>>,
+    ) -> RMITrainingData<T> {
+        return RMITrainingData {
+            iterable: Arc::new(iterable),
+            scale: 1.0,
+        };
     }
 
     pub fn empty() -> RMITrainingData<T> {
         return RMITrainingData::<T>::new(Box::new(vec![]));
     }
 
-    pub fn len(&self) -> usize { return self.iterable.len(); }
+    pub fn len(&self) -> usize {
+        return self.iterable.len();
+    }
 
     pub fn set_scale(&mut self, scale: f64) {
         self.scale = scale;
@@ -271,7 +338,7 @@ impl <T: TrainingKey> RMITrainingData<T> {
     }
 
     pub fn get_key(&self, idx: usize) -> T {
-        return map_scale!(self, self.iterable.get(idx)).unwrap().0
+        return map_scale!(self, self.iterable.get(idx)).unwrap().0;
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (T, usize)> + '_ {
@@ -283,20 +350,22 @@ impl <T: TrainingKey> RMITrainingData<T> {
             .map(|(k, o)| (k.to_model_input(), o));
     }
 
-
     pub fn iter_unique(&self) -> impl Iterator<Item = (T, usize)> + '_ {
         map_scale!(self, DedupIter::new(self.iterable.cdf_iter()))
     }
-
 
     // Code adapted from superslice,
     // https://docs.rs/superslice/1.0.0/src/superslice/lib.rs.html
     // which was copyright 2017 Alkis Evlogimenos under the Apache License.
     pub fn lower_bound_by<F>(&self, f: F) -> usize
-    where F: Fn((T, usize)) -> Ordering {
+    where
+        F: Fn((T, usize)) -> Ordering,
+    {
         let mut size = self.len();
-        if size == 0 { return 0; }
-        
+        if size == 0 {
+            return 0;
+        }
+
         let mut base = 0usize;
         while size > 1 {
             let half = size / 2;
@@ -308,11 +377,11 @@ impl <T: TrainingKey> RMITrainingData<T> {
         let cmp = f(self.get(base));
         base + (cmp == Ordering::Less) as usize
     }
-    
+
     pub fn soft_copy(&self) -> RMITrainingData<T> {
         return RMITrainingData {
             scale: self.scale,
-            iterable: Arc::clone(&self.iterable)
+            iterable: Arc::clone(&self.iterable),
         };
     }
 }
@@ -324,7 +393,6 @@ impl <T: TrainingKey> RMITrainingData<T> {
 impl RMITrainingDataIteratorProvider for RMITrainingDataIteratorProviderWrapper {
 
 }*/
-
 
 /*impl PartialEq for ModelInput {
     fn eq(&self, other: &Self) -> bool {
@@ -360,14 +428,12 @@ impl PartialOrd for ModelInput {
             ModelInput::Float(x) => {
                 match other {
                     ModelInput::Int(_) => None,
-                    ModelInput::Float(y) => x.partial_cmp(y) 
+                    ModelInput::Float(y) => x.partial_cmp(y)
                 }
             }
         }
     }
 }*/
-
-
 
 #[derive(Clone, Copy, Debug)]
 pub enum ModelInput {
@@ -378,45 +444,37 @@ pub enum ModelInput {
 impl PartialEq for ModelInput {
     fn eq(&self, other: &Self) -> bool {
         match self {
-            ModelInput::Int(x) => {
-                match other {
-                    ModelInput::Int(y) => x == y,
-                    ModelInput::Float(_) => false
-                }
-            }
+            ModelInput::Int(x) => match other {
+                ModelInput::Int(y) => x == y,
+                ModelInput::Float(_) => false,
+            },
 
             ModelInput::Float(x) => {
                 match other {
                     ModelInput::Int(_) => false,
-                    ModelInput::Float(y) => x == y // exact equality is intentional
+                    ModelInput::Float(y) => x == y, // exact equality is intentional
                 }
             }
         }
     }
 }
 
-impl Eq for ModelInput { }
+impl Eq for ModelInput {}
 
 impl PartialOrd for ModelInput {
     fn partial_cmp(&self, other: &ModelInput) -> Option<Ordering> {
         match self {
-            ModelInput::Int(x) => {
-                match other {
-                    ModelInput::Int(y) => x.partial_cmp(y),
-                    ModelInput::Float(_) => None
-                }
-            }
-            ModelInput::Float(x) => {
-                match other {
-                    ModelInput::Int(_) => None,
-                    ModelInput::Float(y) => x.partial_cmp(y) 
-                }
-            }
+            ModelInput::Int(x) => match other {
+                ModelInput::Int(y) => x.partial_cmp(y),
+                ModelInput::Float(_) => None,
+            },
+            ModelInput::Float(x) => match other {
+                ModelInput::Int(_) => None,
+                ModelInput::Float(y) => x.partial_cmp(y),
+            },
         }
     }
 }
-
-
 
 impl ModelInput {
     pub fn as_float(&self) -> f64 {
@@ -436,32 +494,40 @@ impl ModelInput {
     pub fn max_value(&self) -> ModelInput {
         return match self {
             ModelInput::Int(_) => std::u64::MAX.into(),
-            ModelInput::Float(_) => std::f64::MAX.into()
+            ModelInput::Float(_) => std::f64::MAX.into(),
         };
     }
 
     pub fn min_value(&self) -> ModelInput {
         return match self {
             ModelInput::Int(_) => 0.into(),
-            ModelInput::Float(_) => std::f64::MIN.into()
+            ModelInput::Float(_) => std::f64::MIN.into(),
         };
     }
 
     pub fn minus_epsilon(&self) -> ModelInput {
         return match self {
-            ModelInput::Int(x) => if *x > 0 { (x - 1).into() } else { 0.into() }
-            ModelInput::Float(x) => (x - std::f64::EPSILON).into()
+            ModelInput::Int(x) => {
+                if *x > 0 {
+                    (x - 1).into()
+                } else {
+                    0.into()
+                }
+            }
+            ModelInput::Float(x) => (x - std::f64::EPSILON).into(),
         };
     }
 
     pub fn plus_epsilon(&self) -> ModelInput {
         return match self {
-            ModelInput::Int(x) => if *x < std::u64::MAX {
-                (x + 1).into()
-            } else {
-                std::u64::MAX.into()
+            ModelInput::Int(x) => {
+                if *x < std::u64::MAX {
+                    (x + 1).into()
+                } else {
+                    std::u64::MAX.into()
+                }
             }
-            ModelInput::Float(x) => (x + std::f64::EPSILON).into()
+            ModelInput::Float(x) => (x + std::f64::EPSILON).into(),
         };
     }
 }
@@ -484,7 +550,6 @@ impl From<i32> for ModelInput {
         ModelInput::Int(i as u64)
     }
 }
-
 
 impl From<f64> for ModelInput {
     fn from(f: f64) -> Self {
@@ -548,7 +613,7 @@ impl ModelParam {
             ModelParam::ShortArray(_) => true,
             ModelParam::IntArray(_) => true,
             ModelParam::Int32Array(_) => true,
-            ModelParam::FloatArray(_) => true
+            ModelParam::FloatArray(_) => true,
         }
     }
 
@@ -572,19 +637,19 @@ impl ModelParam {
                     tmp.push_str(".0");
                 }
                 return tmp;
-            },
+            }
             ModelParam::ShortArray(arr) => {
                 let itms: Vec<String> = arr.iter().map(|i| format!("{}", i)).collect();
                 return format!("{{ {} }}", itms.join(", "));
-            },
+            }
             ModelParam::IntArray(arr) => {
                 let itms: Vec<String> = arr.iter().map(|i| format!("{}UL", i)).collect();
                 return format!("{{ {} }}", itms.join(", "));
-            },
+            }
             ModelParam::Int32Array(arr) => {
                 let itms: Vec<String> = arr.iter().map(|i| format!("{}UL", i)).collect();
                 return format!("{{ {} }}", itms.join(", "));
-            },
+            }
             ModelParam::FloatArray(arr) => {
                 let itms: Vec<String> = arr
                     .iter()
@@ -621,15 +686,15 @@ impl ModelParam {
                 }
 
                 Ok(())
-            },
-            
+            }
+
             ModelParam::IntArray(arr) => {
                 for v in arr {
                     target.write_u64::<LittleEndian>(*v)?;
                 }
 
                 Ok(())
-            },
+            }
 
             ModelParam::Int32Array(arr) => {
                 for v in arr {
@@ -637,7 +702,7 @@ impl ModelParam {
                 }
 
                 Ok(())
-            },
+            }
 
             ModelParam::FloatArray(arr) => {
                 for v in arr {
@@ -645,12 +710,10 @@ impl ModelParam {
                 }
 
                 Ok(())
-
             }
-
         }
     }
-    
+
     pub fn as_float(&self) -> f64 {
         match self {
             ModelParam::Int(v) => *v as f64,
@@ -669,7 +732,7 @@ impl ModelParam {
             ModelParam::ShortArray(p) => p.len(),
             ModelParam::IntArray(p) => p.len(),
             ModelParam::Int32Array(p) => p.len(),
-            ModelParam::FloatArray(p) => p.len()
+            ModelParam::FloatArray(p) => p.len(),
         }
     }
 }

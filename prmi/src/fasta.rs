@@ -58,7 +58,10 @@ pub fn fasta_file_to_2bit(path: &Path) -> Result<(Vec<u8>, FastaStats)> {
         source: e,
     })?;
     fasta_to_2bit(std::io::BufReader::new(f)).map_err(|e| match e {
-        Error::Fasta { detail, .. } => Error::Fasta { file: path.to_path_buf(), detail },
+        Error::Fasta { detail, .. } => Error::Fasta {
+            file: path.to_path_buf(),
+            detail,
+        },
         other => other,
     })
 }

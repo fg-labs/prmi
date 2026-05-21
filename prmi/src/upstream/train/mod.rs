@@ -15,8 +15,8 @@
     dropping_references
 )]
 
-use super::models::*;
 use super::cache_fix::cache_fix;
+use super::models::*;
 use log::*;
 use std::time::SystemTime;
 
@@ -38,11 +38,10 @@ pub struct TrainedRMI {
     pub models: String,
     pub branching_factor: u64,
     pub cache_fix: Option<(usize, Vec<(u64, usize)>)>,
-    pub build_time: u128
+    pub build_time: u128,
 }
 
-fn train_model<T: TrainingKey>(model_type: &str,
-                              data: &RMITrainingData<T>) -> Box<dyn Model> {
+fn train_model<T: TrainingKey>(model_type: &str, data: &RMITrainingData<T>) -> Box<dyn Model> {
     let model: Box<dyn Model> = match model_type {
         "linear" => Box::new(LinearModel::new(data)),
         "robust_linear" => Box::new(RobustLinearModel::new(data)),
@@ -99,16 +98,18 @@ fn validate(model_spec: &[String]) {
     let (guess, err) = rmi.test_predict(test_key);
     println!("Model prediction for lookup {}: {} with error {}",
              test_key, guess, err);
-    
+
     println!("({}, {}), {}",
              guess - err,
              guess + err,
              correct);
 }*/
 
-pub fn train<T: TrainingKey>(data: &RMITrainingData<T>,
-                            model_spec: &str, branch_factor: u64) -> TrainedRMI {
-
+pub fn train<T: TrainingKey>(
+    data: &RMITrainingData<T>,
+    model_spec: &str,
+    branch_factor: u64,
+) -> TrainedRMI {
     let start_time = SystemTime::now();
     let (model_list, last_model): (Vec<String>, String) = {
         let mut all_models: Vec<String> = model_spec.split(',').map(String::from).collect();
@@ -118,14 +119,18 @@ pub fn train<T: TrainingKey>(data: &RMITrainingData<T>,
     };
 
     if model_list.len() == 1 {
-        let mut res = two_layer::train_two_layer(&mut data.soft_copy(), &model_list[0],
-                                             &last_model, branch_factor);
+        let mut res = two_layer::train_two_layer(
+            &mut data.soft_copy(),
+            &model_list[0],
+            &last_model,
+            branch_factor,
+        );
         let build_time = SystemTime::now()
             .duration_since(start_time)
             .map(|d| d.as_nanos())
             .unwrap_or(std::u128::MAX);
         res.build_time = build_time;
-        
+
         return res;
     }
 
@@ -134,56 +139,65 @@ pub fn train<T: TrainingKey>(data: &RMITrainingData<T>,
     panic!(); // TODO
 }
 
-pub fn train_for_size<T: TrainingKey>(data: &RMITrainingData<T>,
-                                     max_size: usize) -> TrainedRMI {
-
+pub fn train_for_size<T: TrainingKey>(data: &RMITrainingData<T>, max_size: usize) -> TrainedRMI {
     let start_time = SystemTime::now();
     let pareto = super::optimizer::find_pareto_efficient_configs(data, 1000);
     // go down the front until we find something small enough
 
-    let config = pareto.into_iter()
+    let config = pareto
+        .into_iter()
         .filter(|x| x.size < max_size as u64)
         .next()
-        .expect(format!(
-            "Could not find any configurations smaller than {}", max_size).as_str());
+        .expect(
+            format!(
+                "Could not find any configurations smaller than {}",
+                max_size
+            )
+            .as_str(),
+        );
 
     let models = config.models;
     let bf = config.branching_factor;
 
-    info!("Found RMI config {} {} with size {} and average log2 {}",
-          models, bf, config.size, config.average_log2_error);
+    info!(
+        "Found RMI config {} {} with size {} and average log2 {}",
+        models, bf, config.size, config.average_log2_error
+    );
     let mut res = train(data, models.as_str(), bf);
-    
+
     let build_time = SystemTime::now()
-            .duration_since(start_time)
-            .map(|d| d.as_nanos())
-            .unwrap_or(std::u128::MAX);
+        .duration_since(start_time)
+        .map(|d| d.as_nanos())
+        .unwrap_or(std::u128::MAX);
     res.build_time = build_time;
     return res;
 }
 
-pub fn train_bounded(data: &RMITrainingData<u64>,
-                     model_spec: &str,
-                     branch_factor: u64,
-                     line_size: usize) -> TrainedRMI {
+pub fn train_bounded(
+    data: &RMITrainingData<u64>,
+    model_spec: &str,
+    branch_factor: u64,
+    line_size: usize,
+) -> TrainedRMI {
     let start_time = SystemTime::now();
     // first, transform our data into error-bounded spline points
     let spline = cache_fix(data, line_size);
     std::mem::drop(data);
 
     // reindex the spline points so we can build an RMI on top
-    let reindexed_splines: Vec<(u64, usize)> = spline.iter()
+    let reindexed_splines: Vec<(u64, usize)> = spline
+        .iter()
         .enumerate()
         .map(|(idx, (key, _old_offset))| (*key, idx))
         .collect();
-    
+
     // construct new training data from our spline points
     let mut new_data = RMITrainingData::new(Box::new(reindexed_splines));
 
     let mut res = train(&mut new_data, model_spec, branch_factor);
     res.cache_fix = Some((line_size, spline));
     res.num_data_rows = data.len();
-    
+
     let build_time = SystemTime::now()
         .duration_since(start_time)
         .map(|d| d.as_nanos())

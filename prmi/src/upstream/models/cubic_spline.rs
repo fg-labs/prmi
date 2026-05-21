@@ -3,9 +3,8 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
 
 use super::*;
 
@@ -50,7 +49,10 @@ fn cubic<T: TrainingKey>(data: &RMITrainingData<T>) -> (f64, f64, f64, f64) {
             .find(|&(tx, _ty)| scale!(tx.as_float(), xmin, xmax) > 0.0)
             .unwrap();
 
-        let (sxn, syn) = (scale!(xn.as_float(), xmin, xmax), scale!(yn as f64, ymin, ymax));
+        let (sxn, syn) = (
+            scale!(xn.as_float(), xmin, xmax),
+            scale!(yn as f64, ymin, ymax),
+        );
         (syn - y1) / (sxn - x1)
     };
 
@@ -61,7 +63,10 @@ fn cubic<T: TrainingKey>(data: &RMITrainingData<T>) -> (f64, f64, f64, f64) {
             .find(|&(tx, _ty)| scale!(tx.as_float(), xmin, xmax) < 1.0)
             .unwrap();
 
-        let (sxp, syp) = (scale!(xp.as_float(), xmin, xmax), scale!(yp as f64, ymin, ymax));
+        let (sxp, syp) = (
+            scale!(xp.as_float(), xmin, xmax),
+            scale!(yp as f64, ymin, ymax),
+        );
         (y2 - syp) / (x2 - sxp)
     };
 
@@ -148,7 +153,6 @@ impl Model for CubicSplineModel {
         let v2 = v1.mul_add(val, c);
         let v3 = v2.mul_add(val, d);
         return v3;
-
     }
 
     fn input_type(&self) -> ModelDataType {
@@ -189,7 +193,7 @@ inline double cubic(double a, double b, double c, double d, double x) {
     fn set_to_constant_model(&mut self, constant: u64) -> bool {
         self.params = (0.0, 0.0, 0.0, constant as f64);
         return true;
-    }    
+    }
 }
 
 #[cfg(feature = "upstream_tests")]
@@ -249,5 +253,4 @@ mod tests {
     fn test_empty() {
         CubicSplineModel::new(&ModelData::empty());
     }
-
 }

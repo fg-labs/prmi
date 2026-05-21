@@ -3,9 +3,8 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum StdFunctions {

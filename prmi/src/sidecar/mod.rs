@@ -34,9 +34,9 @@ impl SidecarPaths {
         };
         Self {
             meta: with(".meta"),
-            sa:   with(".sa"),
-            l1:   with(".l1"),
-            l2:   with(".l2"),
+            sa: with(".sa"),
+            l1: with(".l1"),
+            l2: with(".l2"),
         }
     }
 }

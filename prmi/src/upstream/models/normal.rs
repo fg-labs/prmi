@@ -3,9 +3,8 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
 
 use super::*;
 use std::f64;
@@ -38,7 +37,7 @@ fn ncdf<T: TrainingKey>(loc_data: &RMITrainingData<T>) -> (f64, f64, f64) {
         mean += x / n;
         scale = f64::max(scale, y as f64);
     }
-    
+
     for (inp, _y) in loc_data.iter() {
         let x = inp.as_float();
         stdev += (x - mean).powf(2.0)
@@ -68,7 +67,6 @@ fn lncdf<T: TrainingKey>(loc_data: &RMITrainingData<T>) -> (f64, f64, f64) {
         let lnx = if !f64::is_finite(x.ln()) { 0.0 } else { x.ln() };
         stdev += (lnx - mean).powf(2.0)
     }
-
 
     stdev /= n;
     stdev = stdev.sqrt();
@@ -145,7 +143,6 @@ mod ncdf_tests {
     fn test_empty() {
         NormalModel::new(&ModelData::empty());
     }
-
 }
 
 pub struct LogNormalModel {
@@ -220,5 +217,4 @@ mod lncdf_tests {
     fn test_empty() {
         LogNormalModel::new(&ModelData::empty());
     }
-
 }

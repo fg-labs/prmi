@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
-use prmi::sidecar::meta::{Meta, Prmi, Priors, Ref, RmiSpec, Sa};
+use prmi::sidecar::meta::{Meta, Priors, Prmi, Ref, RmiSpec, Sa};
 use prmi::Error;
 
 fn sample() -> Meta {
@@ -28,7 +28,9 @@ fn sample() -> Meta {
             bit_shift: 56,
             max_error_bound: 12345,
         },
-        priors: Priors { kind: "uniform".into() },
+        priors: Priors {
+            kind: "uniform".into(),
+        },
     }
 }
 
@@ -75,7 +77,10 @@ fn reject_wrong_bytes_per_entry() {
     let s = m.to_toml().unwrap();
     let err = Meta::from_toml_str(&s).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("bytes_per_entry"), "expected 'bytes_per_entry' in: {msg}");
+    assert!(
+        msg.contains("bytes_per_entry"),
+        "expected 'bytes_per_entry' in: {msg}"
+    );
     assert!(matches!(err, Error::SizeMismatch { .. }));
 }
 

@@ -10,18 +10,30 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("i/o error on {path}: {source}")]
-    Io { path: PathBuf, #[source] source: io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
     #[error("invalid sidecar magic in {file}: found {found:?}, expected {expected:?}")]
-    BadMagic { file: PathBuf, found: String, expected: String },
+    BadMagic {
+        file: PathBuf,
+        found: String,
+        expected: String,
+    },
 
-    #[error("sidecar format version {found} not supported (this crate handles version {expected})")]
+    #[error(
+        "sidecar format version {found} not supported (this crate handles version {expected})"
+    )]
     UnsupportedVersion { found: u32, expected: u32 },
 
     #[error("sidecar component {file} has inconsistent size: {detail}")]
     SizeMismatch { file: PathBuf, detail: String },
 
-    #[error("unsupported encoding {encoding:?} in {file} (v0.1 only supports \"packed_lo8_hi32\")")]
+    #[error(
+        "unsupported encoding {encoding:?} in {file} (v0.1 only supports \"packed_lo8_hi32\")"
+    )]
     UnsupportedEncoding { file: PathBuf, encoding: String },
 
     #[error("companion sidecar files {file} disagree: {detail}")]
@@ -31,7 +43,11 @@ pub enum Error {
     FormatTooNew { kind: String },
 
     #[error("malformed TOML in {file}: {source}")]
-    TomlParse { file: PathBuf, #[source] source: toml::de::Error },
+    TomlParse {
+        file: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
 
     #[error("malformed FASTA in {file}: {detail}")]
     Fasta { file: PathBuf, detail: String },

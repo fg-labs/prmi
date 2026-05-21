@@ -3,9 +3,8 @@
 // Modified by Fulcrum Genomics 2026
 //
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
- 
+//
+// < end copyright >
 
 use super::utils::{common_prefix_size, num_bits};
 use super::*;
@@ -30,8 +29,7 @@ impl RadixModel {
             (1 << (bits + 1)) - 1
         );
 
-
-        let common_prefix =  common_prefix_size(data);
+        let common_prefix = common_prefix_size(data);
         trace!("Radix layer common prefix: {}", common_prefix);
 
         return RadixModel {
@@ -84,20 +82,26 @@ inline uint64_t radix(uint64_t prefix_length, uint64_t bits, uint64_t inp) {
 pub struct RadixTable {
     prefix_bits: u8,
     table_bits: u8,
-    hint_table: Vec<u32>
+    hint_table: Vec<u32>,
 }
 
 impl RadixTable {
     pub fn new<T: TrainingKey>(data: &RMITrainingData<T>, bits: u8) -> RadixTable {
         let prefix = common_prefix_size(data);
-        let mut hint_table: Vec<u32> = vec![0 ; 1 << bits];
+        let mut hint_table: Vec<u32> = vec![0; 1 << bits];
 
         let mut last_radix = 0;
         for (inp, y) in data.iter_model_input() {
             let x = inp.as_int();
-            let num_bits = if prefix + bits > 64 { 0 } else { 64 - (prefix + bits) };
+            let num_bits = if prefix + bits > 64 {
+                0
+            } else {
+                64 - (prefix + bits)
+            };
             let current_radix = ((x << prefix) >> prefix) >> num_bits;
-            if current_radix == last_radix { continue; }
+            if current_radix == last_radix {
+                continue;
+            }
             assert!(current_radix < hint_table.len() as u64);
 
             hint_table[current_radix as usize] = y as u32;
@@ -110,13 +114,13 @@ impl RadixTable {
         }
 
         for i in (last_radix as usize + 1)..hint_table.len() {
-            hint_table[i as usize] = hint_table.len() as u32; 
+            hint_table[i as usize] = hint_table.len() as u32;
         }
 
         return RadixTable {
             prefix_bits: prefix,
             table_bits: bits,
-            hint_table
+            hint_table,
         };
     }
 }
@@ -126,10 +130,14 @@ impl Model for RadixTable {
         let as_int: u64 = inp.as_int();
         let prefix = self.prefix_bits;
         let bits = self.table_bits;
-        let num_bits = if prefix + bits > 64 { 0 } else { 64 - (prefix + bits) };
+        let num_bits = if prefix + bits > 64 {
+            0
+        } else {
+            64 - (prefix + bits)
+        };
         let res = ((as_int << prefix) >> prefix) >> num_bits;
         let idx = self.hint_table[res as usize] as u64;
-        
+
         return idx;
     }
 
@@ -150,12 +158,13 @@ impl Model for RadixTable {
         } else {
             64 - (self.prefix_bits + self.table_bits)
         };
-        
+
         return format!(
             "
 inline uint64_t radix_table(const uint32_t* table, const uint64_t inp) {{
     return table[((inp << {0}) >> {0}) >> {1}];
-}}", self.prefix_bits, num_bits
+}}",
+            self.prefix_bits, num_bits
         );
     }
 
@@ -178,5 +187,4 @@ mod tests {
     fn test_empty() {
         RadixModel::new(&ModelData::empty());
     }
-
 }
