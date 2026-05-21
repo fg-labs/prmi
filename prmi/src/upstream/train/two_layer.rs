@@ -349,6 +349,7 @@ pub fn train_two_layer<T: TrainingKey>(
         model_max_error_idx,
         model_max_log2_error,
         last_layer_max_l1s: final_errors,
+        third_layer_max_l1s: Vec::new(),
         rmi: vec![vec![top_model], leaf_models],
         models: format!("{},{}", layer1_model, layer2_model),
         branching_factor: num_leaf_models,

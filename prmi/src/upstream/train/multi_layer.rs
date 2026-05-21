@@ -112,6 +112,7 @@ pub fn train_multi_layer(data: &mut RMITrainingData,
         model_max_error_idx,
         model_max_log2_error,
         last_layer_max_l1s,
+        third_layer_max_l1s: Vec::new(),
         rmi,
         models: format!("{},{}", model_list.join(","), last_model),
         branching_factor: branch_factor

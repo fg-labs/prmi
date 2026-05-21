@@ -34,6 +34,9 @@ pub struct TrainedRMI {
     pub model_max_error_idx: usize,
     pub model_max_log2_error: f64,
     pub last_layer_max_l1s: Vec<u64>,
+    /// Per-leaf maximum-error bounds for the middle (partial-3-layer) models.
+    /// Empty for two-layer trained RMIs; populated by `train_partial_three_layer`.
+    pub third_layer_max_l1s: Vec<u64>,
     pub rmi: Vec<Vec<Box<dyn Model>>>,
     pub models: String,
     pub branching_factor: u64,
