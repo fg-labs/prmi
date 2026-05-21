@@ -5,6 +5,7 @@
 
 pub mod magic;
 pub mod meta;
+pub mod sa_file;
 
 use std::path::{Path, PathBuf};
 

@@ -1,7 +1,9 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
-#![forbid(unsafe_code)]
+// unsafe_code is deny (not forbid) so that the single unsafe island in
+// sidecar::sa_file (mmap) can opt in with #[allow(unsafe_code)].
+#![deny(unsafe_code)]
 
 //! prmi — Piecewise Recursive Model Index for sorted-key lookup, with a
 //! genomics-oriented trainer over the suffix array of a reference genome.
