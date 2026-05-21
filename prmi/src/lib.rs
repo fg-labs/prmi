@@ -14,6 +14,7 @@
 pub mod encoding;
 pub mod error;
 pub mod fasta;
+pub mod index;
 pub mod sa;
 pub mod sidecar;
 pub mod train;
