@@ -142,12 +142,9 @@ impl Meta {
             });
         }
         if self.sa.encoding != "packed_lo8_hi32" {
-            return Err(Error::SizeMismatch {
+            return Err(Error::UnsupportedEncoding {
                 file: file.to_path_buf(),
-                detail: format!(
-                    "encoding={:?} (v0.1 only supports \"packed_lo8_hi32\")",
-                    self.sa.encoding
-                ),
+                encoding: self.sa.encoding.clone(),
             });
         }
         Ok(())

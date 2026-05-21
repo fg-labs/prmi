@@ -21,6 +21,9 @@ pub enum Error {
     #[error("sidecar component {file} has inconsistent size: {detail}")]
     SizeMismatch { file: PathBuf, detail: String },
 
+    #[error("unsupported encoding {encoding:?} in {file} (v0.1 only supports \"packed_lo8_hi32\")")]
+    UnsupportedEncoding { file: PathBuf, encoding: String },
+
     #[error("companion sidecar files {file} disagree: {detail}")]
     SidecarMismatch { file: PathBuf, detail: String },
 
