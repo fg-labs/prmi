@@ -141,7 +141,23 @@ pub fn train<T: TrainingKey>(
         return res;
     }
 
-    // it is not a simple, two layer rmi
+    if model_list.len() == 2 {
+        let mut res = two_layer::train_partial_three_layer(
+            &mut data.soft_copy(),
+            &model_list[0],
+            &model_list[1],
+            &last_model,
+            branch_factor,
+        );
+        let build_time = SystemTime::now()
+            .duration_since(start_time)
+            .map(|d| d.as_nanos())
+            .unwrap_or(std::u128::MAX);
+        res.build_time = build_time;
+        return res;
+    }
+
+    // it is not a simple, two layer rmi (model_list.len() >= 3 is out of scope for v0.1)
     //return multi_layer::train_multi_layer(data, &model_list, last_model, branch_factor);
     panic!(); // TODO
 }

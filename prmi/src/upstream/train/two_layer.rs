@@ -677,3 +677,514 @@ pub fn train_two_layer<T: TrainingKey>(
         build_time: 0,
     };
 }
+
+pub fn train_partial_three_layer<T: TrainingKey>(
+    md_container: &mut RMITrainingData<T>,
+    layer1_model: &str,
+    layer2_model: &str,
+    layer3_model: &str,
+    num_leaf_models: u64,
+) -> TrainedRMI {
+    validate(&[
+        String::from(layer1_model),
+        String::from(layer2_model),
+        String::from(layer3_model),
+    ]);
+
+    let num_rows = md_container.len();
+
+    let second_model_num = num_leaf_models;
+
+    log::debug!("Training top-level {} model layer", layer1_model);
+    md_container.set_scale(second_model_num as f64 / num_rows as f64);
+    let top_model = train_model(layer1_model, &md_container);
+
+    // Check monotonicity if in debug mode
+    #[cfg(debug_assertions)]
+    {
+        let mut last_pred = 0;
+        for (x, _y) in md_container.iter_model_input() {
+            let prediction = top_model.predict_to_int(&x);
+            debug_assert!(
+                prediction >= last_pred,
+                "Top model {} was non-monotonic on input {:?}",
+                layer1_model,
+                x
+            );
+            last_pred = prediction;
+        }
+        trace!("Top model was monotonic.");
+    }
+
+    log::debug!(
+        "Training second-level {} model layer (num models = {})",
+        layer2_model,
+        second_model_num
+    );
+    md_container.set_scale(1.0);
+    let first_idx_target = 0;
+    let (
+        mut sec_models,
+        partial_3rd_idx,
+        partial_3rd_lb_corrs,
+        partial_3rd_models,
+        third_layer_num,
+    ) = build_partial_3layer_models_from(
+        &md_container,
+        &top_model,
+        layer2_model,
+        layer3_model,
+        0,
+        md_container.len(),
+        first_idx_target,
+        second_model_num as usize,
+    );
+
+    log::debug!("[2nd layer]Computing lower bound stats...");
+    let lb_corrections = LowerBoundCorrection::new(
+        |x| top_model.predict_to_int(&x.to_model_input()),
+        second_model_num,
+        md_container,
+    );
+
+    log::debug!("[2nd layer]Fixing empty models...");
+    // replace any empty model with a model that returns the correct constant
+    // (for LB predictions), if the underlying model supports it.
+    let mut could_not_replace = false;
+    for idx in 0..(second_model_num as usize) {
+        assert_eq!(
+            lb_corrections.first_key(idx).is_none(),
+            lb_corrections.last_key(idx).is_none()
+        );
+
+        if lb_corrections.last_key(idx).is_none() {
+            // model is empty!
+            let upper_bound = lb_corrections.next_index(idx);
+            if !sec_models[idx].set_to_constant_model(upper_bound as u64) {
+                could_not_replace = true;
+            }
+        }
+    }
+    if could_not_replace {
+        warn!(
+            "[2nd layer]Some empty models could not be replaced with constants, \
+            negative lookup performance may be poor."
+        );
+        panic!();
+    }
+    log::debug!("Computing last level errors...");
+    // evaluate model, compute last level errors
+
+    let mut last_layer_max_l1s = vec![(0, 0); num_leaf_models as usize];
+    let mut third_layer_max_l1s = vec![(0, 0); third_layer_num as usize];
+
+    for (x, y) in md_container.iter_model_input() {
+        let leaf_idx = top_model.predict_to_int(&x);
+        let target = u64::min(num_leaf_models - 1, leaf_idx) as usize;
+
+        let pred;
+        if partial_3rd_idx[target] == (0, 0) {
+            pred = sec_models[target].predict_to_int(&x);
+            let err = error_between(pred, y as u64, md_container.len() as u64);
+            let cur_val = last_layer_max_l1s[target];
+
+            // cur_val stores minimum error (can be minus value) and maximum error (can be minus also)
+            // first 32bit is for minimum err, next 32bit for maximum error
+            // first bit is used for sign, 1 for minus, 0 for plus
+
+            let mut min_err = (cur_val.1 >> 32) & 0x000000003fffffffu64; // left most bit is used for partial model representation
+            let mut min_flag = ((cur_val.1 >> 32) & 0x0000000040000000u64) >> 30;
+            let mut max_err = (cur_val.1) & 0x000000007fffffffu64;
+            let mut max_flag = ((cur_val.1) & 0x0000000080000000u64) >> 31;
+
+            if pred > y as u64 {
+                // err is minus err
+                if min_err < err || min_flag == 0 {
+                    min_err = err;
+                    min_flag = 1;
+                }
+                if max_err > err && max_flag == 1 {
+                    max_err = err;
+                    max_flag = 1;
+                }
+            } else {
+                // pred is smaller than y, plus err
+                if min_err > err && min_flag == 0 {
+                    min_err = err;
+                    min_flag = 0;
+                }
+                if max_err < err || max_flag == 1 {
+                    max_err = err;
+                    max_flag = 0;
+                }
+            }
+
+            last_layer_max_l1s[target] = (
+                cur_val.0 + 1,
+                min_flag << 62 | min_err << 32 | max_flag << 31 | max_err,
+            );
+            assert!(last_layer_max_l1s[target].1 >> 63 == 0); // flag for partial model should be 0
+        } else {
+            // partial_3rd_idx.0 has start of 3rd model list, partial_3rd_idx.1 has number of models
+            let mut target_third =
+                sec_models[target].predict_to_int(&x) + partial_3rd_idx[target].0 as u64;
+            target_third = u64::min(
+                (partial_3rd_idx[target].0 + partial_3rd_idx[target].1 - 1) as u64,
+                target_third,
+            );
+            target_third = u64::max(partial_3rd_idx[target].0 as u64, target_third);
+            pred = partial_3rd_models[target_third as usize].predict_to_int(&x);
+
+            let cur_val = last_layer_max_l1s[target];
+            // put number of cumulative partial models in 32 most significant bits, number of models in 32 least significant bits
+            // first bit is set as 1 if partial model is used
+            assert!(partial_3rd_idx[target].0 as u64 <= 0x000000007fffffffu64);
+            assert!(partial_3rd_idx[target].1 as u64 <= 0x00000000ffffffffu64);
+            last_layer_max_l1s[target] = (
+                cur_val.0 + 1,
+                ((partial_3rd_idx[target].0 as u64 | 0x0000000080000000u64) << 32)
+                    | partial_3rd_idx[target].1 as u64,
+            );
+
+            let err = error_between(pred, y as u64, md_container.len() as u64);
+            let cur_val = third_layer_max_l1s[target_third as usize];
+
+            let mut min_err = (cur_val.1 >> 32) & 0x000000003fffffffu64; // left most bit is used for partial model representation
+            let mut min_flag = ((cur_val.1 >> 32) & 0x0000000040000000u64) >> 30;
+            let mut max_err = (cur_val.1) & 0x000000007fffffffu64;
+            let mut max_flag = ((cur_val.1) & 0x0000000080000000u64) >> 31;
+
+            if pred > y as u64 {
+                // err is minus err
+                if min_err < err || min_flag == 0 {
+                    min_err = err;
+                    min_flag = 1;
+                }
+                if max_err > err && max_flag == 1 {
+                    max_err = err;
+                    max_flag = 1;
+                }
+            } else {
+                // pred is smaller than y, plus err
+                if min_err > err && min_flag == 0 {
+                    min_err = err;
+                    min_flag = 0;
+                }
+                if max_err < err || max_flag == 1 {
+                    max_err = err;
+                    max_flag = 0;
+                }
+            }
+            third_layer_max_l1s[target_third as usize] = (
+                cur_val.0 + 1,
+                min_flag << 62 | min_err << 32 | max_flag << 31 | max_err,
+            );
+        }
+    }
+
+    let large_corrections = 0;
+    let mut partial_third_num = 0;
+    let report_error_threshold = 100000;
+    for leaf_idx in 0..num_leaf_models as usize {
+        if partial_3rd_idx[leaf_idx] != (0, 0) {
+            for third_idx in 0..partial_3rd_idx[leaf_idx].1 {
+                let curr_err = third_layer_max_l1s[third_idx + partial_3rd_idx[leaf_idx].0].1;
+
+                let mut min_err = (curr_err >> 32) & 0x000000003fffffffu64; // left most bit is used for partial model representation
+                let mut min_flag = ((curr_err >> 32) & 0x0000000040000000u64) >> 30;
+                let mut max_err = curr_err & 0x000000007fffffffu64;
+                let mut max_flag = (curr_err & 0x0000000080000000u64) >> 31;
+
+                let mut upper_flag = false;
+                let mut lower_flag = false;
+                let upper_error = {
+                    if third_idx
+                        >= partial_3rd_lb_corrs[partial_third_num].last_non_empty_model() as usize
+                    {
+                        let (idx_of_next, key_of_next) = lb_corrections.next(leaf_idx);
+                        let pred = partial_3rd_models[third_idx + partial_3rd_idx[leaf_idx].0]
+                            .predict_to_int(&key_of_next.minus_epsilon().to_model_input());
+
+                        upper_flag = pred > idx_of_next as u64;
+                        error_between(pred, idx_of_next as u64 + 1, md_container.len() as u64)
+                    } else {
+                        let (idx_of_next, key_of_next) =
+                            partial_3rd_lb_corrs[partial_third_num].next(third_idx);
+                        let pred = partial_3rd_models[third_idx + partial_3rd_idx[leaf_idx].0]
+                            .predict_to_int(&key_of_next.minus_epsilon().to_model_input());
+
+                        upper_flag = pred > idx_of_next as u64;
+                        error_between(pred, idx_of_next as u64 + 1, md_container.len() as u64)
+                    }
+                };
+                let lower_error = {
+                    let first_key_before;
+                    let prev_idx;
+                    let first_idx;
+                    // if empty models
+                    if third_idx
+                        <= partial_3rd_lb_corrs[partial_third_num].first_non_empty_model() as usize
+                    {
+                        first_key_before = lb_corrections.prev_key(leaf_idx);
+                        prev_idx = if leaf_idx == 0 { 0 } else { leaf_idx - 1 };
+                        first_idx = lb_corrections.next_index(prev_idx);
+                        let (prev_idx_inner, first_idx_inner) = if leaf_idx == 0 {
+                            let p = if third_idx == 0 { 0 } else { third_idx - 1 };
+                            (p, partial_3rd_lb_corrs[partial_third_num].next_index(p))
+                        } else {
+                            (prev_idx, first_idx)
+                        };
+                        let pred = partial_3rd_models[third_idx + partial_3rd_idx[leaf_idx].0]
+                            .predict_to_int(&first_key_before.plus_epsilon().to_model_input());
+
+                        lower_flag = pred > first_idx_inner as u64;
+                        error_between(pred, first_idx_inner as u64, md_container.len() as u64)
+                    } else {
+                        first_key_before =
+                            partial_3rd_lb_corrs[partial_third_num].prev_key(third_idx);
+                        prev_idx = if third_idx == 0 { 0 } else { third_idx - 1 };
+                        first_idx = partial_3rd_lb_corrs[partial_third_num].next_index(prev_idx);
+                        let (eff_prev_idx, eff_first_idx) =
+                            if partial_3rd_lb_corrs[partial_third_num].first_non_empty_model() == 0
+                                && partial_3rd_lb_corrs[partial_third_num].first_non_empty_model()
+                                    == partial_3rd_lb_corrs[partial_third_num]
+                                        .last_non_empty_model()
+                            {
+                                let p = if leaf_idx == 0 { 0 } else { leaf_idx - 1 };
+                                (p, lb_corrections.next_index(p))
+                            } else {
+                                (prev_idx, first_idx)
+                            };
+                        let pred = partial_3rd_models[third_idx + partial_3rd_idx[leaf_idx].0]
+                            .predict_to_int(&first_key_before.plus_epsilon().to_model_input());
+
+                        lower_flag = pred > eff_first_idx as u64;
+                        error_between(pred, eff_first_idx as u64, md_container.len() as u64)
+                    }
+                };
+
+                // (debug trace removed for upper_error > report_error_threshold)
+                // (debug trace removed for lower_error > report_error_threshold)
+
+                if upper_flag {
+                    // err is minus err
+                    if min_err < upper_error || min_flag == 0 {
+                        min_err = upper_error;
+                        min_flag = 1;
+                    }
+                    if max_err > upper_error && max_flag == 1 {
+                        max_err = upper_error;
+                        max_flag = 1;
+                    }
+                } else {
+                    // pred is smaller than y, plus err
+                    if min_err > upper_error && min_flag == 0 {
+                        min_err = upper_error;
+                        min_flag = 0;
+                    }
+                    if max_err < upper_error || max_flag == 1 {
+                        max_err = upper_error;
+                        max_flag = 0;
+                    }
+                }
+
+                if lower_flag {
+                    // err is minus err
+                    if min_err < lower_error || min_flag == 0 {
+                        min_err = lower_error;
+                        min_flag = 1;
+                    }
+                    if max_err > lower_error && max_flag == 1 {
+                        max_err = lower_error;
+                        max_flag = 1;
+                    }
+                } else {
+                    // pred is smaller than y, plus err
+                    if min_err > lower_error && min_flag == 0 {
+                        min_err = lower_error;
+                        min_flag = 0;
+                    }
+                    if max_err < lower_error || max_flag == 1 {
+                        max_err = lower_error;
+                        max_flag = 0;
+                    }
+                }
+                let num_items_in_leaf =
+                    third_layer_max_l1s[third_idx + partial_3rd_idx[leaf_idx].0].0;
+
+                third_layer_max_l1s[third_idx + partial_3rd_idx[leaf_idx].0] = (
+                    num_items_in_leaf,
+                    min_flag << 62 | min_err << 32 | max_flag << 31 | max_err,
+                );
+            }
+            partial_third_num += 1;
+
+            continue;
+        }
+
+        let curr_err = last_layer_max_l1s[leaf_idx].1;
+        let mut min_err = (curr_err >> 32) & 0x000000003fffffffu64; // left most bit is used for partial model representation
+        let mut min_flag = ((curr_err >> 32) & 0x0000000040000000u64) >> 30;
+        let mut max_err = curr_err & 0x000000007fffffffu64;
+        let mut max_flag = (curr_err & 0x0000000080000000u64) >> 31;
+
+        let mut upper_flag = false;
+        let mut lower_flag = false;
+
+        let upper_error = {
+            let (idx_of_next, key_of_next) = lb_corrections.next(leaf_idx);
+            let pred =
+                sec_models[leaf_idx].predict_to_int(&key_of_next.minus_epsilon().to_model_input());
+            upper_flag = pred > idx_of_next as u64;
+            error_between(pred, idx_of_next as u64 + 1, md_container.len() as u64)
+        };
+
+        let lower_error = {
+            let first_key_before = lb_corrections.prev_key(leaf_idx);
+
+            let prev_idx = if leaf_idx == 0 { 0 } else { leaf_idx - 1 };
+            let first_idx = lb_corrections.next_index(prev_idx);
+
+            let pred = sec_models[leaf_idx]
+                .predict_to_int(&first_key_before.plus_epsilon().to_model_input());
+            lower_flag = pred > first_idx as u64;
+            error_between(pred, first_idx as u64, md_container.len() as u64)
+        };
+
+        if upper_flag {
+            // err is minus err
+            if min_err < upper_error || min_flag == 0 {
+                min_err = upper_error;
+                min_flag = 1;
+            }
+            if max_err > upper_error && max_flag == 1 {
+                max_err = upper_error;
+                max_flag = 1;
+            }
+        } else {
+            // pred is smaller than y, plus err
+            if min_err > upper_error && min_flag == 0 {
+                min_err = upper_error;
+                min_flag = 0;
+            }
+            if max_err < upper_error || max_flag == 1 {
+                max_err = upper_error;
+                max_flag = 0;
+            }
+        }
+
+        if lower_flag {
+            // err is minus err
+            if min_err < lower_error || min_flag == 0 {
+                min_err = lower_error;
+                min_flag = 1;
+            }
+            if max_err > lower_error && max_flag == 1 {
+                max_err = lower_error;
+                max_flag = 1;
+            }
+        } else {
+            // pred is smaller than y, plus err
+            if min_err > lower_error && min_flag == 0 {
+                min_err = lower_error;
+                min_flag = 0;
+            }
+            if max_err < lower_error || max_flag == 1 {
+                max_err = lower_error;
+                max_flag = 0;
+            }
+        }
+        let num_items_in_leaf = last_layer_max_l1s[leaf_idx].0;
+
+        last_layer_max_l1s[leaf_idx] = (
+            num_items_in_leaf,
+            min_flag << 62 | min_err << 32 | max_flag << 31 | max_err,
+        );
+    }
+
+    if large_corrections > 1 {
+        trace!(
+            "Of {} models, {} needed large lower bound corrections.",
+            num_leaf_models,
+            large_corrections
+        );
+    }
+
+    trace!("Evaluating Second layer of RMI...");
+
+    log::debug!(
+        "[INFO] Number of leaf and partial models: {}, leaf: {}, partial: {}, leaf models that have partial models:{}",
+        num_leaf_models as usize + third_layer_num as usize,
+        num_leaf_models,
+        third_layer_num,
+        partial_3rd_lb_corrs.len()
+    );
+
+    let (m_idx, m_err) = last_layer_max_l1s
+        .iter()
+        .enumerate()
+        .max_by_key(|(_idx, &x)| (x.1 & 0x7fffffff) + ((x.1 >> 32) & 0x3fffffff))
+        .unwrap();
+
+    let model_max_error = (m_err.1 & 0x7fffffff) + ((m_err.1 >> 32) & 0x3fffffff);
+    let model_max_error_idx = m_idx;
+
+    let model_avg_error: f64 = last_layer_max_l1s
+        .iter()
+        .map(|(n, err)| n * ((err & 0x7fffffff) + ((err >> 32) & 0x3fffffff)))
+        .sum::<u64>() as f64
+        / num_rows as f64;
+
+    let model_avg_l2_error: f64 = last_layer_max_l1s
+        .iter()
+        .map(|(n, err)| {
+            (((err & 0x7fffffff) + ((err >> 32) & 0x3fffffff)) as f64).powf(2.0) / num_rows as f64
+        })
+        .sum::<f64>();
+
+    let model_avg_log2_error: f64 = last_layer_max_l1s
+        .iter()
+        .map(|(n, err)| {
+            (*n as f64) * (((err & 0x7fffffff) + ((err >> 32) & 0x3fffffff) + 2) as f64).log2()
+        })
+        .sum::<f64>()
+        / num_rows as f64;
+
+    let model_max_log2_error: f64 = (model_max_error as f64).log2();
+
+    let final_errors = last_layer_max_l1s
+        .into_iter()
+        .map(|(_n, err)| err)
+        .collect();
+
+    let final_third_errors = third_layer_max_l1s
+        .into_iter()
+        .map(|(_n, err)| err)
+        .collect();
+
+    let rmi = if third_layer_num > 0 {
+        vec![vec![top_model], partial_3rd_models, sec_models]
+    } else {
+        let dummy_model = train_model("pwl", &md_container);
+        vec![vec![top_model], vec![dummy_model], sec_models]
+    };
+
+    return TrainedRMI {
+        num_rmi_rows: md_container.len(),
+        num_data_rows: md_container.len(),
+        model_avg_error,
+        model_avg_l2_error,
+        model_avg_log2_error,
+        model_max_error,
+        model_max_error_idx,
+        model_max_log2_error,
+        last_layer_max_l1s: final_errors,
+        third_layer_max_l1s: final_third_errors,
+        rmi,
+        // Note: layer1, layer3, layer2 order is BWA-MEME's spec-string serialization convention
+        models: format!("{},{},{}", layer1_model, layer3_model, layer2_model),
+        branching_factor: num_leaf_models,
+        cache_fix: None,
+        build_time: 0,
+    };
+}
