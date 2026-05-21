@@ -48,6 +48,6 @@ pub mod optimizer;
 pub use codegen::output_rmi;
 pub use codegen::rmi_size;
 pub use models::KeyType;
-pub use models::{ModelInput, RMITrainingData, RMITrainingDataIteratorProvider};
+pub use models::{Model, ModelInput, ModelParam, RMITrainingData, RMITrainingDataIteratorProvider};
 pub use optimizer::find_pareto_efficient_configs;
-pub use train::{train, train_bounded, train_for_size};
+pub use train::{train, train_bounded, train_for_size, TrainedRMI};
