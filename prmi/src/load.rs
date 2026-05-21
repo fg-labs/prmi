@@ -1,9 +1,10 @@
-// < begin copyright > 
+// < begin copyright >
 // Copyright Ryan Marcus 2020
-// 
+// Modified by Fulcrum Genomics 2026
+//
 // See root directory of this project for license terms.
-// 
-// < end copyright > 
+//
+// < end copyright >
  
  
 use memmap::MmapOptions;
