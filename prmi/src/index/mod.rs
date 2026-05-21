@@ -6,6 +6,7 @@
 //! for the four sidecar files and answers `lookup(key) -> (pos, err)` queries.
 
 pub mod lookup;
+pub mod smem;
 
 use crate::error::{Error, Result};
 use crate::index::lookup::lookup_core;
@@ -72,7 +73,6 @@ impl LearnedIndex {
     }
 
     // Accessors used by Task 22+ (smem_range) and the C FFI layer.
-    #[allow(dead_code)]
     pub(crate) fn sa(&self) -> &SaFileReader {
         &self.sa
     }
