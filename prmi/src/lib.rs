@@ -16,6 +16,7 @@ pub mod error;
 pub mod fasta;
 pub mod sa;
 pub mod sidecar;
+pub mod train;
 pub use error::{Error, Result};
 
 pub mod upstream;
