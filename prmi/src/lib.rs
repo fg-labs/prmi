@@ -9,4 +9,7 @@
 //! See `docs/superpowers/handoff/2026-05-20-prmi-v0.1-brief.md` for the
 //! v0.1 sidecar format spec and the C ABI contract.
 
+pub mod error;
+pub use error::{Error, Result};
+
 pub(crate) mod upstream;
