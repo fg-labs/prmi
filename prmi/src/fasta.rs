@@ -15,7 +15,7 @@ use std::io::BufRead;
 use std::path::Path;
 
 /// Counts gathered while reading a FASTA file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FastaStats {
     pub total_bases: u64,
     pub n_bases: u64,
@@ -25,11 +25,11 @@ pub struct FastaStats {
 /// Read all records from a FASTA stream, return the concatenated 2-bit
 /// sequence (one byte per base; values 0..=3) and counts.
 pub fn fasta_to_2bit<R: BufRead>(reader: R) -> Result<(Vec<u8>, FastaStats)> {
-    let mut r = Reader::new(reader);
+    let mut reader = Reader::new(reader);
     let mut bases: Vec<u8> = Vec::new();
-    let mut stats = FastaStats { total_bases: 0, n_bases: 0, contigs: 0 };
+    let mut stats = FastaStats::default();
 
-    for record in r.records() {
+    for record in reader.records() {
         let record = record.map_err(|e| Error::Fasta {
             file: std::path::PathBuf::new(),
             detail: e.to_string(),
@@ -50,10 +50,15 @@ pub fn fasta_to_2bit<R: BufRead>(reader: R) -> Result<(Vec<u8>, FastaStats)> {
 }
 
 /// Convenience wrapper: open the file by path.
+///
+/// On error, the file path is included in the returned `Error`.
 pub fn fasta_file_to_2bit(path: &Path) -> Result<(Vec<u8>, FastaStats)> {
     let f = std::fs::File::open(path).map_err(|e| Error::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
-    fasta_to_2bit(std::io::BufReader::new(f))
+    fasta_to_2bit(std::io::BufReader::new(f)).map_err(|e| match e {
+        Error::Fasta { detail, .. } => Error::Fasta { file: path.to_path_buf(), detail },
+        other => other,
+    })
 }

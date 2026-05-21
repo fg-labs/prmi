@@ -18,6 +18,7 @@ fn n_bases_become_a() {
     let (bases, stats) = fasta_to_2bit(Cursor::new(&fasta[..])).unwrap();
     assert_eq!(bases, vec![0, 1, 0, 3]);
     assert_eq!(stats.n_bases, 1);
+    assert_eq!(stats.total_bases, 4);
 }
 
 #[test]
