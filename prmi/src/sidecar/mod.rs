@@ -4,6 +4,7 @@
 //! On-disk sidecar format: TOML meta + binary `.sa` / `.l1` / `.l2`.
 
 pub mod magic;
+pub mod meta;
 
 use std::path::{Path, PathBuf};
 
