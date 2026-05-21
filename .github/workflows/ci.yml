@@ -35,6 +35,8 @@ jobs:
       - run: cargo test --workspace
 
   cpp-example:
+    # Enabled in Task 30 once examples/ exists; skip until then to avoid CI failures.
+    if: false
     name: examples/cpp_caller
     runs-on: ubuntu-latest
     needs: rust

@@ -5,3 +5,5 @@ Cargo.lock
 *\#
 \#*
 rmi_data
+# cbindgen output — generated in Task 24
+prmi-sys/include/
