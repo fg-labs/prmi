@@ -11,6 +11,7 @@
 
 pub mod encoding;
 pub mod error;
+pub mod fasta;
 pub use error::{Error, Result};
 
 pub(crate) mod upstream;
