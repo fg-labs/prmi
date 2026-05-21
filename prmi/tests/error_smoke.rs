@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 use prmi::Error;
+use std::path::PathBuf;
 
 #[test]
 fn error_display_includes_kind() {
-    let e = Error::bad_magic_str("XXXX", "PRMIv1");
+    let e = Error::BadMagic {
+        file: PathBuf::new(),
+        found: "XXXX".into(),
+        expected: "PRMIv1".into(),
+    };
     let s = format!("{e}");
     assert!(s.contains("PRMIv1"));
     assert!(s.contains("XXXX"));

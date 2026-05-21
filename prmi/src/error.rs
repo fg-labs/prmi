@@ -1,6 +1,8 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
+//! Error types for the prmi crate.
+
 use std::io;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -19,8 +21,8 @@ pub enum Error {
     #[error("sidecar component {file} has inconsistent size: {detail}")]
     SizeMismatch { file: PathBuf, detail: String },
 
-    #[error("companion sidecar files disagree: {detail}")]
-    SidecarMismatch { detail: String },
+    #[error("companion sidecar files {file} disagree: {detail}")]
+    SidecarMismatch { file: PathBuf, detail: String },
 
     #[error("priors type {kind:?} requires a newer prmi (format too new)")]
     FormatTooNew { kind: String },
@@ -43,7 +45,9 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(test)]
 impl Error {
+    /// Construct a `BadMagic` error with an empty file path for use in unit tests.
     pub fn bad_magic_str(found: impl Into<String>, expected: impl Into<String>) -> Self {
         Error::BadMagic {
             file: PathBuf::new(),
