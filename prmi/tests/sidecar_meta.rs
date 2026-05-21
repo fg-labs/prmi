@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use prmi::sidecar::meta::{Meta, Prmi, Priors, Ref, RmiSpec, Sa};
+use prmi::Error;
 
 fn sample() -> Meta {
     Meta {
@@ -65,4 +66,38 @@ fn unknown_priors_type_is_format_too_new() {
     let msg = format!("{err}");
     assert!(msg.to_lowercase().contains("too new"));
     assert!(msg.contains("bed"));
+}
+
+#[test]
+fn reject_wrong_bytes_per_entry() {
+    let mut m = sample();
+    m.sa.bytes_per_entry = 4;
+    let s = m.to_toml().unwrap();
+    let err = Meta::from_toml_str(&s).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("bytes_per_entry"), "expected 'bytes_per_entry' in: {msg}");
+    assert!(matches!(err, Error::SizeMismatch { .. }));
+}
+
+#[test]
+fn file_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.meta");
+    let m = sample();
+    m.write_file(&path).unwrap();
+    let parsed = Meta::read_file(&path).unwrap();
+    assert_eq!(parsed, m);
+}
+
+#[test]
+fn read_file_error_includes_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("garbage.meta");
+    std::fs::write(&path, b"this is not valid toml [[[[").unwrap();
+    let err = Meta::read_file(&path).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("garbage.meta"),
+        "expected file path in error message: {msg}"
+    );
 }

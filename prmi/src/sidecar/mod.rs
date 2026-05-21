@@ -21,6 +21,10 @@ pub struct SidecarPaths {
 }
 
 impl SidecarPaths {
+    /// Build the four sidecar paths by literal concatenation of suffixes onto
+    /// `prefix`. This intentionally uses raw `OsStr` concatenation rather than
+    /// [`Path::with_extension`] so that an existing extension on `prefix` (e.g.
+    /// `.prmi` in `hg38.fa.prmi`) is preserved intact.
     pub fn from_prefix(prefix: &Path) -> Self {
         let p = prefix.to_path_buf();
         let with = |suffix: &str| {
