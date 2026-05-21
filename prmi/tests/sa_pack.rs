@@ -24,7 +24,7 @@ fn layout_is_hi32_then_lo8_little_endian() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "SA position")]
 fn pack_overflow_panics() {
     pack_position(MAX_PACKED_POSITION + 1);
 }

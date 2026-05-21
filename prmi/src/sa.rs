@@ -14,7 +14,9 @@ pub const MAX_PACKED_POSITION: u64 = (1u64 << 40) - 1;
 /// `bytes[0..4] = LE u32 position_hi (upper 32 bits)`,
 /// `bytes[4]    = u8 position_lo (lowest 8 bits)`.
 ///
-/// `position_hi` is bits 8..40 of the position; `position_lo` is bits 0..8.
+/// `position_hi` holds bits 8..40 (the upper 32); `position_lo` holds bits
+/// 0..8 (the lowest 8). Both ranges are half-open (`a..b` means bits `a`
+/// through `b-1` inclusive).
 /// The full uint40 reconstruction is `(hi as u64) << 8 | lo as u64`.
 ///
 /// Panics if `pos > MAX_PACKED_POSITION`.
