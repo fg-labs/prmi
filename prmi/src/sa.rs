@@ -6,6 +6,9 @@
 //! well past the human genome's ~3.1 Gbp.
 
 use byteorder::{ByteOrder, LittleEndian};
+use libsais::SuffixArrayConstruction;
+
+use crate::error::{Error, Result};
 
 pub const BYTES_PER_PACKED_ENTRY: usize = 5;
 pub const MAX_PACKED_POSITION: u64 = (1u64 << 40) - 1;
@@ -40,4 +43,32 @@ pub fn unpack_position(bytes: &[u8; BYTES_PER_PACKED_ENTRY]) -> u64 {
     let hi = LittleEndian::read_u32(&bytes[0..4]) as u64;
     let lo = bytes[4] as u64;
     (hi << 8) | lo
+}
+
+/// Construct the suffix array for a 2-bit–encoded byte sequence.
+///
+/// `bases` is a slice of 2-bit–coded bases (values 0–3). An empty slice
+/// returns an empty `Vec`. On success, each element of the returned `Vec` is
+/// the 0-based starting position of the corresponding sorted suffix, stored as
+/// `u64`.
+///
+/// # Errors
+///
+/// Returns `Error::SaConstruction` if the underlying `libsais` call fails.
+pub fn build_suffix_array(bases: &[u8]) -> Result<Vec<u64>> {
+    if bases.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sa_i64: Vec<i64> = SuffixArrayConstruction::for_text(bases)
+        .in_owned_buffer64()
+        .single_threaded()
+        .run()
+        .map_err(|e| Error::SaConstruction {
+            detail: format!("{e}"),
+        })?
+        .into_vec();
+
+    let sa: Vec<u64> = sa_i64.into_iter().map(|v| v as u64).collect();
+    Ok(sa)
 }
