@@ -11,6 +11,7 @@
 //! See `docs/superpowers/handoff/2026-05-20-prmi-v0.1-brief.md` for the
 //! v0.1 sidecar format spec and the C ABI contract.
 
+pub mod cli;
 pub mod encoding;
 pub mod error;
 pub mod fasta;

@@ -24,8 +24,7 @@ serde.workspace = true
 toml.workspace = true
 memmap2.workspace = true
 byteorder.workspace = true
-# Legacy binary uses clap 2 API; Task 19 will rewrite the CLI with clap 4
-clap = "2"
+clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
 rayon.workspace = true
