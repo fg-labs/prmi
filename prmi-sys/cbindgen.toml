@@ -1,0 +1,14 @@
+language = "C"
+header = "/* Copyright (C) 2026 Fulcrum Genomics LLC; SPDX-License-Identifier: MIT */"
+include_guard = "PRMI_H"
+cpp_compat = true
+sys_includes = ["stddef.h", "stdint.h"]
+no_includes = true
+documentation = true
+documentation_style = "doxy"
+
+[parse]
+parse_deps = false
+
+[export]
+include = ["prmi_index_t"]
