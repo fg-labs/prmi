@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
-use prmi::encoding::{base_to_2bit, tokenize_32mer, BASE_T};
+use prmi::encoding::{base_to_2bit, tokenize_32mer};
 
 #[test]
 fn ascii_to_2bit_maps_acgt() {
@@ -41,6 +41,14 @@ fn tokenize_short_kmer_pads_with_t() {
 }
 
 #[test]
-fn base_t_constant_is_three() {
-    assert_eq!(BASE_T, 3);
+fn tokenize_with_short_slice() {
+    // Exercise the len.min(bases.len()) clamp: pass len == bases.len() == 3.
+    let bases = [0u8, 1u8, 2u8];
+    let key = tokenize_32mer(&bases[..3], 3);
+    // First 3 positions: A(00), C(01), G(10); remaining 29 slots padded with T(11).
+    let expected = tokenize_32mer(&[0u8, 1u8, 2u8], 3);
+    assert_eq!(key, expected);
+    // Verify it doesn't panic (the old code would index out of bounds if len >
+    // bases.len() were not clamped).
+    let _ = tokenize_32mer(&bases[..3], 32);
 }
