@@ -7,7 +7,7 @@
  
  
 use memmap::MmapOptions;
-use rmi_lib::{RMITrainingData, RMITrainingDataIteratorProvider, KeyType};
+use crate::upstream::{RMITrainingData, RMITrainingDataIteratorProvider, KeyType};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::fs::File;
 use std::convert::TryInto;

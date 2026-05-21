@@ -1,0 +1,19 @@
+[package]
+name = "prmi-sys"
+description = "C ABI shim for the prmi crate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "prmi_sys"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+prmi = { path = "../prmi", version = "0.1.0" }
+libc = "0.2"
+
+[build-dependencies]
+cbindgen = "0.27"

@@ -6,8 +6,8 @@
 // < end copyright > 
  
 
-use crate::models::*;
-use crate::cache_fix::cache_fix;
+use super::models::*;
+use super::cache_fix::cache_fix;
 use log::*;
 use std::time::SystemTime;
 
@@ -129,7 +129,7 @@ pub fn train_for_size<T: TrainingKey>(data: &RMITrainingData<T>,
                                      max_size: usize) -> TrainedRMI {
 
     let start_time = SystemTime::now();
-    let pareto = crate::find_pareto_efficient_configs(data, 1000);
+    let pareto = super::optimizer::find_pareto_efficient_configs(data, 1000);
     // go down the front until we find something small enough
 
     let config = pareto.into_iter()
@@ -171,7 +171,7 @@ pub fn train_bounded(data: &RMITrainingData<u64>,
     // construct new training data from our spline points
     let mut new_data = RMITrainingData::new(Box::new(reindexed_splines));
 
-    let mut res = crate::train(&mut new_data, model_spec, branch_factor);
+    let mut res = train(&mut new_data, model_spec, branch_factor);
     res.cache_fix = Some((line_size, spline));
     res.num_data_rows = data.len();
     

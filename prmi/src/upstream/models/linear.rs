@@ -7,7 +7,7 @@
  
  
 
-use crate::models::*;
+use super::*;
 
 fn slr<T: Iterator<Item = (f64, f64)>>(loc_data: T) -> (f64, f64) {
 

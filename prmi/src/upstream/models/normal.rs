@@ -6,7 +6,7 @@
 // < end copyright > 
  
 
-use crate::models::*;
+use super::*;
 use std::f64;
 
 fn exp1(inp: f64) -> f64 {

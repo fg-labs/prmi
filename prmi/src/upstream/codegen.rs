@@ -7,14 +7,14 @@
  
  
 
-use crate::models::Model;
-use crate::models::*;
+use super::models::Model;
+use super::models::*;
 use bytesize::ByteSize;
 use log::*;
 use std::collections::HashSet;
 use std::io::Write;
 use std::str;
-use crate::train::TrainedRMI;
+use super::train::TrainedRMI;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;

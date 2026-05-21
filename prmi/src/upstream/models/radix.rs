@@ -6,8 +6,8 @@
 // < end copyright > 
  
 
-use crate::models::utils::{common_prefix_size, num_bits};
-use crate::models::*;
+use super::utils::{common_prefix_size, num_bits};
+use super::*;
 use log::*;
 
 pub struct RadixModel {

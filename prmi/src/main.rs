@@ -11,11 +11,12 @@
 
 #[macro_use]
 mod load;
+mod upstream;
 
 use load::{load_data, DataType};
-use rmi_lib::{train, train_bounded};
-use rmi_lib::KeyType;
-use rmi_lib::optimizer;
+use crate::upstream::{train, train_bounded};
+use crate::upstream::KeyType;
+use crate::upstream::optimizer;
 
 use json::*;
 use log::*;
@@ -202,7 +203,7 @@ fn main() {
                     let loc_data = data.soft_copy();
                     let mut trained_model = dynamic!(train, loc_data, models, *branch_factor);
                     
-                    let size_bs = rmi_lib::rmi_size(&trained_model);
+                    let size_bs = crate::upstream::rmi_size(&trained_model);
                     
                     let result_obj = object! {
                         "layers" => models.clone(),
@@ -225,7 +226,7 @@ fn main() {
                     }
                     
                     if let Some(nmspc) = namespace {
-                        rmi_lib::output_rmi(
+                        crate::upstream::output_rmi(
                             &nmspc,
                             trained_model,
                             data_dir,
@@ -288,7 +289,7 @@ fn main() {
                 let max_size = max_size_str.parse::<usize>().unwrap();
                 info!("Constructing RMI with size less than {}", max_size);
 
-                let trained_model = dynamic!(rmi_lib::train_for_size, data, max_size);
+                let trained_model = dynamic!(crate::upstream::train_for_size, data, max_size);
                 trained_model
             }
         };
@@ -325,7 +326,7 @@ fn main() {
                 trained_model.build_time = 0;
             }
 
-            rmi_lib::output_rmi(
+            crate::upstream::output_rmi(
                 &namespace,
                 trained_model,
                 data_dir,

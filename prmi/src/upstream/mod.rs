@@ -1,3 +1,6 @@
+// Copyright Ryan Marcus 2020
+// Modified by Fulcrum Genomics 2026
+
 mod codegen;
 mod models;
 mod train;

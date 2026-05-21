@@ -5,8 +5,8 @@
 // 
 // < end copyright > 
  
-use crate::models::*;
-use crate::train::{train_model, TrainedRMI};
+use super::super::models::*;
+use super::{train_model, TrainedRMI};
 use log::*;
 
 pub fn train_multi_layer(data: &mut RMITrainingData,

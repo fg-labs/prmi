@@ -7,7 +7,7 @@
  
  
 
-use crate::models::*;
+use super::*;
 
 #[allow(clippy::float_cmp)]
 fn linear_splines<T: TrainingKey>(data: &RMITrainingData<T>) -> (f64, f64) {

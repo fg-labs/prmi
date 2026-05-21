@@ -1,0 +1,49 @@
+[package]
+name = "prmi"
+description = "Piecewise Recursive Model Index over genomic suffix arrays"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["bioinformatics", "genomics", "rmi", "learned-index", "suffix-array"]
+categories = ["science", "data-structures"]
+readme = "../README.md"
+
+[lib]
+name = "prmi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "prmi"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+memmap2.workspace = true
+byteorder.workspace = true
+# Legacy binary uses clap 2 API; Task 3 will rewrite the CLI with clap 4
+clap = "2"
+log.workspace = true
+env_logger.workspace = true
+rayon.workspace = true
+noodles-fasta.workspace = true
+libsais.workspace = true
+# Legacy binary uses indicatif 0.13 API; Task 3 will update to 0.17
+indicatif = "0.13"
+approx.workspace = true
+sha2.workspace = true
+hex.workspace = true
+time.workspace = true
+anyhow.workspace = true
+# Upstream (rmi_lib) legacy deps — these drop out when the CLI is rewritten in Task 3
+json = "0.12"
+memmap = "0.7"
+bytesize = "1.0"
+superslice = "1.0"
+tabular = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
