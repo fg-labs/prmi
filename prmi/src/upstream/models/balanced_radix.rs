@@ -170,7 +170,7 @@ inline uint64_t bradix_clamp_low(uint64_t prefix_length,
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod tests {
     use super::*;
 

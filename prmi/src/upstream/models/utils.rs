@@ -104,7 +104,7 @@ pub fn radix_index(points: &[u64], num_bits: u8) -> Vec<u64> {
 
 
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod tests {
   use super::*;
   

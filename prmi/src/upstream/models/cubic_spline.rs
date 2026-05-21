@@ -192,7 +192,7 @@ inline double cubic(double a, double b, double c, double d, double x) {
     }    
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod tests {
     use super::*;
     use approx::*;

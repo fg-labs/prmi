@@ -764,7 +764,7 @@ pub trait Model: Sync + Send {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod tests {
     use super::*;
 

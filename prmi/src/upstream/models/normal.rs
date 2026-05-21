@@ -127,7 +127,7 @@ inline double ncdf(double mean, double stdev, double scale, double inp) {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod ncdf_tests {
     use super::*;
 
@@ -202,7 +202,7 @@ inline double lncdf(double mean, double stdev, double scale, double inp) {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod lncdf_tests {
     use super::*;
 

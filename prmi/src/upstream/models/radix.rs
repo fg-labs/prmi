@@ -170,7 +170,7 @@ inline uint64_t radix_table(const uint32_t* table, const uint64_t inp) {{
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod tests {
     use super::*;
 

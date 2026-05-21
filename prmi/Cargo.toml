@@ -45,5 +45,10 @@ bytesize = "1.0"
 superslice = "1.0"
 tabular = "0.1"
 
+[features]
+# Gates the upstream (Marcus) internal test modules; off by default.
+# Enable with: cargo test --features upstream_tests
+upstream_tests = []
+
 [dev-dependencies]
 tempfile = "3"

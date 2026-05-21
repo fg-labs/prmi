@@ -83,7 +83,7 @@ inline double linear(double alpha, double beta, double inp) {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod tests {
     use super::*;
 

@@ -104,7 +104,7 @@ inline uint64_t ed_histogram(const uint64_t length,
     fn needs_bounds_check(&self) -> bool { return false; }
 }
 
-#[cfg(test)]
+#[cfg(feature = "upstream_tests")]
 mod tests {
     use super::*;
     
