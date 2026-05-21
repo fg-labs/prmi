@@ -193,6 +193,237 @@ fn build_partial_models_from<T: TrainingKey>(
     return leaf_models;
 }
 
+// called in train_partial_three_layer (Task 15.5f)
+#[allow(dead_code)]
+fn build_partial_3layer_models_from<T: TrainingKey>(
+    data: &RMITrainingData<T>,
+    top_model: &Box<dyn Model>,
+    model_type: &str,
+    model_type_partial: &str,
+    start_idx: usize,
+    end_idx: usize,
+    first_model_idx: usize,
+    num_models: usize,
+) -> (
+    Vec<Box<dyn Model>>,
+    Vec<(usize, usize)>,
+    Vec<LowerBoundCorrection<T>>,
+    Vec<Box<dyn Model>>,
+    usize,
+) {
+    assert!(
+        end_idx > start_idx,
+        "start index was {} but end index was {}",
+        start_idx,
+        end_idx
+    );
+    assert!(end_idx <= data.len());
+    assert!(start_idx <= data.len());
+
+    let dummy_md = RMITrainingData::<T>::empty();
+    let mut leaf_models: Vec<Box<dyn Model>> = Vec::with_capacity(num_models as usize);
+    let mut partial_3rd_models: Vec<Box<dyn Model>> = Vec::new();
+    let mut partial_3rd_idx: Vec<(usize, usize)> = Vec::new();
+    let mut partial_3rd_lb_corrs: Vec<LowerBoundCorrection<T>> = Vec::new();
+    let mut second_layer_data: Vec<(T, usize)> =
+        Vec::with_capacity((end_idx - start_idx) / num_models as usize);
+    let mut last_target = first_model_idx;
+
+    let bounded_it = data.iter().skip(start_idx).take(end_idx - start_idx);
+
+    let mut third_layer_num: usize = 0;
+
+    let make_partial_threshold = 1000;
+    let average_partial_model_num = 20;
+
+    for (x, y) in bounded_it {
+        let model_pred = top_model.predict_to_int(&x.to_model_input()) as usize;
+        assert!(
+            top_model.needs_bounds_check() || model_pred < first_model_idx + num_models,
+            "Top model gave an index of {} which is out of bounds of {}. \
+                Subset range: {} to {}",
+            model_pred,
+            start_idx + num_models,
+            start_idx,
+            end_idx
+        );
+        let target = usize::min(first_model_idx + num_models - 1, model_pred);
+        assert!(target >= last_target);
+        if target > last_target {
+            // this is the first datapoint for the next leaf model.
+            // train the previous leaf model.
+            // include the first point of the next leaf node to
+            // support lower bound searches (not required, but reduces error)
+            let last_item = second_layer_data.last().copied();
+            second_layer_data.push((x, y));
+            let mut container = RMITrainingData::new(Box::new(second_layer_data));
+            if container.len() > make_partial_threshold {
+                let curr_third_layer_num =
+                    (container.len() as f64 / average_partial_model_num as f64).round() as u64;
+                let start_y = container.get(0).1;
+                let end_y = container.get(container.len() - 1).1;
+
+                container.set_offset(container.get(0).1);
+                container.set_scale((curr_third_layer_num - 1) as f64 / (end_y - start_y) as f64);
+
+                let leaf_model = train_model(model_type, &container);
+
+                // check if only single partial model is used, and exclude
+
+                partial_3rd_idx.append(&mut vec![(third_layer_num, curr_third_layer_num as usize)]);
+                container.set_offset(0);
+                container.set_scale(1.0);
+
+                let mut curr_partial_3rd_model = build_partial_models_from(
+                    &container,
+                    &leaf_model,
+                    model_type_partial,
+                    0,
+                    container.len(),
+                    0,
+                    curr_third_layer_num as usize,
+                    third_layer_num as u64,
+                );
+
+                let lb_corrections = LowerBoundCorrection::new(
+                    |x| leaf_model.predict_to_int(&x.to_model_input()),
+                    curr_third_layer_num,
+                    &container,
+                );
+                for idx in 0..(curr_third_layer_num as usize) {
+                    assert_eq!(
+                        lb_corrections.first_key(idx).is_none(),
+                        lb_corrections.last_key(idx).is_none()
+                    );
+                    if lb_corrections.last_key(idx).is_none() {
+                        // model is empty!
+                        let mut upper_bound = lb_corrections.next_index(idx);
+                        // next index is 0 if first and single model is used in 3rd layer
+                        // no need to use partial layer in this case, need fix
+                        if lb_corrections.first_non_empty_model() == 0
+                            && lb_corrections.first_non_empty_model()
+                                == lb_corrections.last_non_empty_model()
+                        {
+                            upper_bound = end_y + 1;
+                        }
+                        if !curr_partial_3rd_model[idx].set_to_constant_model(upper_bound as u64) {
+                            panic!();
+                        }
+                    }
+                }
+                leaf_models.push(leaf_model);
+                partial_3rd_lb_corrs.append(&mut vec![lb_corrections]);
+                partial_3rd_models.append(&mut curr_partial_3rd_model);
+                third_layer_num += curr_third_layer_num as usize;
+                assert!(partial_3rd_models.len() == third_layer_num);
+            } else {
+                let leaf_model = train_model(model_type, &container);
+                partial_3rd_idx.append(&mut vec![(0, 0)]);
+                leaf_models.push(leaf_model);
+            }
+            // leave empty models for any we skipped.
+            for _skipped_idx in (last_target + 1)..target {
+                leaf_models.push(train_model(model_type, &dummy_md));
+                partial_3rd_idx.append(&mut vec![(0, 0)]);
+            }
+            assert_eq!(leaf_models.len() + first_model_idx, target);
+
+            second_layer_data = Vec::new();
+
+            // include the last item of this leaf in the next leaf
+            // to support lower bound searches.
+            if let Some(v) = last_item {
+                second_layer_data.push(v);
+            }
+        }
+        second_layer_data.push((x, y));
+        last_target = target;
+    }
+
+    // train the last remaining model
+    assert!(!second_layer_data.is_empty());
+    let mut container = RMITrainingData::new(Box::new(second_layer_data));
+    if container.len() > make_partial_threshold {
+        let curr_third_layer_num =
+            (container.len() as f64 / average_partial_model_num as f64).round() as usize;
+        let start_y = container.get(0).1;
+        let end_y = container.get(container.len() - 1).1;
+
+        container.set_offset(container.get(0).1);
+        container.set_scale((curr_third_layer_num - 1) as f64 / (end_y - start_y) as f64);
+
+        let leaf_model = train_model(model_type, &container);
+        partial_3rd_idx.append(&mut vec![(third_layer_num, curr_third_layer_num)]);
+
+        container.set_offset(0);
+        container.set_scale(1.0);
+        // build partial 3 layer model with calculated number of models to build
+        let mut curr_partial_3rd_model = build_partial_models_from(
+            &container,
+            &leaf_model,
+            model_type_partial,
+            0,
+            container.len(),
+            0,
+            curr_third_layer_num,
+            third_layer_num as u64,
+        );
+        // Do lowerboundcorrection
+        let lb_corrections = LowerBoundCorrection::new(
+            |x| leaf_model.predict_to_int(&x.to_model_input()),
+            curr_third_layer_num as u64,
+            &container,
+        );
+        // set empty models to constant model
+        for idx in 0..curr_third_layer_num {
+            assert_eq!(
+                lb_corrections.first_key(idx).is_none(),
+                lb_corrections.last_key(idx).is_none()
+            );
+            if lb_corrections.last_key(idx).is_none() {
+                // model is empty!
+                let mut upper_bound = lb_corrections.next_index(idx);
+                // if data is all inside single and first model of partial models, upper bound should be end_y + 1
+                // lowerbound have next set to 0 in this case
+                if lb_corrections.first_non_empty_model() == 0
+                    && lb_corrections.first_non_empty_model()
+                        == lb_corrections.last_non_empty_model()
+                {
+                    upper_bound = end_y + 1;
+                }
+                if !curr_partial_3rd_model[idx].set_to_constant_model(upper_bound as u64) {
+                    panic!();
+                }
+            }
+        }
+        leaf_models.push(leaf_model);
+        partial_3rd_lb_corrs.append(&mut vec![lb_corrections]);
+        partial_3rd_models.append(&mut curr_partial_3rd_model);
+
+        third_layer_num += curr_third_layer_num;
+        assert!(partial_3rd_models.len() == third_layer_num);
+    } else {
+        let leaf_model = train_model(model_type, &container);
+        partial_3rd_idx.append(&mut vec![(0, 0)]);
+        leaf_models.push(leaf_model);
+    }
+    assert!(leaf_models.len() <= num_models);
+
+    // add models at the end with nothing mapped into them
+    for _skipped_idx in (last_target + 1)..(first_model_idx + num_models) as usize {
+        leaf_models.push(train_model(model_type, &dummy_md));
+        partial_3rd_idx.append(&mut vec![(0, 0)]);
+    }
+    assert_eq!(num_models as usize, leaf_models.len());
+    return (
+        leaf_models,
+        partial_3rd_idx,
+        partial_3rd_lb_corrs,
+        partial_3rd_models,
+        third_layer_num,
+    );
+}
+
 pub fn train_two_layer<T: TrainingKey>(
     md_container: &mut RMITrainingData<T>,
     layer1_model: &str,

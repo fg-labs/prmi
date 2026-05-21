@@ -294,17 +294,19 @@ where
 pub struct RMITrainingData<T> {
     iterable: Arc<Box<dyn RMITrainingDataIteratorProvider<InpType = T>>>,
     scale: f64,
+    offset: usize,
 }
 
 macro_rules! map_scale {
     ($self: expr, $inp: expr) => {{
         let sf = ($self).scale;
+        let of = ($self).offset;
         let use_sf = (sf - 1.0).abs() > std::f64::EPSILON;
         ($inp).map(move |(key, offset)| {
             if use_sf {
-                (key, (offset as f64 * sf) as usize)
+                (key, ((offset - of) as f64 * sf) as usize)
             } else {
-                (key, offset)
+                (key, offset - of)
             }
         })
     }};
@@ -317,6 +319,7 @@ impl<T: TrainingKey> RMITrainingData<T> {
         return RMITrainingData {
             iterable: Arc::new(iterable),
             scale: 1.0,
+            offset: 0,
         };
     }
 
@@ -330,6 +333,10 @@ impl<T: TrainingKey> RMITrainingData<T> {
 
     pub fn set_scale(&mut self, scale: f64) {
         self.scale = scale;
+    }
+
+    pub fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
     }
 
     pub fn get(&self, idx: usize) -> (T, usize) {
@@ -380,6 +387,7 @@ impl<T: TrainingKey> RMITrainingData<T> {
     pub fn soft_copy(&self) -> RMITrainingData<T> {
         return RMITrainingData {
             scale: self.scale,
+            offset: self.offset,
             iterable: Arc::clone(&self.iterable),
         };
     }
