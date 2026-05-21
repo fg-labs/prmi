@@ -1,3 +1,6 @@
+// Copyright Ryan Marcus 2020
+// Modified by Fulcrum Genomics 2026
+
 use log::*;
 use super::models::TrainingKey;
 use super::RMITrainingData;
