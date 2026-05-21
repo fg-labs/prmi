@@ -10,7 +10,7 @@
 #![allow(clippy::all, unused_imports, unused_variables, dead_code)]
 
 use memmap::MmapOptions;
-use crate::upstream::{RMITrainingData, RMITrainingDataIteratorProvider, KeyType};
+use prmi::upstream::{RMITrainingData, RMITrainingDataIteratorProvider, KeyType};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::fs::File;
 use std::convert::TryInto;

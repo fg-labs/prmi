@@ -16,4 +16,4 @@ pub mod sa;
 pub mod sidecar;
 pub use error::{Error, Result};
 
-pub(crate) mod upstream;
+pub mod upstream;
