@@ -1,121 +1,104 @@
-# RMI
+# prmi
 
-[![Build Status](https://drone.rm.cab/api/badges/learnedsystems/RMI/status.svg)](https://drone.rm.cab/learnedsystems/RMI)
+> **Status: v0.1 — pre-release.** Not yet published to crates.io. Build from source.
 
-This is a reference implementation of recursive model indexes (RMIs). A prototype RMI was initially described in [The Case for Learned Index Structures](https://arxiv.org/abs/1712.01208) by Kraska et al. in 2017.
+## What it is
 
-![Fig 1 from the Case for Learned Index Structures](http://people.csail.mit.edu/ryanmarcus/rmi.png)
+**prmi** is a P-RMI (Piecewise Recursive Model Index) over a genomic suffix array. It is a two-crate Cargo workspace — `prmi` (Rust library + CLI trainer) and `prmi-sys` (thin C FFI shim) — designed as a drop-in learned-index accelerator for short-read aligners such as bwa-mem3. Given a reference FASTA, `prmi build` trains a two-layer radix-routed RMI over the suffix array, writes a compact sidecar on disk, and exposes a stable C and Rust API for fast bounded-search seeding at alignment time.
 
-## RMI basics
+## Provenance
 
-Like binary search trees, an RMI is a structure to help search through sorted data. Given a sorted array, an RMI is a function that maps a key to an approximate index. This approximate index can be used as a starting point for a linear, exponential, or binary search. The [SOSD benchmark](https://learned.systems/sosd) demonstrates that RMIs can outperform binary search and many other standard approaches as well.
+`fg-labs/prmi` is a GitHub fork of [`learnedsystems/RMI`](https://github.com/learnedsystems/RMI) — Ryan Marcus's MIT-licensed reference implementation of recursive model indexes. The P-RMI trainer additionally embeds verbatim training-pipeline code from the [`kaist-ina/BWA-MEME`](https://github.com/kaist-ina/BWA-MEME) RMI fork, which is also MIT-licensed. See [`LICENSE-FORK-NOTICE.md`](LICENSE-FORK-NOTICE.md) for the full fork lineage and tri-attribution convention.
 
-Unlike a binary search tree, an RMI uses machine learning techniques to build this approximation function. The result is normally a small, compact mathematical function that can be evaluated quickly. RMIs are a good tool when you need to search the same sorted data many times. Compared to other structures, RMIs:
+## Quick start (build from source)
 
-* (➕) Offer faster lookup times (when properly tuned)
-* (➕) Are generally much smaller than traditional structures like B-Trees or radix trees
-* (➖) Must be trained ahead of time on a dataset
-* (➖) Do not support inserts (without retraining the model)
-
-Many more details can be found in [the original paper](https://arxiv.org/abs/1712.01208).
-
-## Using this implementation
-
-To use the reference implementation, clone this repository and [install Rust](https://rustup.rs/).
-
-The reference RMI implementation is a *compiler.* It takes a dataset as input, and produces C/C++ source files as outputs. The data input file must be a binary file containing:
-
-1. The number of items, as a 64-bit unsigned integer (little endian)
-2. The data items, either 32-bit or 64-bit unsigned integers (little endian)
-
-If the input file contains 32-bit integers, the filename must end with `uint32`. If the input file contains 64-bit integers, the filename must end with `uint64`. If the input file contains 64-bit floats, the filename must end with `f64`.
-
-In addition to the input dataset, you must also provide a model structure. For example, to build a 2-layer RMI on the data file `books_200M_uint32` (available from [the Harvard Dataverse](https://dataverse.harvard.edu/file.xhtml?persistentId=doi:10.7910/DVN/JGVF9A/MZZUP2&version=4.0)) with a branching factor of 100, we could run:
-
-```
-cargo run --release -- books_200M_uint32 my_first_rmi linear,linear 100
+```bash
+git clone https://github.com/fg-labs/prmi
+cd prmi
+cargo build --release -p prmi
+./target/release/prmi build path/to/ref.fa
+# Produces ref.fa.prmi.{meta,sa,l1,l2}
 ```
 
-Logging useful diagnostic information can be enabled by setting the `RUST_LOG` environmental variable to `trace`: `export RUST_LOG=trace`.
+To use the Rust reader from another crate (path dependency — prmi is not yet on crates.io):
 
+```rust
+// In your Cargo.toml: prmi = { path = "../prmi/prmi" }
+use prmi::index::LearnedIndex;
 
-## Generated code
-The RMI generator  produces C/C++ source files in the current directory. The command directly above, for example, produces the following output. The C/C++ sources contain a few publicly-exposed fields:
-
-```C++
-#include <cstddef>
-#include <cstdint>
-namespace wiki {
-    bool load(char const* dataPath);
-    void cleanup();
-    const size_t RMI_SIZE = 50331680;
-    const uint64_t BUILD_TIME_NS = 14288421237;
-    const char NAME[] = "wiki";
-    uint64_t lookup(uint64_t key, size_t* err);
-}
-
+let idx = LearnedIndex::open("ref.fa.prmi")?;
+let (pos, err) = idx.lookup(my_32mer_key);
 ```
 
-* The `RMI_SIZE` constant represents the size of the constructed model in bytes. 
-* The `BUILD_TIME_NS` field records how long it took to build the RMI, in nanoseconds. 
-* The `NAME` field is a constant you specify (and always matches the namespace name). 
-* The `load` function will need to be called before any calls to `lookup`. The `dataPath` parameter must the path to the directory containing the RMI data (`rmi_data` in this example / the default).
-* The `lookup` function takes in an unsigned, 64-bit integer key and produces an estimate of the offset. The `err` parameter will be populated with the maximum error from the RMI's prediction to the target key. This lookup error can be used to perform a bounded binary search. If the error of the trained RMI is low enough, linear search may give better performance.
+## Sidecar layout
 
-If you run the compiler with the `--no-errors` flag, the API will change to no longer report the maximum possible error of each lookup, saving some space.
-
-```c++
-uint64_t lookup(uint64_t key);
-```
-
-
-## RMI Layers and Tuning
-
-Currently, the following types of RMI layers are supported:
-
-* `linear`, simple linear regression
-* `linear_spline`, connected linear spline segments
-* `cubic`, connected cubic spline segments
-* `loglinear`, simple linear regression with a log transform
-* `normal`, normal CDF with tuned mean, variance, and scale.
-* `lognormal`, normal CDF with log transform
-* `radix`, eliminates common prefixes and returns a fixed number of significant bits based on the branching factor
-* `bradix`, same as radix, but attempts to choose the number of bits based on balancing the dataset
-* `histogram`, partitions the data into several even-sized blocks (based on the branching factor)
-
-Tuning an RMI is critical to getting good performance. A good place to start is a `cubic` layer followed by a large linear layer, for example: `cubic,linear 262144`. For automatic tuning, try the RMI optimizer using the `--optimize` flag:
+The trainer emits four files sharing a common prefix (typically `<ref>.fa.prmi`):
 
 ```
-cargo run --release -- --optimize optimizer_out.json books_200M_uint64
+<prefix>.meta    TOML header (small)
+<prefix>.sa      Packed suffix array (large; ~15 GB for human genome)
+<prefix>.l1      L1 model parameters (fallback layer)
+<prefix>.l2      L2 model parameters (primary radix-routed layer)
 ```
 
-By default, the optimizer will use 4 threads. If you have a big machine, consider increasing this with the `--threads` option.
+All multi-byte fields are little-endian. The reader mmaps the files at open time and validates magic bytes, counts, and sizes across all four files before returning a handle.
 
-The optimizer will output a table, with each row representing an RMI configuration. By default, the optimizer selects a small set of possible configurations that are heuristically selected to cover the Pareto front. Each column contains:
+## C API
 
-* `Models`: the model types used at each level of the RMI
-* `Branch`: the branching factor of the RMI (number of leaf models)
-* `AvgLg2`: the average log2 error of the model (which approximates the number of binary search steps required to find a particular key within a range predicted by the RMI)
-* `MaxLg2`: the maximum log2 error of the model (the maximum number of binary search steps required to find any key within the range predicted by the RMI)
-* `Size (b)`: the in-memory size of the RMI, in bytes.
+The stable C API is declared in `prmi-sys/include/prmi.h` (generated at build time by `cbindgen`):
 
-## Citation and license
+```c
+int  prmi_open (const char* sidecar_prefix, prmi_index_t** out_handle);
+void prmi_close(prmi_index_t* handle);
+int  prmi_lookup(const prmi_index_t* handle, uint64_t key,
+                 uint64_t* out_predicted_sa_pos, uint64_t* out_err);
+int  prmi_smem_range(const prmi_index_t* handle,
+                     const uint8_t* query, int query_len,
+                     const uint8_t* pac, size_t pac_len,
+                     uint64_t* out_k, uint64_t* out_l, uint64_t* out_s);
+size_t      prmi_sa_num         (const prmi_index_t*);
+uint64_t    prmi_max_error_bound(const prmi_index_t*);
+const char* prmi_format_version (const prmi_index_t*);
+const char* prmi_last_error_message(void);
+```
 
-If you use this RMI implementation in your academic research, please cite the CDFShop paper:
+All functions return 0 on success or a negative integer on error. `prmi_last_error_message()` returns a thread-local human-readable string valid until the next `prmi_*` call on the same thread. Handles are safe for concurrent lookup calls after `prmi_open` returns. See `examples/cpp_caller.cc` for a working C++ consumer.
 
+Note: `prmi_smem_range` takes an explicit `pac_len` parameter beyond the bare C API sketch in the brief; see `examples/cpp_caller.cc` for the authoritative signature.
 
-> Ryan Marcus, Emily Zhang, and Tim Kraska. 2020. CDFShop: Exploring and Optimizing Learned Index Structures. In Proceedings of the 2020 ACM SIGMOD International Conference on Management of Data (SIGMOD '20). Association for Computing Machinery, New York, NY, USA, 2789–2792. DOI:https://doi.org/10.1145/3318464.3384706
+## v0.1 scope
 
+What is in v0.1:
 
-If you are comparing a new index structure to learned approaches, or evaluating a new learned approach, please take a look at our [benchmark for learned index structures](https://learned.systems/sosd).
+- Reference-only training (no BED or FASTQ priors yet).
+- Single curated memory mode: 5-byte packed SA entries (uint40 positions).
+- 1-base-per-byte pac at the C ABI — not the 4-bpb BWA-MEME format.
+- Single-key C API (`prmi_smem_range` and `prmi_lookup`); no batch API — `prmi_smem_range_batch` is v0.2.
+- Contigs concatenated without sentinels — 32-mer queries can spuriously match across contig boundaries; callers are responsible for filtering these hits.
+- N bases encoded as A (0) in the 2-bit pac.
 
-For RMIs and learned index structures in general, one should cite the original paper:
+## Roadmap (v0.2+)
 
-> Tim Kraska, Alex Beutel, Ed H. Chi, Jeffrey Dean, and Neoklis Polyzotis. 2018. The Case for Learned Index Structures. In Proceedings of the 2018 International Conference on Management of Data (SIGMOD '18). Association for Computing Machinery, New York, NY, USA, 489–504. DOI:https://doi.org/10.1145/3183713.3196909
+- BED priors: target-aware training (capture priors from a target-capture BED).
+- FASTQ histogram priors: workload-aware training from a read-set histogram.
+- Batch FFI: `prmi_smem_range_batch` for aligned-SIMD seeding pipelines.
+- Optional 4-bpb pac mode: drop-in compatibility with BWA-MEME's packed reference.
+- Parallel SA construction: faster `prmi build` on many-core machines.
 
+## Building and testing
 
-This work is freely available under the terms of the MIT license.
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo build -p prmi-sys --release   # generates prmi-sys/include/prmi.h
+make -C examples                     # builds cpp_caller against libprmi_sys.a
+./examples/run_smoke.sh              # end-to-end smoke test
+```
 
-## Contributors
+## Citation
 
-* [Ryan Marcus](https://rmarcus.info)
+If you use prmi in published work, please cite [forthcoming].
+
+## License
+
+MIT throughout. See [`LICENSE`](LICENSE) (Marcus's MIT license text, which applies to the whole repository including new files) and [`LICENSE-FORK-NOTICE.md`](LICENSE-FORK-NOTICE.md) (fork lineage and tri-attribution convention).
