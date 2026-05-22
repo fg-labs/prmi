@@ -268,3 +268,34 @@ pub unsafe extern "C" fn prmi_format_version(handle: *const prmi_index_t) -> *co
     let _ = handle;
     CSTR.as_ptr() as *const c_char
 }
+
+/// Tokenize up to 32 bases (2-bit packed, MSB-first, T-pad short queries)
+/// into a u64 key suitable for prmi_lookup. Mirrors prmi's internal
+/// tokenization exactly, so callers don't have to reimplement it.
+///
+/// `bases` points to up to 32 unpacked bytes (values 0..=3). `len` is the
+/// number of valid bases; values > 32 are clamped to 32.
+///
+/// Returns 0 on success and writes the key to `*out_key`; returns -1 if
+/// any pointer is null or `len < 0`.
+///
+/// # Safety
+/// `bases` must point to at least `len` valid bytes when `len > 0`.
+/// `out_key` must be a valid writable u64 location.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_tokenize_32mer(
+    bases: *const u8,
+    len: c_int,
+    out_key: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if bases.is_null() || out_key.is_null() || len < 0 {
+        set_last_error("prmi_tokenize_32mer: null pointer or negative len");
+        return -1;
+    }
+    let n = (len as usize).min(32);
+    let slice = unsafe { std::slice::from_raw_parts(bases, n) };
+    let key = prmi::encoding::tokenize_32mer(slice, n);
+    unsafe { *out_key = key };
+    0
+}
