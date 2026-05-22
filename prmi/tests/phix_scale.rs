@@ -15,7 +15,9 @@ fn deterministic_fasta(n_bases: usize, seed: u64) -> Vec<u8> {
     let mut s = String::from(">phix_synth\n");
     let mut x = seed;
     for _ in 0..n_bases {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         s.push(b"ACGT"[(x & 3) as usize] as char);
     }
     s.push('\n');
@@ -78,5 +80,9 @@ fn phix_scale_smem_range_resolves_first_suffix() {
     let (k, l, s) = idx.smem_range(&query, &bases).unwrap();
     assert!(l > 0, "expected non-empty SA range at first suffix");
     assert!(s >= 32, "expected s >= 32, got {s}");
-    assert!(k < idx.sa_num(), "k={k} out of range (sa_num={})", idx.sa_num());
+    assert!(
+        k < idx.sa_num(),
+        "k={k} out of range (sa_num={})",
+        idx.sa_num()
+    );
 }
