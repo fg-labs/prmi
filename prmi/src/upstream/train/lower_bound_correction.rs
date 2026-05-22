@@ -46,7 +46,6 @@ fn compute_next_for_leaf<T: TrainingKey>(
     num_leaf_models: u64,
     num_keys: usize,
     first_key_for_leaf: &[Option<(usize, T)>],
-    last_key_for_leaf: &[Option<(usize, T)>],
 ) -> Vec<(usize, T)> {
     let mut next_for_leaf = vec![(0, T::zero_value()); num_leaf_models as usize];
     let mut idx: usize = 0;
@@ -60,14 +59,8 @@ fn compute_next_for_leaf<T: TrainingKey>(
                 idx = next_leaf_idx;
             }
             None => {
-                if idx == 0 {
-                    // partial models have only a single model used; nothing to fill.
-                    break;
-                }
-                // As last data is included in next, last key should be first key of next model.
-                let last_next_for_leaf = usize::max(last_key_for_leaf[idx].unwrap().0, num_keys);
                 for i in idx..num_leaf_models as usize {
-                    next_for_leaf[i] = (last_next_for_leaf, T::max_value());
+                    next_for_leaf[i] = (num_keys, T::max_value());
                 }
                 break;
             }
@@ -107,8 +100,6 @@ pub struct LowerBoundCorrection<T> {
     next: Vec<(usize, T)>,
     prev: Vec<(usize, T)>,
     run_lengths: Vec<u64>,
-    last_nonempty_model_idx: u64,
-    first_nonempty_model_idx: u64,
 }
 
 impl<T: TrainingKey> LowerBoundCorrection<T> {
@@ -125,17 +116,11 @@ impl<T: TrainingKey> LowerBoundCorrection<T> {
         let mut max_run_length: Vec<u64> = vec![0; num_leaf_models as usize];
 
         let mut last_target = 0;
-        let mut last_nonempty_model_idx = 0;
-        let mut first_nonempty_model_idx = num_leaf_models;
         let mut current_run_length = 0;
         let mut current_run_key = data.get_key(0);
         for (x, y) in data.iter() {
             let leaf_idx = pred_func(x.into());
             let target = u64::min(num_leaf_models - 1, leaf_idx) as usize;
-
-            if first_nonempty_model_idx == num_leaf_models {
-                first_nonempty_model_idx = target as u64;
-            }
 
             if target == last_target && x == current_run_key {
                 current_run_length += 1;
@@ -152,15 +137,12 @@ impl<T: TrainingKey> LowerBoundCorrection<T> {
                 first_key_for_leaf[target] = Some((y, x));
             }
             last_key_for_leaf[target] = Some((y, x));
-
-            last_nonempty_model_idx = target as u64;
         }
 
         let next_for_leaf = compute_next_for_leaf(
             num_leaf_models,
             data.len(),
             &first_key_for_leaf,
-            &last_key_for_leaf,
         );
         let prev_for_leaf = compute_prev_for_leaf(num_leaf_models, &last_key_for_leaf);
 
@@ -170,8 +152,6 @@ impl<T: TrainingKey> LowerBoundCorrection<T> {
             next: next_for_leaf,
             prev: prev_for_leaf,
             run_lengths: max_run_length,
-            last_nonempty_model_idx,
-            first_nonempty_model_idx,
         };
     }
 
@@ -179,16 +159,8 @@ impl<T: TrainingKey> LowerBoundCorrection<T> {
         return self.first[leaf_idx].map(|x| x.1);
     }
 
-    pub fn first(&self, leaf_idx: usize) -> usize {
-        return self.first[leaf_idx].unwrap().0;
-    }
-
     pub fn last_key(&self, leaf_idx: usize) -> Option<T> {
         return self.last[leaf_idx].map(|x| x.1);
-    }
-
-    pub fn last(&self, leaf_idx: usize) -> usize {
-        return self.last[leaf_idx].unwrap().0;
     }
 
     pub fn next(&self, leaf_idx: usize) -> (usize, T) {
@@ -203,19 +175,7 @@ impl<T: TrainingKey> LowerBoundCorrection<T> {
         return self.prev[leaf_idx].1;
     }
 
-    pub fn prev(&self, leaf_idx: usize) -> usize {
-        return self.prev[leaf_idx].0;
-    }
-
     pub fn longest_run(&self, leaf_idx: usize) -> u64 {
         return self.run_lengths[leaf_idx];
-    }
-
-    pub fn last_non_empty_model(&self) -> u64 {
-        return self.last_nonempty_model_idx;
-    }
-
-    pub fn first_non_empty_model(&self) -> u64 {
-        return self.first_nonempty_model_idx;
     }
 }
