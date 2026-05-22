@@ -139,11 +139,7 @@ impl<T: TrainingKey> LowerBoundCorrection<T> {
             last_key_for_leaf[target] = Some((y, x));
         }
 
-        let next_for_leaf = compute_next_for_leaf(
-            num_leaf_models,
-            data.len(),
-            &first_key_for_leaf,
-        );
+        let next_for_leaf = compute_next_for_leaf(num_leaf_models, data.len(), &first_key_for_leaf);
         let prev_for_leaf = compute_prev_for_leaf(num_leaf_models, &last_key_for_leaf);
 
         return LowerBoundCorrection {

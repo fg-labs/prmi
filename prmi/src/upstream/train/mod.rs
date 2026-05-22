@@ -18,7 +18,7 @@ use std::time::SystemTime;
 
 mod two_layer;
 //mod multi_layer;
-mod lower_bound_correction;
+pub mod lower_bound_correction;
 
 pub struct TrainedRMI {
     pub num_rmi_rows: usize,

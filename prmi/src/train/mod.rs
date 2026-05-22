@@ -6,6 +6,7 @@
 pub mod config;
 pub mod keys;
 pub mod prmi;
+pub mod trainer;
 pub mod training_set;
 pub mod verify;
 

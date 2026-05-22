@@ -352,4 +352,3 @@ pub fn train_two_layer<T: TrainingKey>(
         build_time: 0,
     };
 }
-
