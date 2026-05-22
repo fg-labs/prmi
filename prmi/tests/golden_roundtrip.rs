@@ -46,6 +46,15 @@ fn every_suffix_predicted_within_error_bound() {
     }
 }
 
+/// Originally added as a regression guard against BWA-MEME-packed err
+/// values (the upstream 4-field `min_flag<<62 | min_err<<32 | max_flag<<31
+/// | max_err` packing that leaked into our sidecar pre-Phase-5-rev and
+/// produced err values around 4.6e18). Under Phase 5-rev's Fulcrum
+/// trainer the err is always a scalar symmetric radius, so this test
+/// passes trivially. Kept as defense-in-depth: anything that
+/// reintroduces packed err semantics (a BWA-MEME-style refactor, a
+/// merge from a divergent fork, an accidental bit shift) will flunk
+/// here long before downstream consumers notice runaway err.
 #[test]
 fn decoded_err_values_are_sane() {
     let dir = tempdir().unwrap();
