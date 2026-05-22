@@ -3,6 +3,7 @@
 
 //! Trainer: builds a prmi sidecar from a reference FASTA.
 
+pub mod config;
 pub mod keys;
 pub mod prmi;
 pub mod training_set;
