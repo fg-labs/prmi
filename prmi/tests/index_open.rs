@@ -1,7 +1,9 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
+use prmi::error::Error;
 use prmi::index::LearnedIndex;
+use prmi::sidecar::SidecarPaths;
 use prmi::train::build_sidecar;
 use tempfile::tempdir;
 
@@ -35,4 +37,36 @@ fn rejects_missing_files() {
     let dir = tempdir().unwrap();
     let prefix = dir.path().join("absent");
     assert!(LearnedIndex::open(&prefix).is_err());
+}
+
+#[test]
+fn open_rejects_unknown_priors_type_as_format_too_new() {
+    let dir = tempdir().unwrap();
+    let fa = dir.path().join("e.fa");
+    let mut content = String::from(">c\n");
+    for _ in 0..32 {
+        content.push_str("ACGTACGT");
+    }
+    content.push('\n');
+    std::fs::write(&fa, content.as_bytes()).unwrap();
+
+    let prefix = dir.path().join("e.fa.prmi");
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
+
+    // Corrupt the .meta to set priors.type = "bed" (a hypothetical v0.2 value).
+    let meta_path = SidecarPaths::from_prefix(&prefix).meta;
+    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
+    let corrupted = meta_str.replace(r#"type = "uniform""#, r#"type = "bed""#);
+    assert!(
+        corrupted.contains(r#"type = "bed""#),
+        "replacement did not take effect — check the .meta TOML format"
+    );
+    std::fs::write(&meta_path, corrupted).unwrap();
+
+    // Opening should fail cleanly with Error::FormatTooNew { kind: "bed" }.
+    let err = LearnedIndex::open(&prefix).unwrap_err();
+    match err {
+        Error::FormatTooNew { kind } => assert_eq!(kind, "bed"),
+        other => panic!("expected FormatTooNew {{ kind: \"bed\" }}, got {other:?}"),
+    }
 }
