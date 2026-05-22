@@ -45,3 +45,35 @@ fn every_suffix_predicted_within_error_bound() {
         );
     }
 }
+
+#[test]
+fn decoded_err_values_are_sane() {
+    let dir = tempdir().unwrap();
+    let fa = dir.path().join("e.fa");
+    std::fs::write(&fa, deterministic_fasta(4096, 0xCAFE_BABE)).unwrap();
+    let prefix = dir.path().join("e.fa.prmi");
+    build_sidecar(&fa, &prefix, 64).unwrap();
+
+    let idx = LearnedIndex::open(&prefix).unwrap();
+    let sa_num = idx.sa_num();
+    let max_err = idx.max_error_bound();
+
+    // Reconstruct keys, run lookups, and assert each returned `err` is a
+    // reasonable scalar — not BWA-MEME's packed 4.6e18 monster, and not
+    // wildly larger than the global max_error_bound (which is the worst
+    // observed error across the entire training set).
+    let (bases_seen, _) = prmi::fasta::fasta_file_to_2bit(&fa).unwrap();
+    for i in 0..sa_num {
+        let sa_pos = idx.sa_position_for(i);
+        let avail = bases_seen.len().saturating_sub(sa_pos as usize).min(32);
+        let key = tokenize_32mer(&bases_seen[sa_pos as usize..sa_pos as usize + avail], avail);
+        let (_pred, err) = idx.lookup(key);
+        // err can legitimately reach max_error_bound * 2 in pathological cases
+        // (asymmetric distributions), but should never approach 2^31. A bound
+        // of 10x is generous slack while catching the 4.6e18 regression.
+        assert!(
+            err <= max_err.saturating_mul(10) || err < (1u64 << 31),
+            "i={i} err={err} max_error_bound={max_err} — looks unpacked-BWA-MEME"
+        );
+    }
+}

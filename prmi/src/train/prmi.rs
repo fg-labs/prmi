@@ -58,8 +58,35 @@ pub fn train_prmi(ts: &TrainingSet, l2_leaf_count: u64) -> Result<PrmiModel> {
     Ok(PrmiModel { l1, l2, bit_shift })
 }
 
+/// Decode BWA-MEME's 4-field packed err (`min_flag<<62 | min_err<<32 |
+/// max_flag<<31 | max_err`) into a symmetric scalar search radius that
+/// callers can use as `[pred - err, pred + err]` per brief §4.4.
+///
+/// The flag bits are direction indicators we don't currently use; we
+/// return `max(min_err, max_err)` as a safe symmetric bound that covers
+/// both directions.
+#[inline]
+fn decode_packed_err(packed: u64) -> u64 {
+    let min_err = (packed >> 32) & 0x3FFF_FFFF; // bits 32–61
+    let max_err = packed & 0x7FFF_FFFF; // bits 0–30
+    min_err.max(max_err)
+}
+
 /// Walk the trained 3-layer (top + partial_3rd_models + sec_models) RMI and
 /// emit our `.l2` (routing layer) and `.l1` (flat fallback array) entries.
+///
+/// BWA-MEME's trainer stores per-leaf error bounds using a 4-field bit
+/// packing (`min_flag<<62 | min_err<<32 | max_flag<<31 | max_err`). The
+/// sidecar format §4.3 specifies `err` as a scalar search radius, and the
+/// §4.4 lookup math uses it as `[pred - err, pred + err]`. We decode the
+/// packing here at write time so that on-disk sidecar entries are clean
+/// scalars. This localises BWA-MEME-specific encoding knowledge to the
+/// trainer; the reader, the C ABI, and downstream consumers see only
+/// scalars.
+///
+/// The L2-fallback encoding (high bit 63 set: `(partial_start | 0x8000_0000)
+/// << 32 | partial_num`) is not a packed err — it is a routing pointer that
+/// `lookup_core` handles by spec. That encoding is preserved verbatim.
 fn unpack_trained_to_l1_l2(
     trained: &TrainedRMI,
     l2_leaf_count: usize,
@@ -91,10 +118,19 @@ fn unpack_trained_to_l1_l2(
     }
 
     // L2: one entry per sec_model with err from last_layer_max_l1s.
+    // When high bit 63 is set the value is a fallback-routing pointer
+    // (partial_start + partial_num) that lookup_core handles by spec; preserve
+    // it verbatim. When high bit 63 is clear the value is BWA-MEME's 4-field
+    // packed err; decode it to a scalar so the on-disk entry conforms to §4.4.
     let mut l2: Vec<ModelEntry> = Vec::with_capacity(l2_leaf_count);
     for (i, model) in sec_models.iter().enumerate() {
         let (alpha, beta) = extract_alpha_beta(model.as_ref())?;
-        let err = trained.last_layer_max_l1s[i];
+        let raw = trained.last_layer_max_l1s[i];
+        let err = if (raw >> 63) != 0 {
+            raw // fallback-routing pointer; preserve verbatim for lookup_core
+        } else {
+            decode_packed_err(raw) // direct leaf; decode to scalar
+        };
         l2.push(ModelEntry { alpha, beta, err });
     }
 
@@ -119,7 +155,9 @@ fn unpack_trained_to_l1_l2(
         l1.reserve(partial_models.len());
         for (j, model) in partial_models.iter().enumerate() {
             let (alpha, beta) = extract_alpha_beta(model.as_ref())?;
-            let err = trained.third_layer_max_l1s[j];
+            // L1 entries are always direct leaves (never routing pointers);
+            // decode BWA-MEME's 4-field packing unconditionally.
+            let err = decode_packed_err(trained.third_layer_max_l1s[j]);
             l1.push(ModelEntry { alpha, beta, err });
         }
     }
