@@ -32,33 +32,9 @@ The `LICENSE` and `COPYING` files at the repo root carry Marcus's MIT
 license text unchanged; MIT terms apply to the whole repo including all
 new files.
 
-## Inherited from BWA-MEME's RMI fork
+## Acknowledgments
 
-This repository's `prmi/src/upstream/` tree absorbs additional code from
-[`kaist-ina/BWA-MEME`](https://github.com/kaist-ina/BWA-MEME)'s `RMI/rmi_lib/`
-subtree (MIT-licensed) at upstream commit
-`42b2194b2c7d03249e300272dc12a0659d9cc3b1`. Specifically:
-
-- `prmi/src/upstream/models/piecewiselinear.rs` (the P-RMI `pwl` model)
-- The `train_partial_three_layer` codepath in `prmi/src/upstream/train/two_layer.rs`
-- Related extensions to `LowerBoundCorrection` and the `TrainedRMI` struct
-
-These additions are the published P-RMI training pipeline that BWA-MEME
-deploys; we inherit them so prmi's reader can decode the same on-disk
-layout (see the v0.1 brief §4.4).
-
-## Tri-attribution headers for inherited BWA-MEME content
-
-Source files that contain code copied or adapted from BWA-MEME's RMI fork
-carry a three-line copyright preamble:
-
-```
-// Copyright Ryan Marcus 2020          (origin: learnedsystems/RMI)
-// Copyright 2022 Youngmok Jung et al. (origin: kaist-ina/BWA-MEME RMI fork)
-// Modified by Fulcrum Genomics 2026
-// SPDX-License-Identifier: MIT
-```
-
-For files that contain content from only one upstream, drop the
-corresponding line. New files authored entirely by Fulcrum use the
-single-line Fulcrum header from §3.
+BWA-MEME (Jung & Han, Bioinformatics 2022) demonstrated the P-RMI
+variant on suffix-array seeding and informed the algorithmic shape of
+prmi's trainer. No code from BWA-MEME is used in prmi; the trainer is
+Fulcrum-authored on top of Marcus's RMI primitives.
