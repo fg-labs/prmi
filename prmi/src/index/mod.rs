@@ -51,6 +51,11 @@ impl LearnedIndex {
         self.sa.num_entries()
     }
 
+    /// SA position stored at index `i`. `i` must be less than [`sa_num`](Self::sa_num).
+    pub fn sa_position_for(&self, i: u64) -> u64 {
+        self.sa.position(i)
+    }
+
     /// Global maximum prediction error bound recorded in `.meta`.
     pub fn max_error_bound(&self) -> u64 {
         self.meta.rmi.max_error_bound
