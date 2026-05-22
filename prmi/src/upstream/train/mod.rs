@@ -46,7 +46,6 @@ fn train_model<T: TrainingKey>(model_type: &str, data: &RMITrainingData<T>) -> B
         "loglinear" => Box::new(LogLinearModel::new(data)),
         "normal" => Box::new(NormalModel::new(data)),
         "lognormal" => Box::new(LogNormalModel::new(data)),
-        "pwl" => Box::new(PiecewiselinearModel::new(data, 28)),
         "radix" => Box::new(RadixModel::new(data)),
         "radix8" => Box::new(RadixTable::new(data, 8)),
         "radix18" => Box::new(RadixTable::new(data, 18)),

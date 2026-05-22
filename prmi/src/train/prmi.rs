@@ -7,6 +7,7 @@
 //! prmi reader consumes — see v0.1 brief §4 / §4.4.
 
 use crate::error::Result;
+use crate::sidecar::model_file::ModelEntry;
 use crate::train::training_set::TrainingSet;
 
 /// An in-memory P-RMI model ready to be serialized into the `.l1` / `.l2`
