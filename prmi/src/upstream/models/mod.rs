@@ -1,5 +1,4 @@
 // Copyright Ryan Marcus 2020          (origin: learnedsystems/RMI)
-// Copyright 2022 Youngmok Jung et al. (origin: kaist-ina/BWA-MEME RMI fork)
 // Modified by Fulcrum Genomics 2026
 // SPDX-License-Identifier: MIT
 
@@ -17,7 +16,6 @@ mod histogram;
 mod linear;
 mod linear_spline;
 mod normal;
-mod piecewiselinear;
 mod radix;
 mod stdlib;
 mod utils;
@@ -31,7 +29,6 @@ pub use linear::RobustLinearModel;
 pub use linear_spline::LinearSplineModel;
 pub use normal::LogNormalModel;
 pub use normal::NormalModel;
-pub use piecewiselinear::PiecewiselinearModel;
 pub use radix::RadixModel;
 pub use radix::RadixTable;
 pub use stdlib::StdFunctions;
@@ -294,19 +291,17 @@ where
 pub struct RMITrainingData<T> {
     iterable: Arc<Box<dyn RMITrainingDataIteratorProvider<InpType = T>>>,
     scale: f64,
-    offset: usize,
 }
 
 macro_rules! map_scale {
     ($self: expr, $inp: expr) => {{
         let sf = ($self).scale;
-        let of = ($self).offset;
         let use_sf = (sf - 1.0).abs() > std::f64::EPSILON;
         ($inp).map(move |(key, offset)| {
             if use_sf {
-                (key, ((offset - of) as f64 * sf) as usize)
+                (key, (offset as f64 * sf) as usize)
             } else {
-                (key, offset - of)
+                (key, offset)
             }
         })
     }};
@@ -319,7 +314,6 @@ impl<T: TrainingKey> RMITrainingData<T> {
         return RMITrainingData {
             iterable: Arc::new(iterable),
             scale: 1.0,
-            offset: 0,
         };
     }
 
@@ -333,10 +327,6 @@ impl<T: TrainingKey> RMITrainingData<T> {
 
     pub fn set_scale(&mut self, scale: f64) {
         self.scale = scale;
-    }
-
-    pub fn set_offset(&mut self, offset: usize) {
-        self.offset = offset;
     }
 
     pub fn get(&self, idx: usize) -> (T, usize) {
@@ -387,7 +377,6 @@ impl<T: TrainingKey> RMITrainingData<T> {
     pub fn soft_copy(&self) -> RMITrainingData<T> {
         return RMITrainingData {
             scale: self.scale,
-            offset: self.offset,
             iterable: Arc::clone(&self.iterable),
         };
     }
