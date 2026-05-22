@@ -1,0 +1,30 @@
+# CMake config for prmi-sys; place on CMAKE_PREFIX_PATH after substitution.
+# After find_package(PrmiSys), link via `target_link_libraries(... PrmiSys::prmi_sys)`.
+
+set(PRMISYS_VERSION "@VERSION@")
+set(PRMISYS_PREFIX  "@PREFIX@")
+
+set(PRMISYS_INCLUDE_DIR "${PRMISYS_PREFIX}/include")
+set(PRMISYS_LIBRARY     "${PRMISYS_PREFIX}/lib/libprmi_sys.a")
+
+if(NOT EXISTS "${PRMISYS_INCLUDE_DIR}/prmi.h")
+    message(FATAL_ERROR "prmi.h not found at ${PRMISYS_INCLUDE_DIR}")
+endif()
+if(NOT EXISTS "${PRMISYS_LIBRARY}")
+    message(FATAL_ERROR "libprmi_sys.a not found at ${PRMISYS_LIBRARY}")
+endif()
+
+add_library(PrmiSys::prmi_sys STATIC IMPORTED)
+set_target_properties(PrmiSys::prmi_sys PROPERTIES
+    IMPORTED_LOCATION "${PRMISYS_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${PRMISYS_INCLUDE_DIR}"
+)
+
+if(APPLE)
+    target_link_libraries(PrmiSys::prmi_sys INTERFACE
+        "-framework Security" "-framework CoreFoundation")
+elseif(UNIX)
+    target_link_libraries(PrmiSys::prmi_sys INTERFACE pthread dl m)
+endif()
+
+set(PRMISYS_FOUND TRUE)
