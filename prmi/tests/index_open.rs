@@ -56,7 +56,10 @@ fn open_rejects_unknown_strand_as_format_too_new() {
     // Corrupt the .meta to set sa.strand = "forward_reverse" (a hypothetical v0.2 value).
     let meta_path = SidecarPaths::from_prefix(&prefix).meta;
     let meta_str = std::fs::read_to_string(&meta_path).unwrap();
-    let corrupted = meta_str.replace(r#"strand = "forward_only""#, r#"strand = "forward_reverse""#);
+    let corrupted = meta_str.replace(
+        r#"strand = "forward_only""#,
+        r#"strand = "forward_reverse""#,
+    );
     assert!(
         corrupted.contains(r#"strand = "forward_reverse""#),
         "replacement did not take effect — check the .meta TOML format"
@@ -69,9 +72,9 @@ fn open_rejects_unknown_strand_as_format_too_new() {
         Error::FormatTooNew { kind } => {
             assert_eq!(kind, "sa.strand=forward_reverse")
         }
-        other => panic!(
-            "expected FormatTooNew {{ kind: \"sa.strand=forward_reverse\" }}, got {other:?}"
-        ),
+        other => {
+            panic!("expected FormatTooNew {{ kind: \"sa.strand=forward_reverse\" }}, got {other:?}")
+        }
     }
 }
 
