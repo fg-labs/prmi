@@ -8,7 +8,7 @@
 
 ## Provenance
 
-`fg-labs/prmi` is a GitHub fork of [`learnedsystems/RMI`](https://github.com/learnedsystems/RMI) — Ryan Marcus's MIT-licensed reference implementation of recursive model indexes. The P-RMI trainer additionally embeds verbatim training-pipeline code from the [`kaist-ina/BWA-MEME`](https://github.com/kaist-ina/BWA-MEME) RMI fork, which is also MIT-licensed. See [`LICENSE-FORK-NOTICE.md`](LICENSE-FORK-NOTICE.md) for the full fork lineage and tri-attribution convention.
+`fg-labs/prmi` is a GitHub fork of [`learnedsystems/RMI`](https://github.com/learnedsystems/RMI) — Ryan Marcus's MIT-licensed reference implementation of recursive model indexes. The P-RMI trainer is Fulcrum-authored on top of Marcus's RMI primitives; BWA-MEME (Jung & Han 2022) demonstrated the variant on suffix-array seeding and informed the algorithmic shape, but no code from BWA-MEME is used. See [`LICENSE-FORK-NOTICE.md`](LICENSE-FORK-NOTICE.md) for the fork lineage.
 
 ## Quick start (build from source)
 
