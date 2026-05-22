@@ -1,5 +1,4 @@
 // Copyright Ryan Marcus 2020          (origin: learnedsystems/RMI)
-// Copyright 2022 Youngmok Jung et al. (origin: kaist-ina/BWA-MEME RMI fork)
 // Modified by Fulcrum Genomics 2026
 // SPDX-License-Identifier: MIT
 
@@ -31,9 +30,6 @@ pub struct TrainedRMI {
     pub model_max_error_idx: usize,
     pub model_max_log2_error: f64,
     pub last_layer_max_l1s: Vec<u64>,
-    /// Per-leaf maximum-error bounds for the middle (partial-3-layer) models.
-    /// Empty for two-layer trained RMIs; populated by `train_partial_three_layer`.
-    pub third_layer_max_l1s: Vec<u64>,
     pub rmi: Vec<Vec<Box<dyn Model>>>,
     pub models: String,
     pub branching_factor: u64,
@@ -51,23 +47,6 @@ fn train_model<T: TrainingKey>(model_type: &str, data: &RMITrainingData<T>) -> B
         "normal" => Box::new(NormalModel::new(data)),
         "lognormal" => Box::new(LogNormalModel::new(data)),
         "pwl" => Box::new(PiecewiselinearModel::new(data, 28)),
-        "pwl1" => Box::new(PiecewiselinearModel::new(data, 1)),
-        "pwl2" => Box::new(PiecewiselinearModel::new(data, 2)),
-        "pwl3" => Box::new(PiecewiselinearModel::new(data, 3)),
-        "pwl4" => Box::new(PiecewiselinearModel::new(data, 4)),
-        "pwl5" => Box::new(PiecewiselinearModel::new(data, 5)),
-        "pwl6" => Box::new(PiecewiselinearModel::new(data, 6)),
-        "pwl8" => Box::new(PiecewiselinearModel::new(data, 8)),
-        "pwl16" => Box::new(PiecewiselinearModel::new(data, 16)),
-        "pwl17" => Box::new(PiecewiselinearModel::new(data, 17)),
-        "pwl18" => Box::new(PiecewiselinearModel::new(data, 18)),
-        "pwl19" => Box::new(PiecewiselinearModel::new(data, 19)),
-        "pwl20" => Box::new(PiecewiselinearModel::new(data, 20)),
-        "pwl22" => Box::new(PiecewiselinearModel::new(data, 22)),
-        "pwl24" => Box::new(PiecewiselinearModel::new(data, 24)),
-        "pwl26" => Box::new(PiecewiselinearModel::new(data, 26)),
-        "pwl28" => Box::new(PiecewiselinearModel::new(data, 28)),
-        "pwl30" => Box::new(PiecewiselinearModel::new(data, 30)),
         "radix" => Box::new(RadixModel::new(data)),
         "radix8" => Box::new(RadixTable::new(data, 8)),
         "radix18" => Box::new(RadixTable::new(data, 18)),
@@ -152,23 +131,7 @@ pub fn train<T: TrainingKey>(
         return res;
     }
 
-    if model_list.len() == 2 {
-        let mut res = two_layer::train_partial_three_layer(
-            &mut data.soft_copy(),
-            &model_list[0],
-            &model_list[1],
-            &last_model,
-            branch_factor,
-        );
-        let build_time = SystemTime::now()
-            .duration_since(start_time)
-            .map(|d| d.as_nanos())
-            .unwrap_or(std::u128::MAX);
-        res.build_time = build_time;
-        return res;
-    }
-
-    // it is not a simple, two layer rmi (model_list.len() >= 3 is out of scope for v0.1)
+    // it is not a simple, two layer rmi (model_list.len() >= 2 is out of scope for v0.1)
     //return multi_layer::train_multi_layer(data, &model_list, last_model, branch_factor);
     panic!(); // TODO
 }
