@@ -1,5 +1,4 @@
 // Copyright Ryan Marcus 2020          (origin: learnedsystems/RMI)
-// Copyright 2022 Youngmok Jung et al. (origin: kaist-ina/BWA-MEME RMI fork)
 // Modified by Fulcrum Genomics 2026
 // SPDX-License-Identifier: MIT
 
