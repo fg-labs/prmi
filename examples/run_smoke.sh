@@ -5,10 +5,11 @@
 # End-to-end smoke harness for the cpp_caller example.
 #   1. Writes a synthetic 4-kb FASTA.
 #   2. Runs `prmi build` to produce the sidecar.
-#   3. Writes a binary PAC file (1 byte/base, values 0–3).
+#   3. Writes a binary PAC file (1 byte/base, values 0–3) and a 2-bit packed
+#      PAC file (BWA-MEME bntpac convention: 4 bases/byte, MSB-first).
 #   4. Writes a binary 32-base query file.
 #   5. Computes the expected 32-mer hex key.
-#   6. Runs cpp_caller and checks the exit code.
+#   6. Runs cpp_caller and checks the exit code; verifies packed == unpacked.
 #
 # Run from anywhere; all paths are relative to this script's directory.
 
@@ -43,9 +44,9 @@ PREFIX="${TMPDIR}/smoke.fa.prmi"
 "${PRMI}" build "${FA}" -o "${PREFIX}" --l2-leaf-count 16
 echo "=== sidecar built: ${PREFIX}.{meta,sa,l1,l2}"
 
-# ---- 3. Binary PAC file (1 byte per base: A=0 C=1 G=2 T=3) -----------------
-PAC="${TMPDIR}/smoke.pac"
-python3 - "${PAC}" <<'PYEOF'
+# ---- 3a. Unpacked PAC file (1 byte per base: A=0 C=1 G=2 T=3) --------------
+PAC_UNPACKED="${TMPDIR}/smoke.pac"
+python3 - "${PAC_UNPACKED}" <<'PYEOF'
 import sys
 path = sys.argv[1]
 # ACGT × 1024
@@ -53,13 +54,32 @@ enc = [0, 1, 2, 3] * 1024
 with open(path, "wb") as f:
     f.write(bytes(enc))
 PYEOF
-echo "=== wrote PAC: ${PAC} ($(wc -c < "${PAC}") bytes)"
+echo "=== wrote unpacked PAC: ${PAC_UNPACKED} ($(wc -c < "${PAC_UNPACKED}") bytes)"
+
+# ---- 3b. Packed PAC file (2 bits per base: BWA-MEME bntpac convention) ------
+# Base 0 in bits 6-7, base 1 in bits 4-5, base 2 in bits 2-3, base 3 in bits 0-1.
+PAC_PACKED="${TMPDIR}/smoke_packed.pac"
+PAC_NUM_BASES=4096
+python3 - "${PAC_UNPACKED}" "${PAC_PACKED}" <<'PYEOF'
+import sys
+src_path, dst_path = sys.argv[1], sys.argv[2]
+with open(src_path, "rb") as f:
+    bases = list(f.read())   # list of int 0-3
+n = len(bases)
+out = bytearray((n + 3) // 4)
+for i, b in enumerate(bases):
+    shift = 6 - 2 * (i % 4)
+    out[i // 4] |= (b & 0x3) << shift
+with open(dst_path, "wb") as f:
+    f.write(out)
+PYEOF
+echo "=== wrote packed PAC: ${PAC_PACKED} ($(wc -c < "${PAC_PACKED}") bytes, ${PAC_NUM_BASES} bases)"
 
 # ---- 4. Query file: first 32 bases starting at offset 10 -------------------
 # offset 10 in ACGT×1024: bases at pos 10,11,...,41 → G T A C G T A C G T ...
 #   (10 % 4 = 2 → G, 11%4=3 → T, 12%4=0 → A, 13%4=1 → C, ...)
 QUERY="${TMPDIR}/query.bin"
-python3 - "${PAC}" "${QUERY}" <<'PYEOF'
+python3 - "${PAC_UNPACKED}" "${QUERY}" <<'PYEOF'
 import sys
 pac_path, q_path = sys.argv[1], sys.argv[2]
 with open(pac_path, "rb") as f:
@@ -86,5 +106,6 @@ echo "=== 32-mer hex key: ${HEX_KEY}"
 
 # ---- 6. Run cpp_caller ------------------------------------------------------
 echo "=== running cpp_caller..."
-"${CPP_CALLER}" "${PREFIX}" "${HEX_KEY}" "${QUERY}" "${PAC}"
+"${CPP_CALLER}" "${PREFIX}" "${HEX_KEY}" "${QUERY}" \
+    "${PAC_UNPACKED}" "${PAC_PACKED}" "${PAC_NUM_BASES}"
 echo "=== cpp_caller exited 0 — smoke PASSED"

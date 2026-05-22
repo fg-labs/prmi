@@ -168,6 +168,71 @@ pub unsafe extern "C" fn prmi_smem_range(
     }
 }
 
+/// Resolve an SA range matching the query against a caller-owned 2-bit
+/// packed pac (BWA / BWA-MEME `bntpac` convention: 4 bases per byte,
+/// MSB-first within each byte — base 0 in bits 6-7, base 1 in bits 4-5,
+/// base 2 in bits 2-3, base 3 in bits 0-1).
+///
+/// `pac_num_bases` is the exact number of bases (not bytes) the pac holds;
+/// `pac` must point to at least `ceil(pac_num_bases / 4)` bytes.
+///
+/// Returns 0 on match (l > 0), 1 if no match (l == 0), negative on error.
+///
+/// # Safety
+/// All pointers must be valid. `query` must point to `query_len` bytes.
+/// `pac` must point to at least `ceil(pac_num_bases / 4)` bytes.
+/// Out-pointers must be valid writable u64 locations.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_smem_range_packed(
+    handle: *const prmi_index_t,
+    query: *const u8,
+    query_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+    out_k: *mut u64,
+    out_l: *mut u64,
+    out_s: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null()
+        || query.is_null()
+        || pac.is_null()
+        || out_k.is_null()
+        || out_l.is_null()
+        || out_s.is_null()
+    {
+        set_last_error("prmi_smem_range_packed: null pointer argument");
+        return -1;
+    }
+    if query_len < 0 {
+        set_last_error("prmi_smem_range_packed: negative query_len");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
+    let pac_bytes = pac_num_bases.div_ceil(4) as usize;
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+
+    match h.0.smem_range_packed(q, pac_slice, pac_num_bases) {
+        Ok((k, l, s)) => {
+            unsafe {
+                *out_k = k;
+                *out_l = l;
+                *out_s = s;
+            }
+            if l == 0 {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            set_last_error(&format!("{e}"));
+            -3
+        }
+    }
+}
+
 /// Number of SA entries in the loaded sidecar.
 ///
 /// # Safety

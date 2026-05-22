@@ -56,6 +56,10 @@ int  prmi_smem_range(const prmi_index_t* handle,
                      const uint8_t* query, int query_len,
                      const uint8_t* pac, size_t pac_len,
                      uint64_t* out_k, uint64_t* out_l, uint64_t* out_s);
+int  prmi_smem_range_packed(const prmi_index_t* handle,
+                            const uint8_t* query, int query_len,
+                            const uint8_t* pac, uint64_t pac_num_bases,
+                            uint64_t* out_k, uint64_t* out_l, uint64_t* out_s);
 size_t      prmi_sa_num         (const prmi_index_t*);
 uint64_t    prmi_max_error_bound(const prmi_index_t*);
 const char* prmi_format_version (const prmi_index_t*);
@@ -64,7 +68,7 @@ const char* prmi_last_error_message(void);
 
 All functions return 0 on success or a negative integer on error. `prmi_last_error_message()` returns a thread-local human-readable string valid until the next `prmi_*` call on the same thread. Handles are safe for concurrent lookup calls after `prmi_open` returns. See `examples/cpp_caller.cc` for a working C++ consumer.
 
-Note: `prmi_smem_range` takes an explicit `pac_len` parameter beyond the bare C API sketch in the brief; see `examples/cpp_caller.cc` for the authoritative signature.
+`prmi_smem_range` takes a 1-base-per-byte pac and an explicit `pac_len` parameter. `prmi_smem_range_packed` accepts a 2-bit packed pac in BWA / BWA-MEME's `bntpac` convention (4 bases per byte, MSB-first within each byte) and takes `pac_num_bases` — the exact base count — instead of a byte length; this allows bwa-mem3 to pass its packed reference directly without unpacking. Both functions return identical `(k, l, s)` results for the same reference and query.
 
 ## v0.1 scope
 
@@ -72,7 +76,7 @@ What is in v0.1:
 
 - Reference-only training (no BED or FASTQ priors yet).
 - Single curated memory mode: 5-byte packed SA entries (uint40 positions).
-- 1-base-per-byte pac at the C ABI — not the 4-bpb BWA-MEME format.
+- 1-base-per-byte pac via `prmi_smem_range`; 2-bit packed (BWA-MEME `bntpac`) via `prmi_smem_range_packed`.
 - Single-key C API (`prmi_smem_range` and `prmi_lookup`); no batch API — `prmi_smem_range_batch` is v0.2.
 - Contigs concatenated without sentinels — 32-mer queries can spuriously match across contig boundaries; callers are responsible for filtering these hits.
 - N bases encoded as A (0) in the 2-bit pac.
@@ -81,8 +85,7 @@ What is in v0.1:
 
 - BED priors: target-aware training (capture priors from a target-capture BED).
 - FASTQ histogram priors: workload-aware training from a read-set histogram.
-- Batch FFI: `prmi_smem_range_batch` for aligned-SIMD seeding pipelines.
-- Optional 4-bpb pac mode: drop-in compatibility with BWA-MEME's packed reference.
+- Batch FFI: `prmi_smem_range_batch` for aligned-SIMD seeding pipelines (both unpacked and packed).
 - Parallel SA construction: faster `prmi build` on many-core machines.
 
 ## Building and testing
