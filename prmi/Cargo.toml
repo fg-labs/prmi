@@ -9,6 +9,8 @@ authors.workspace = true
 keywords = ["bioinformatics", "genomics", "rmi", "learned-index", "suffix-array"]
 categories = ["science", "data-structures"]
 readme = "../README.md"
+homepage = "https://github.com/fg-labs/prmi"
+documentation = "https://docs.rs/prmi"
 
 [lib]
 name = "prmi"
@@ -30,16 +32,15 @@ env_logger.workspace = true
 rayon.workspace = true
 noodles-fasta.workspace = true
 libsais.workspace = true
-# Legacy binary uses indicatif 0.13 API; Task 19 will update to 0.17
-indicatif = "0.13"
-approx.workspace = true
 sha2.workspace = true
 hex.workspace = true
 time.workspace = true
 anyhow.workspace = true
-# Upstream (rmi_lib) legacy deps — these drop out when the CLI is rewritten in Task 19
+# Upstream (rmi_lib inherited) deps — present because prmi/src/upstream/
+# files import them. Touching these would force upstream source modifications
+# that the LICENSE-FORK-NOTICE tracking is designed to minimize.
+indicatif = "0.13"
 json = "0.12"
-memmap = "0.7"
 bytesize = "1.0"
 superslice = "1.0"
 tabular = "0.1"

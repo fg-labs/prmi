@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["bioinformatics", "genomics", "ffi", "learned-index", "c-api"]
+categories = ["external-ffi-bindings", "science"]
+readme = "../README.md"
+homepage = "https://github.com/fg-labs/prmi"
+documentation = "https://docs.rs/prmi-sys"
 
 [lib]
 name = "prmi_sys"
