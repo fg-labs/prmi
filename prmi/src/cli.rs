@@ -31,7 +31,7 @@ pub enum Cmd {
         /// Defaults to <ref_fa>.prmi.
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
-        /// L2 leaf count (must be a power of two).
+        /// L2 leaf count (must be a power of two, ≥ 16).
         #[arg(long, default_value_t = 262144)]
         l2_leaf_count: u64,
     },

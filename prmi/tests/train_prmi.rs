@@ -63,3 +63,28 @@ fn train_prmi_bit_shift_calculation() {
         assert_eq!(model.l2.len(), count as usize);
     }
 }
+
+#[test]
+fn train_prmi_rejects_pwl_bit_widths_below_four() {
+    // l2_leaf_count = 8 → pwl3, which is known to trigger an upstream
+    // minus_epsilon underflow. We refuse the configuration with a clear
+    // error rather than letting the trainer panic.
+    let ts = make_uniform_training_set(64);
+    let err = train_prmi(&ts, 8).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("pwl3"), "expected pwl3 in error: {msg}");
+    assert!(
+        msg.contains("minimum"),
+        "expected 'minimum' in error: {msg}"
+    );
+
+    // l2_leaf_count = 4 → pwl2, same story.
+    let err = train_prmi(&ts, 4).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("pwl2"), "expected pwl2 in error: {msg}");
+
+    // l2_leaf_count = 2 → pwl1, same story.
+    let err = train_prmi(&ts, 2).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("pwl1"), "expected pwl1 in error: {msg}");
+}

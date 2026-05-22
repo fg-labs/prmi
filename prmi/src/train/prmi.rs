@@ -33,13 +33,28 @@ pub fn train_prmi(ts: &TrainingSet, l2_leaf_count: u64) -> Result<PrmiModel> {
             detail: format!("l2_leaf_count={l2_leaf_count} must be a power of two ≥ 2"),
         });
     }
+    // Reject pwl bit-widths below 4. pwl1/pwl2/pwl3 trigger an underflow in
+    // BWA-MEME's upstream `minus_epsilon` (defined as `*self - 1` for u64;
+    // see prmi/src/upstream/models/mod.rs) when the training set contains
+    // `key = 0`. This is a known upstream bug (filed against kaist-ina/BWA-MEME);
+    // until the upstream fix lands, refuse the configuration up front so users
+    // get a clear error rather than a panic from inside the trainer.
+    let pwl_bits = l2_leaf_count.trailing_zeros();
+    if pwl_bits < 4 {
+        return Err(Error::Internal {
+            detail: format!(
+                "l2_leaf_count={l2_leaf_count} would use pwl{pwl_bits}, which hits \
+                 an upstream minus_epsilon underflow on key=0; minimum supported \
+                 value is 16 (pwl4)"
+            ),
+        });
+    }
     if ts.is_empty() {
         return Err(Error::Internal {
             detail: "empty training set".into(),
         });
     }
     let bit_shift = 64 - l2_leaf_count.trailing_zeros();
-    let pwl_bits = l2_leaf_count.trailing_zeros();
 
     // Build the upstream training data: (key, sa_index) pairs.
     let data: Vec<(u64, usize)> = ts
