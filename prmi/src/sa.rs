@@ -10,7 +10,9 @@ use libsais::SuffixArrayConstruction;
 
 use crate::error::{Error, Result};
 
+/// Bytes used to store one packed SA position on disk (5-byte uint40).
 pub const BYTES_PER_PACKED_ENTRY: usize = 5;
+/// Maximum SA position that fits in the 5-byte on-disk representation (~1.1 Tbp).
 pub const MAX_PACKED_POSITION: u64 = (1u64 << 40) - 1;
 
 /// Pack a `u64` position into the on-disk 5-byte layout:

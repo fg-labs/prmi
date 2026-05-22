@@ -3,6 +3,7 @@
 
 #![allow(clippy::all)]
 #![allow(unused_imports, unused_variables, unused_assignments, dead_code)]
+#![allow(missing_docs)] // upstream code carries its own (often minimal) docs from Marcus 2020 + BWA-MEME
 
 #[allow(
     clippy::all,

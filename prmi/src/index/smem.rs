@@ -8,10 +8,14 @@ use crate::encoding::{tokenize_32mer, KMER_LEN};
 use crate::error::Result;
 use crate::index::LearnedIndex;
 
+/// An SA range result: start index `k`, length `l`, and common prefix length `s`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SmemRange {
+    /// SA index of the first matching entry.
     pub k: u64,
+    /// Number of consecutive SA entries matching the query key.
     pub l: u64,
+    /// Length of the longest common prefix shared by all entries in the range.
     pub s: u64,
 }
 

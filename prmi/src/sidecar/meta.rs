@@ -11,45 +11,64 @@ use std::path::Path;
 /// Top-level sidecar metadata struct, corresponding to the `.meta` TOML file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
+    /// Sidecar identity and version fields.
     pub prmi: Prmi,
     #[serde(rename = "ref")]
+    /// Reference genome provenance.
     pub ref_: Ref,
+    /// Suffix-array layout metadata.
     pub sa: Sa,
+    /// RMI architecture specification.
     pub rmi: RmiSpec,
+    /// Prior distribution specification.
     pub priors: Priors,
 }
 
 /// Sidecar identity and versioning fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Prmi {
+    /// Magic string identifying this as a prmi sidecar (e.g. `"PRMIv1"`).
     pub magic: String,
+    /// On-disk format version integer.
     pub format_version: u32,
+    /// Semver of the `prmi` crate that produced this sidecar.
     pub trainer_version: String,
+    /// RFC 3339 UTC timestamp at which the sidecar was created.
     pub created_utc: String,
 }
 
 /// Reference genome provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ref {
+    /// Filesystem path of the reference FASTA at build time.
     pub path: String,
+    /// SHA-256 hex digest of the reference FASTA.
     pub sha256: String,
+    /// Size of the reference FASTA in bytes.
     pub size_bytes: u64,
 }
 
 /// Suffix-array layout fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sa {
+    /// Number of suffix-array entries (equals the genome length in bases).
     pub num_entries: u64,
+    /// Bytes per packed SA position (always 5 for v0.1).
     pub bytes_per_entry: u8,
+    /// Encoding name for the SA positions (always `"packed_lo8_hi32"` for v0.1).
     pub encoding: String,
 }
 
 /// RMI architecture spec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RmiSpec {
+    /// RMI architecture string (e.g. `"linear,linear"`).
     pub spec: String,
+    /// Number of L2 leaf nodes (must be a power of two).
     pub l2_leaf_count: u64,
+    /// Bit-shift used to route a key into the L2 layer: `64 - log2(l2_leaf_count)`.
     pub bit_shift: u32,
+    /// Global maximum prediction error across all keys in the training set.
     pub max_error_bound: u64,
 }
 
@@ -81,7 +100,7 @@ impl Meta {
     /// Parse and validate a `Meta` from a TOML string.
     ///
     /// File-path context is absent; errors report an empty path. Use
-    /// [`read_file`] when reading from disk so errors include the path.
+    /// [`Meta::read_file`] when reading from disk so errors include the path.
     pub fn from_toml_str(s: &str) -> Result<Self> {
         Self::from_toml_str_with_file(s, None)
     }

@@ -53,8 +53,11 @@ fn clamp_to_int(v: f64, lo: f64, hi: f64) -> usize {
 /// Layer abstraction: same lookup math runs against in-memory slices
 /// (training/verify) or an mmap-backed reader (runtime).
 pub trait Layer {
+    /// Return the model entry at index `i`.
     fn entry(&self, i: usize) -> ModelEntry;
+    /// Number of entries in this layer.
     fn len(&self) -> usize;
+    /// Returns `true` if the layer contains no entries.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }

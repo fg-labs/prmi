@@ -14,7 +14,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+/// Size of the binary header at the start of each model file, in bytes.
 pub const MODEL_FILE_HEADER_BYTES: usize = 16;
+/// Size of one serialised `ModelEntry` on disk, in bytes.
 pub const BYTES_PER_MODEL_ENTRY: usize = 24;
 
 /// One model leaf entry: a linear predictor `(alpha, beta)` plus an `err`
@@ -23,8 +25,11 @@ pub const BYTES_PER_MODEL_ENTRY: usize = 24;
 /// and the rest encodes (partial_start, partial_num) into the L1 array.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelEntry {
+    /// Intercept of the linear predictor.
     pub alpha: f64,
+    /// Slope of the linear predictor.
     pub beta: f64,
+    /// Error bound (or packed L1 pointer for L2 entries on the fallback path).
     pub err: u64,
 }
 
@@ -32,7 +37,9 @@ pub struct ModelEntry {
 /// for I/O and reader-side validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelLayer {
+    /// L1 leaf layer (the large per-key linear predictors).
     L1,
+    /// L2 routing layer (one entry per power-of-two bucket).
     L2,
 }
 
@@ -51,6 +58,7 @@ impl ModelLayer {
 pub struct ModelFileWriter;
 
 impl ModelFileWriter {
+    /// Write all `entries` for the given `layer` to `path`, overwriting any existing file.
     pub fn write(path: &Path, layer: ModelLayer, entries: &[ModelEntry]) -> Result<()> {
         let f = OpenOptions::new()
             .write(true)
@@ -104,6 +112,7 @@ impl std::fmt::Debug for ModelFileReader {
 }
 
 impl ModelFileReader {
+    /// Open and mmap a model file, validating its header against `expected_layer`.
     pub fn open(path: &Path, expected_layer: ModelLayer) -> Result<Self> {
         let f = File::open(path).map_err(|e| Error::Io {
             path: path.to_path_buf(),
@@ -151,16 +160,19 @@ impl ModelFileReader {
         })
     }
 
+    /// Number of model entries in this file.
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns `true` if the file contains no model entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Return the model entry at index `i` via a zero-copy mmap read.
     #[inline]
     pub fn entry(&self, i: usize) -> ModelEntry {
         let off = MODEL_FILE_HEADER_BYTES + i * BYTES_PER_MODEL_ENTRY;

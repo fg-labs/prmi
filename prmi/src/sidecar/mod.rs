@@ -16,9 +16,13 @@ use std::path::{Path, PathBuf};
 ///   `meta = "/data/hg38.fa.prmi.meta"`, `.sa`, `.l1`, `.l2`.
 #[derive(Debug, Clone)]
 pub struct SidecarPaths {
+    /// Path to the `.meta` TOML file.
     pub meta: PathBuf,
+    /// Path to the `.sa` packed suffix-array file.
     pub sa: PathBuf,
+    /// Path to the `.l1` model file (L1 leaves).
     pub l1: PathBuf,
+    /// Path to the `.l2` model file (L2 routing layer).
     pub l2: PathBuf,
 }
 

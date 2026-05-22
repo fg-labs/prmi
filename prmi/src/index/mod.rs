@@ -5,6 +5,7 @@
 //! sidecar format encodes. The `LearnedIndex` type owns mmap-backed readers
 //! for the four sidecar files and answers `lookup(key) -> (pos, err)` queries.
 
+/// §4.4 lookup math: parameterized over mmap-backed readers or in-memory slices.
 pub mod lookup;
 pub mod smem;
 

@@ -18,8 +18,11 @@ use std::path::Path;
 /// Counts gathered while reading a FASTA file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FastaStats {
+    /// Total number of bases seen across all contigs (including N).
     pub total_bases: u64,
+    /// Number of N (or non-IUPAC) bases substituted with A.
     pub n_bases: u64,
+    /// Number of records (contigs) in the FASTA.
     pub contigs: u64,
 }
 

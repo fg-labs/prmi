@@ -6,9 +6,13 @@
 //! (key generation from query input) must call the same function to stay
 //! interoperable. See the v0.1 handoff brief §6 for the spec.
 
+/// 2-bit code for adenine (A).
 pub const BASE_A: u8 = 0;
+/// 2-bit code for cytosine (C).
 pub const BASE_C: u8 = 1;
+/// 2-bit code for guanine (G).
 pub const BASE_G: u8 = 2;
+/// 2-bit code for thymine (T).
 pub const BASE_T: u8 = 3;
 
 /// 32 bases per `u64` key.

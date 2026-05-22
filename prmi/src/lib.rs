@@ -4,6 +4,7 @@
 // unsafe_code is deny (not forbid) so that the single unsafe island in
 // sidecar::sa_file (mmap) can opt in with #[allow(unsafe_code)].
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 
 //! prmi — Piecewise Recursive Model Index for sorted-key lookup, with a
 //! genomics-oriented trainer over the suffix array of a reference genome.
@@ -21,4 +22,6 @@ pub mod sidecar;
 pub mod train;
 pub use error::{Error, Result};
 
+// upstream code carries its own (often minimal) docs from Marcus 2020 + BWA-MEME
+#[allow(missing_docs)]
 pub mod upstream;

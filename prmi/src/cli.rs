@@ -13,18 +13,21 @@ use std::path::PathBuf;
     version,
     about = "P-RMI trainer over genomic suffix arrays"
 )]
+/// Top-level CLI entry point; dispatches to a subcommand.
 pub struct Cli {
     #[command(subcommand)]
+    #[allow(missing_docs)]
     pub cmd: Cmd,
 }
 
+/// Subcommands available in the `prmi` binary.
 #[derive(Subcommand)]
 pub enum Cmd {
     /// Build a prmi sidecar from a reference FASTA.
     Build {
         /// Path to the reference FASTA.
         ref_fa: PathBuf,
-        /// Output prefix; produces <prefix>.{meta,sa,l1,l2}.
+        /// Output prefix; produces `<prefix>.{meta,sa,l1,l2}`.
         /// Defaults to <ref_fa>.prmi.
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
@@ -40,6 +43,7 @@ pub enum Cmd {
 }
 
 impl Cli {
+    /// Execute the selected subcommand and return its result.
     pub fn run(self) -> anyhow::Result<()> {
         match self.cmd {
             Cmd::Build {

@@ -21,6 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+/// Size of the binary header at the start of the `.sa` file, in bytes.
 pub const SA_FILE_HEADER_BYTES: usize = 24;
 const BYTES_PER_ENTRY: usize = BYTES_PER_PACKED_ENTRY; // 5
 
@@ -35,6 +36,7 @@ pub struct SaFileWriter {
 }
 
 impl SaFileWriter {
+    /// Create a new `.sa` file at `path`, writing the 24-byte header for `expected_entries` positions.
     pub fn create(path: &Path, expected_entries: u64) -> Result<Self> {
         let f = OpenOptions::new()
             .write(true)
@@ -64,6 +66,7 @@ impl SaFileWriter {
         })
     }
 
+    /// Append a single packed SA position to the file.
     pub fn write_position(&mut self, pos: u64) -> Result<()> {
         let bytes = pack_position(pos);
         self.inner.write_all(&bytes).map_err(|e| Error::Io {
@@ -74,6 +77,7 @@ impl SaFileWriter {
         Ok(())
     }
 
+    /// Flush and close the writer, verifying that exactly `expected_entries` were written.
     pub fn finish(mut self) -> Result<()> {
         self.inner.flush().map_err(|e| Error::Io {
             path: self.path.clone(),
@@ -112,6 +116,7 @@ impl std::fmt::Debug for SaFileReader {
 }
 
 impl SaFileReader {
+    /// Open and mmap the `.sa` file at `path`, validating its header.
     pub fn open(path: &Path) -> Result<Self> {
         let f = File::open(path).map_err(|e| Error::Io {
             path: path.to_path_buf(),
@@ -167,10 +172,12 @@ impl SaFileReader {
         })
     }
 
+    /// Number of SA entries stored in this file.
     pub fn num_entries(&self) -> u64 {
         self.num_entries
     }
 
+    /// Return the unpacked SA position at index `i` via a zero-copy mmap read.
     #[inline]
     pub fn position(&self, i: u64) -> u64 {
         let off = SA_FILE_HEADER_BYTES + (i as usize) * BYTES_PER_ENTRY;
