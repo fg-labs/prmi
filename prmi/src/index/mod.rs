@@ -66,6 +66,11 @@ impl LearnedIndex {
         self.meta.rmi.bit_shift
     }
 
+    /// Number of L2 leaf models. Equals `l2_leaf_count` from the `.meta` file.
+    pub fn l2_leaf_count(&self) -> u64 {
+        self.meta.rmi.l2_leaf_count
+    }
+
     /// Format-version string (always `"PRMIv1"` for v0.1).
     pub fn format_version(&self) -> &str {
         META_MAGIC
