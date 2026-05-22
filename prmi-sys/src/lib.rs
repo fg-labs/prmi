@@ -10,6 +10,7 @@ mod handle;
 
 use crate::errors::{clear_last_error, set_last_error, with_last_error};
 use crate::handle::{prmi_index_t, Handle};
+use libc::size_t;
 use prmi::index::LearnedIndex;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
@@ -102,4 +103,66 @@ pub unsafe extern "C" fn prmi_lookup(
         *out_err = err;
     }
     0
+}
+
+/// Resolve an SA range matching the query against the caller-owned pac.
+///
+/// `pac` is a 2-bit-coded reference at **1 base per byte** (values 0..=3).
+/// `pac_len` is its length in bytes — explicit to avoid silent overruns
+/// (the brief §5 omits the length; we add it as an authorized deviation).
+///
+/// Returns 0 on match (l > 0), 1 if no match (l == 0), negative on error.
+///
+/// # Safety
+/// All pointers must be valid. `query` and `pac` must point to slices of
+/// length `query_len` and `pac_len` respectively. Out-pointers must be
+/// valid writable u64 locations.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_smem_range(
+    handle: *const prmi_index_t,
+    query: *const u8,
+    query_len: c_int,
+    pac: *const u8,
+    pac_len: size_t,
+    out_k: *mut u64,
+    out_l: *mut u64,
+    out_s: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null()
+        || query.is_null()
+        || pac.is_null()
+        || out_k.is_null()
+        || out_l.is_null()
+        || out_s.is_null()
+    {
+        set_last_error("prmi_smem_range: null pointer argument");
+        return -1;
+    }
+    if query_len < 0 {
+        set_last_error("prmi_smem_range: negative query_len");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_len) };
+
+    match h.0.smem_range(q, pac_slice) {
+        Ok((k, l, s)) => {
+            unsafe {
+                *out_k = k;
+                *out_l = l;
+                *out_s = s;
+            }
+            if l == 0 {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            set_last_error(&format!("{e}"));
+            -3
+        }
+    }
 }
