@@ -10,27 +10,15 @@
     dead_code
 )]
 
-mod balanced_radix;
-mod cubic_spline;
-mod histogram;
 mod linear;
 mod linear_spline;
-mod normal;
-mod radix;
 mod stdlib;
 mod utils;
 
-pub use balanced_radix::BalancedRadixModel;
-pub use cubic_spline::CubicSplineModel;
-pub use histogram::EquidepthHistogramModel;
 pub use linear::LinearModel;
 pub use linear::LogLinearModel;
 pub use linear::RobustLinearModel;
 pub use linear_spline::LinearSplineModel;
-pub use normal::LogNormalModel;
-pub use normal::NormalModel;
-pub use radix::RadixModel;
-pub use radix::RadixTable;
 pub use stdlib::StdFunctions;
 
 use byteorder::{LittleEndian, WriteBytesExt};
