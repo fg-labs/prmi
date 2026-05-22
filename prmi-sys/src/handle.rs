@@ -13,7 +13,6 @@ pub struct prmi_index_t {
     _opaque: [u8; 0],
 }
 
-#[allow(dead_code)]
 pub(crate) struct Handle(pub LearnedIndex);
 
 impl Handle {
@@ -29,7 +28,6 @@ impl Handle {
 
     /// # Safety
     /// `p` must be non-null and point to a valid Handle.
-    #[allow(dead_code)]
     pub unsafe fn as_ref<'a>(p: *const prmi_index_t) -> &'a Handle {
         unsafe { &*(p as *const Handle) }
     }

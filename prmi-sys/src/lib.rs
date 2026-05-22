@@ -74,3 +74,32 @@ pub unsafe extern "C" fn prmi_close(handle: *mut prmi_index_t) {
 pub extern "C" fn prmi_last_error_message() -> *const c_char {
     with_last_error(|c| c.as_ptr())
 }
+
+/// Predict the SA position for a 32-mer key.
+///
+/// Returns 0 on success; negative on error. Writes the predicted SA position
+/// and the error bound to the out-pointers.
+///
+/// # Safety
+/// `handle` must be a valid handle from `prmi_open`. Both out-pointers must
+/// be valid writable u64 locations.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_lookup(
+    handle: *const prmi_index_t,
+    key: u64,
+    out_predicted_sa_pos: *mut u64,
+    out_err: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null() || out_predicted_sa_pos.is_null() || out_err.is_null() {
+        set_last_error("prmi_lookup: null pointer argument");
+        return -1;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let (pos, err) = h.0.lookup(key);
+    unsafe {
+        *out_predicted_sa_pos = pos;
+        *out_err = err;
+    }
+    0
+}
