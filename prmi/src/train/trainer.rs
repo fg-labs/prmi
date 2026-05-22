@@ -85,16 +85,17 @@ fn encode_fallback_err(partial_start: u64, partial_num: u64) -> u64 {
     (1u64 << 63) | ((partial_start & 0x7fff_ffff) << 32) | (partial_num & 0xffff_ffff)
 }
 
-/// Predict using truncation-based rounding (matching runtime's `clamp_to_int`).
-/// Used during training to compute residuals. Does NOT clamp to sa_num.
+/// Mirror the runtime's `lookup_core` exactly: `pred = clamp(alpha + beta*key,
+/// 0, sa_num-1)` with truncation (matching `index::lookup::clamp_to_int`).
+/// Returning i64 so callers can take signed differences against sa_idx
+/// without overflow. NaN maps to 0 (same as runtime).
 #[inline]
-fn predict_truncated(alpha: f64, beta: f64, key: u64) -> i64 {
+fn predict_clamped(alpha: f64, beta: f64, key: u64, sa_num: u64) -> i64 {
     let raw = alpha + beta * key as f64;
     if raw.is_nan() {
-        0
-    } else {
-        raw as i64
+        return 0;
     }
+    raw.clamp(0.0, sa_num.saturating_sub(1) as f64) as i64
 }
 
 // ── main entry point ─────────────────────────────────────────────────────────
@@ -206,7 +207,7 @@ pub fn train_with_config(
                 )?);
             } else {
                 l2.push(fit_fallback_leaf(
-                    ts, start, end, start_y, end_y, &mut l1, config,
+                    ts, start, end, start_y, end_y, &mut l1, config, n as u64,
                 )?);
             }
         }
@@ -265,7 +266,7 @@ fn fit_direct_leaf(
         .iter()
         .zip(ts.sa_indices[start..end].iter())
     {
-        let pred = predict_truncated(alpha, beta, *k);
+        let pred = predict_clamped(alpha, beta, *k, n as u64);
         let d = (pred - *sa_idx as i64).unsigned_abs();
         if d > err {
             err = d;
@@ -298,7 +299,7 @@ fn fit_direct_leaf(
         } else {
             // last SA index belonging to this leaf = next_idx - 1
             let last_sa = (next_idx - 1) as i64;
-            let pred_next = predict_truncated(alpha, beta, next_key);
+            let pred_next = predict_clamped(alpha, beta, next_key, n as u64);
             let d = (pred_next - last_sa).unsigned_abs();
             if d > err {
                 err = d;
@@ -319,6 +320,7 @@ fn fit_direct_leaf(
 /// 5. For each sub-leaf: fit `LinearSplineModel` (≥2 keys), constant (1 key),
 ///    or constant-to-next (empty).
 /// 6. Append sub-leaf entries to `l1`; emit routing L2 entry.
+#[allow(clippy::too_many_arguments)]
 fn fit_fallback_leaf(
     ts: &TrainingSet,
     start: usize,
@@ -327,6 +329,7 @@ fn fit_fallback_leaf(
     end_y: usize,
     l1: &mut Vec<ModelEntry>,
     config: &TrainerConfig,
+    sa_num: u64,
 ) -> Result<ModelEntry> {
     let leaf_len = end - start;
 
@@ -422,7 +425,7 @@ fn fit_fallback_leaf(
                 // Compute err: max |pred - sa_idx| over sub-leaf keys.
                 let mut sub_err = 0u64;
                 for &(k, sa_idx) in items {
-                    let pred = predict_truncated(sub_alpha, sub_beta, k);
+                    let pred = predict_clamped(sub_alpha, sub_beta, k, sa_num);
                     let d = (pred - sa_idx as i64).unsigned_abs();
                     if d > sub_err {
                         sub_err = d;
@@ -528,13 +531,16 @@ mod tests {
 
     #[test]
     fn fit_l2_direct_perfect_line() {
-        // sa_indices = 5 * i + 10; all keys land in leaf 0 of a 16-leaf L2.
+        // Perfect linear dataset: sa_indices[i] = i. Predictions and the
+        // runtime's clamp range both live in [0, n-1], so a well-fit
+        // LinearModel should produce err ≈ 0.
+        //
         // Keys start at 1 << 50 so that minus_epsilon never underflows.
         let n = 32usize;
         let key_base = 1u64 << 50;
         let key_stride = 1u64 << 46; // all keys remain in bucket 0 of a 16-leaf L2
         let keys: Vec<u64> = (0..n as u64).map(|i| key_base + i * key_stride).collect();
-        let sa_indices: Vec<u64> = (0..n as u64).map(|i| 5 * i + 10).collect();
+        let sa_indices: Vec<u64> = (0..n as u64).collect();
         let ts = make_ts(keys, sa_indices);
 
         // Verify all keys route to leaf 0 with bit_shift = 60.
@@ -548,18 +554,14 @@ mod tests {
         assert_eq!(model.l2.len(), 16);
         assert_eq!(model.bit_shift, 60);
         let l2_entry = model.l2[0];
-        // For a perfect line sa = 5*i + 10, alpha ≈ 10 and beta ≈ 5/key_stride.
         assert!(l2_entry.alpha.is_finite(), "alpha should be finite");
         assert!(l2_entry.beta.is_finite(), "beta should be finite");
-        // err should be small (nearly 0 for a perfect linear fit).
-        // With truncation-based clamping (matching runtime), error margin is tight.
-        eprintln!(
-            "DEBUG fit_l2_direct_perfect_line: alpha={}, beta={}, err={}",
-            l2_entry.alpha, l2_entry.beta, l2_entry.err
-        );
+        // err should be tiny for a perfect linear fit on in-range targets.
         assert!(
             l2_entry.err < 10,
-            "err should be tiny for a perfect linear dataset, got {}",
+            "err should be tiny for a perfect linear dataset, got alpha={} beta={} err={}",
+            l2_entry.alpha,
+            l2_entry.beta,
             l2_entry.err
         );
     }
