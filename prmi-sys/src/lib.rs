@@ -166,3 +166,39 @@ pub unsafe extern "C" fn prmi_smem_range(
         }
     }
 }
+
+/// Number of SA entries in the loaded sidecar.
+///
+/// # Safety
+/// `handle` must be a valid handle from `prmi_open`, or NULL (returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn prmi_sa_num(handle: *const prmi_index_t) -> size_t {
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { Handle::as_ref(handle) }.0.sa_num() as size_t
+}
+
+/// Global max prediction error stored in the sidecar.
+///
+/// # Safety
+/// `handle` must be a valid handle from `prmi_open`, or NULL (returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn prmi_max_error_bound(handle: *const prmi_index_t) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { Handle::as_ref(handle) }.0.max_error_bound()
+}
+
+/// Format version string — always "PRMIv1" for v0.1. Always non-NULL.
+///
+/// # Safety
+/// `handle` may be NULL; the returned pointer is a static C string and
+/// remains valid for the lifetime of the process.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_format_version(handle: *const prmi_index_t) -> *const c_char {
+    static CSTR: &[u8] = b"PRMIv1\0";
+    let _ = handle;
+    CSTR.as_ptr() as *const c_char
+}
