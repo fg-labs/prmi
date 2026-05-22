@@ -18,7 +18,7 @@ fn opens_a_freshly_built_sidecar() {
     std::fs::write(&fa, content.as_bytes()).unwrap();
 
     let prefix = dir.path().join("t.fa.prmi");
-    build_sidecar(&fa, &prefix, 16).unwrap();
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
 
     let idx = LearnedIndex::open(&prefix).unwrap();
     assert!(idx.sa_num() > 0);

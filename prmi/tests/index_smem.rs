@@ -20,7 +20,7 @@ fn smem_range_finds_known_kmer() {
     let fa = dir.path().join("s.fa");
     std::fs::write(&fa, synth_fasta()).unwrap();
     let prefix = dir.path().join("s.fa.prmi");
-    build_sidecar(&fa, &prefix, 16).unwrap();
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
     let idx = LearnedIndex::open(&prefix).unwrap();
 
     // 2-bit-coded reference: ACGT repeating, 256 bases (length matches FASTA).
@@ -39,7 +39,7 @@ fn smem_range_returns_empty_for_impossible_query() {
     let fa = dir.path().join("e.fa");
     std::fs::write(&fa, synth_fasta()).unwrap();
     let prefix = dir.path().join("e.fa.prmi");
-    build_sidecar(&fa, &prefix, 16).unwrap();
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
     let idx = LearnedIndex::open(&prefix).unwrap();
 
     // 32 A's: doesn't occur in ACGTACGT... pattern.

@@ -20,6 +20,7 @@ use crate::sidecar::model_file::{ModelFileWriter, ModelLayer};
 use crate::sidecar::sa_file::SaFileWriter;
 use crate::sidecar::SidecarPaths;
 use crate::train::prmi::train_prmi;
+use crate::train::trainer::default_l2_leaf_count;
 use crate::train::training_set::uniform_training_set;
 use crate::train::verify::compute_max_error_bound;
 use std::path::Path;
@@ -31,8 +32,9 @@ use time::OffsetDateTime;
 /// `prefix` is the output prefix; e.g., for `/data/ref.fa.prmi` the four
 /// files become `/data/ref.fa.prmi.{meta,sa,l1,l2}`.
 ///
-/// `l2_leaf_count` must be a power of two ≥ 2. For human-genome scale, 2^28
-/// is typical; for tests, 2^4 = 16 is fine.
+/// If `l2_leaf_count` is `None`, it is auto-scaled from the SA size (targeting
+/// ~12 entries per leaf, rounded down to a power of two, clamped to [16, 2^28]).
+/// If `Some(n)`, the provided `n` must be a power of two ≥ 2.
 ///
 /// ## Sentinel padding
 ///
@@ -42,7 +44,7 @@ use time::OffsetDateTime;
 /// training set and the `.sa` file, matching BWA-MEME's indexer behaviour.
 /// The SHA-256 hash and `size_bytes` in `.meta` still reflect the original
 /// (unpadded) FASTA, not the extended sequence.
-pub fn build_sidecar(ref_fa: &Path, prefix: &Path, l2_leaf_count: u64) -> Result<()> {
+pub fn build_sidecar(ref_fa: &Path, prefix: &Path, l2_leaf_count: Option<u64>) -> Result<()> {
     let (mut bases, _fa_stats, sha256_hex, fa_size_bytes) = fasta_to_2bit_with_sha256(ref_fa)?;
 
     // Record the original genome length before padding.
@@ -62,6 +64,9 @@ pub fn build_sidecar(ref_fa: &Path, prefix: &Path, l2_leaf_count: u64) -> Result
         .into_iter()
         .filter(|&pos| pos < genome_len)
         .collect();
+
+    // Resolve the optional l2_leaf_count: use provided value or auto-scale.
+    let l2_leaf_count = l2_leaf_count.unwrap_or_else(|| default_l2_leaf_count(sa.len()));
 
     let ts = uniform_training_set(&sa, &bases);
     let model = train_prmi(&ts, l2_leaf_count)?;

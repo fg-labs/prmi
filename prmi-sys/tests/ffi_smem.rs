@@ -18,7 +18,7 @@ fn smem_range_ffi_smoke() {
     fa_bytes.push(b'\n');
     std::fs::write(&fa, &fa_bytes).unwrap();
     let prefix = dir.path().join("s.fa.prmi");
-    build_sidecar(&fa, &prefix, 16).unwrap();
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
 
     let cprefix = CString::new(prefix.to_str().unwrap()).unwrap();
     let mut handle = ptr::null_mut();

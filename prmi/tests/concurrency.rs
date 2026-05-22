@@ -17,7 +17,7 @@ fn concurrent_lookups_are_safe() {
     fa_bytes.push(b'\n');
     std::fs::write(&fa, &fa_bytes).unwrap();
     let prefix = dir.path().join("c.fa.prmi");
-    build_sidecar(&fa, &prefix, 16).unwrap();
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
     let idx = Arc::new(LearnedIndex::open(&prefix).unwrap());
 
     let handles: Vec<_> = (0..8)

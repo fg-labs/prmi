@@ -32,8 +32,10 @@ pub enum Cmd {
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
         /// L2 leaf count (must be a power of two, ≥ 16).
-        #[arg(long, default_value_t = 262144)]
-        l2_leaf_count: u64,
+        /// If omitted, auto-scaled to ~12 SA entries per leaf,
+        /// clamped to [2^4, 2^28].
+        #[arg(long)]
+        l2_leaf_count: Option<u64>,
     },
     /// Print sidecar metadata.
     Info {

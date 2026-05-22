@@ -18,7 +18,7 @@ fn lookup_returns_zero_on_known_key() {
     content.push('\n');
     std::fs::write(&fa, content.as_bytes()).unwrap();
     let prefix = dir.path().join("l.fa.prmi");
-    build_sidecar(&fa, &prefix, 16).unwrap();
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
 
     let cprefix = CString::new(prefix.to_str().unwrap()).unwrap();
     let mut handle = ptr::null_mut();

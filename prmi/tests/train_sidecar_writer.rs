@@ -37,7 +37,7 @@ fn writes_all_four_files_for_synthetic_fasta() {
     std::fs::write(&fa, content.as_bytes()).unwrap();
 
     let prefix = dir.path().join("test.fa.prmi");
-    build_sidecar(&fa, &prefix, 16).unwrap();
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
 
     let paths = SidecarPaths::from_prefix(&prefix);
     assert!(paths.meta.exists(), "meta missing");

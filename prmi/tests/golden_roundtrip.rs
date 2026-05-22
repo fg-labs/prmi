@@ -25,7 +25,7 @@ fn every_suffix_predicted_within_error_bound() {
     let fa = dir.path().join("g.fa");
     std::fs::write(&fa, deterministic_fasta(4096, 0xDEAD_BEEF)).unwrap();
     let prefix = dir.path().join("g.fa.prmi");
-    build_sidecar(&fa, &prefix, 64).unwrap();
+    build_sidecar(&fa, &prefix, Some(64)).unwrap();
 
     let idx = LearnedIndex::open(&prefix).unwrap();
 
@@ -52,7 +52,7 @@ fn decoded_err_values_are_sane() {
     let fa = dir.path().join("e.fa");
     std::fs::write(&fa, deterministic_fasta(4096, 0xCAFE_BABE)).unwrap();
     let prefix = dir.path().join("e.fa.prmi");
-    build_sidecar(&fa, &prefix, 64).unwrap();
+    build_sidecar(&fa, &prefix, Some(64)).unwrap();
 
     let idx = LearnedIndex::open(&prefix).unwrap();
     let sa_num = idx.sa_num();

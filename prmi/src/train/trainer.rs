@@ -23,6 +23,27 @@ use crate::upstream::{LinearModel, LinearSplineModel, Model, ModelParam, RMITrai
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// Compute a reasonable default `l2_leaf_count` from the SA size.
+///
+/// Targets ~12 SA entries per L2 leaf (BWA-MEME's empirical human-genome
+/// ratio: 3.1 Gbp / 2^28 ≈ 12). Rounds down to a power of two and clamps to
+/// `[2^4, 2^28]`: the lower bound is the pwl<4 floor (`l2_leaf_count < 16` is
+/// rejected by the trainer); the upper bound is BWA-MEME's largest published
+/// configuration.
+///
+/// # Examples
+///
+/// ```ignore
+/// default_l2_leaf_count(5_000)           // phiX (~5 kb) → 256 (2^8)
+/// default_l2_leaf_count(5_000_000)       // E. coli (~5 Mbp) → 2^18
+/// default_l2_leaf_count(3_100_000_000)   // hg38 (~3.1 Gbp) → 2^28
+/// ```
+pub fn default_l2_leaf_count(sa_num: usize) -> u64 {
+    let target = (sa_num / 12).max(16);
+    let pow2 = (target.next_power_of_two() >> 1).max(16);
+    (pow2 as u64).clamp(16, 1 << 28)
+}
+
 /// Extract (alpha, beta) from a fitted model and guard against non-finite
 /// values. Every `LinearModel::new` / `LinearSplineModel::new` result must
 /// pass through here before being written to a `ModelEntry`.
@@ -425,6 +446,38 @@ mod tests {
 
     fn make_ts(keys: Vec<u64>, sa_indices: Vec<u64>) -> TrainingSet {
         TrainingSet { keys, sa_indices }
+    }
+
+    // ── default_l2_leaf_count tests ───────────────────────────────────────
+
+    #[test]
+    fn default_l2_for_phix_scale() {
+        assert_eq!(default_l2_leaf_count(5_000), 256);
+    }
+
+    #[test]
+    fn default_l2_for_ecoli_scale() {
+        assert_eq!(default_l2_leaf_count(5_000_000), 1 << 18);
+    }
+
+    #[test]
+    fn default_l2_for_human_scale() {
+        assert_eq!(default_l2_leaf_count(3_100_000_000), 1 << 27);
+    }
+
+    #[test]
+    fn default_l2_floor_tiny_input() {
+        assert_eq!(default_l2_leaf_count(0), 16);
+    }
+
+    #[test]
+    fn default_l2_floor_small_input() {
+        assert_eq!(default_l2_leaf_count(100), 16);
+    }
+
+    #[test]
+    fn default_l2_ceiling_huge_input() {
+        assert_eq!(default_l2_leaf_count(usize::MAX), 1 << 28);
     }
 
     // ── encode_fallback_err tests ─────────────────────────────────────────
