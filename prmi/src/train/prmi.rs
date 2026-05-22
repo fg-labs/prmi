@@ -24,7 +24,8 @@ pub struct PrmiModel {
     pub bit_shift: u32,
 }
 
-/// Train a P-RMI on the supplied training set using default [`TrainerConfig`].
+/// Train a P-RMI on the supplied training set using default
+/// [`TrainerConfig`](crate::train::config::TrainerConfig).
 ///
 /// `l2_leaf_count` must be a power of two ≥ 16. The training-set keys must
 /// be non-decreasing.
