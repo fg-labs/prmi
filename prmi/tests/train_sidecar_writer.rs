@@ -48,6 +48,7 @@ fn writes_all_four_files_for_synthetic_fasta() {
     // The .meta should round-trip parse cleanly.
     let meta = prmi::sidecar::meta::Meta::read_file(&paths.meta).unwrap();
     assert_eq!(meta.sa.bytes_per_entry, 5);
+    assert_eq!(meta.sa.strand, "forward_only");
     assert_eq!(meta.priors.kind, "uniform");
     assert_eq!(meta.rmi.l2_leaf_count, 16);
     assert_eq!(meta.rmi.bit_shift, 60);

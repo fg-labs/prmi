@@ -57,6 +57,18 @@ pub struct Sa {
     pub bytes_per_entry: u8,
     /// Encoding name for the SA positions (always `"packed_lo8_hi32"` for v0.1).
     pub encoding: String,
+    /// Which strand the suffix array was built over. v0.1 supports only
+    /// `"forward_only"` (no reverse-complement concatenation). Defaults to
+    /// `"forward_only"` when absent so that sidecars built before this field
+    /// was added still load cleanly.
+    #[serde(default = "default_strand")]
+    pub strand: String,
+}
+
+/// Default value for [`Sa::strand`] when deserialising older sidecars that
+/// pre-date the field.
+fn default_strand() -> String {
+    "forward_only".to_string()
 }
 
 /// RMI architecture spec.
@@ -88,6 +100,10 @@ pub struct Priors {
 /// Canonical v0.1 prior kinds. Anything outside this list triggers
 /// `Error::FormatTooNew { kind }` at validation time.
 pub(crate) const KNOWN_PRIORS_V01: &[&str] = &["uniform"];
+
+/// Canonical v0.1 SA strand values. Anything outside this list triggers
+/// `Error::FormatTooNew { kind }` at validation time.
+pub(crate) const KNOWN_STRANDS_V01: &[&str] = &["forward_only"];
 
 impl Meta {
     /// Serialize this `Meta` to a pretty-printed TOML string.
@@ -151,6 +167,11 @@ impl Meta {
         if !KNOWN_PRIORS_V01.contains(&self.priors.kind.as_str()) {
             return Err(Error::FormatTooNew {
                 kind: self.priors.kind.clone(),
+            });
+        }
+        if !KNOWN_STRANDS_V01.contains(&self.sa.strand.as_str()) {
+            return Err(Error::FormatTooNew {
+                kind: format!("sa.strand={}", self.sa.strand),
             });
         }
         if self.sa.bytes_per_entry != 5 {

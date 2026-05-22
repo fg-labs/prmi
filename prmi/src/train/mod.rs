@@ -110,6 +110,7 @@ pub fn build_sidecar(ref_fa: &Path, prefix: &Path, l2_leaf_count: Option<u64>) -
             num_entries: sa.len() as u64,
             bytes_per_entry: 5,
             encoding: "packed_lo8_hi32".into(),
+            strand: "forward_only".into(),
         },
         rmi: RmiSpec {
             spec,

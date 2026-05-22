@@ -40,6 +40,42 @@ fn rejects_missing_files() {
 }
 
 #[test]
+fn open_rejects_unknown_strand_as_format_too_new() {
+    let dir = tempdir().unwrap();
+    let fa = dir.path().join("s.fa");
+    let mut content = String::from(">c\n");
+    for _ in 0..32 {
+        content.push_str("ACGTACGT");
+    }
+    content.push('\n');
+    std::fs::write(&fa, content.as_bytes()).unwrap();
+
+    let prefix = dir.path().join("s.fa.prmi");
+    build_sidecar(&fa, &prefix, Some(16)).unwrap();
+
+    // Corrupt the .meta to set sa.strand = "forward_reverse" (a hypothetical v0.2 value).
+    let meta_path = SidecarPaths::from_prefix(&prefix).meta;
+    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
+    let corrupted = meta_str.replace(r#"strand = "forward_only""#, r#"strand = "forward_reverse""#);
+    assert!(
+        corrupted.contains(r#"strand = "forward_reverse""#),
+        "replacement did not take effect — check the .meta TOML format"
+    );
+    std::fs::write(&meta_path, corrupted).unwrap();
+
+    // Opening should fail cleanly with Error::FormatTooNew { kind: "sa.strand=forward_reverse" }.
+    let err = LearnedIndex::open(&prefix).unwrap_err();
+    match err {
+        Error::FormatTooNew { kind } => {
+            assert_eq!(kind, "sa.strand=forward_reverse")
+        }
+        other => panic!(
+            "expected FormatTooNew {{ kind: \"sa.strand=forward_reverse\" }}, got {other:?}"
+        ),
+    }
+}
+
+#[test]
 fn open_rejects_unknown_priors_type_as_format_too_new() {
     let dir = tempdir().unwrap();
     let fa = dir.path().join("e.fa");

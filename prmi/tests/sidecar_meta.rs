@@ -21,6 +21,7 @@ fn sample() -> Meta {
             num_entries: 4096,
             bytes_per_entry: 5,
             encoding: "packed_lo8_hi32".into(),
+            strand: "forward_only".into(),
         },
         rmi: RmiSpec {
             spec: "pwl,linear,linear_spline".into(),
