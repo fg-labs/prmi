@@ -34,6 +34,7 @@ use prmi::train::mask::MaskConfig;
 use prmi::train::prior::{parse_histogram_tsv, Prior};
 use prmi::train::prior_from_cli_fastq;
 use prmi::train::validate_prior_paths;
+use prmi::Error;
 use std::collections::HashMap;
 use std::io::Write;
 use tempfile::tempdir;
@@ -387,6 +388,11 @@ fn parse_histogram_tsv_error_paths() {
     }
     let err = parse_histogram_tsv(&dup).unwrap_err();
     assert!(format!("{err}").contains("duplicate key"), "got: {err}");
+    // Malformed user input must surface as InvalidInput, not Internal (a bug).
+    assert!(
+        matches!(err, Error::InvalidInput { .. }),
+        "expected InvalidInput, got: {err:?}"
+    );
 
     // Non-numeric key.
     let bad_key = dir.path().join("bad_key.tsv");
@@ -422,10 +428,11 @@ fn cli_rejects_prior_bed_and_prior_fastq_histogram_together() {
     let bed = std::path::Path::new("targets.bed");
     let hist = std::path::Path::new("hist.tsv");
 
-    // Both supplied → reject.
+    // Both supplied → reject with a user-input error (not an internal-bug error).
+    let err = validate_prior_paths(Some(bed), Some(hist)).unwrap_err();
     assert!(
-        validate_prior_paths(Some(bed), Some(hist)).is_err(),
-        "supplying both --prior-bed and --prior-fastq-histogram must error"
+        matches!(err, Error::InvalidInput { .. }),
+        "supplying both --prior-bed and --prior-fastq-histogram must error as InvalidInput, got: {err:?}"
     );
     // At most one (or neither) is allowed.
     assert!(

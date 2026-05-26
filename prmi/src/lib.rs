@@ -1,19 +1,19 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
-//! prmi — Piecewise Recursive Model Index over genomic suffix arrays.
-//!
-//! This commit introduces the cleanroom trainer ([`train`]) and the shared
-//! §4.4 lookup math ([`index::lookup`]). The runtime `LearnedIndex`, priors,
-//! memory modes, CLI, and FFI land in subsequent PRs.
+//! prmi — Piecewise Recursive Model Index for sorted-key lookup, with a
+//! genomics-oriented trainer over the suffix array of a reference genome.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cli;
 pub mod encoding;
 pub mod error;
 pub mod fasta;
+pub mod histogram;
 pub mod index;
+pub mod inspect;
 pub mod sa;
 pub mod sidecar;
 pub mod train;

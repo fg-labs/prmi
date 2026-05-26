@@ -155,14 +155,14 @@ pub fn parse_histogram_tsv(path: &Path) -> Result<HashMap<u64, u64>> {
         }
 
         let mut fields = trimmed.splitn(3, '\t');
-        let key_str = fields.next().ok_or_else(|| Error::Internal {
+        let key_str = fields.next().ok_or_else(|| Error::InvalidInput {
             detail: format!(
                 "{}:{}: expected exactly two tab-separated fields",
                 path.display(),
                 line_num + 1
             ),
         })?;
-        let count_str = fields.next().ok_or_else(|| Error::Internal {
+        let count_str = fields.next().ok_or_else(|| Error::InvalidInput {
             detail: format!(
                 "{}:{}: expected exactly two tab-separated fields, found only one",
                 path.display(),
@@ -170,7 +170,7 @@ pub fn parse_histogram_tsv(path: &Path) -> Result<HashMap<u64, u64>> {
             ),
         })?;
         if fields.next().is_some() {
-            return Err(Error::Internal {
+            return Err(Error::InvalidInput {
                 detail: format!(
                     "{}:{}: expected exactly two tab-separated fields, found three or more",
                     path.display(),
@@ -179,7 +179,7 @@ pub fn parse_histogram_tsv(path: &Path) -> Result<HashMap<u64, u64>> {
             });
         }
 
-        let key: u64 = key_str.trim().parse().map_err(|_| Error::Internal {
+        let key: u64 = key_str.trim().parse().map_err(|_| Error::InvalidInput {
             detail: format!(
                 "{}:{}: key '{}' is not a valid u64",
                 path.display(),
@@ -187,7 +187,7 @@ pub fn parse_histogram_tsv(path: &Path) -> Result<HashMap<u64, u64>> {
                 key_str.trim()
             ),
         })?;
-        let count: u64 = count_str.trim().parse().map_err(|_| Error::Internal {
+        let count: u64 = count_str.trim().parse().map_err(|_| Error::InvalidInput {
             detail: format!(
                 "{}:{}: count '{}' is not a valid u64",
                 path.display(),
@@ -197,7 +197,7 @@ pub fn parse_histogram_tsv(path: &Path) -> Result<HashMap<u64, u64>> {
         })?;
 
         if map.contains_key(&key) {
-            return Err(Error::Internal {
+            return Err(Error::InvalidInput {
                 detail: format!(
                     "{}:{}: duplicate key {} in histogram",
                     path.display(),

@@ -113,6 +113,16 @@ pub enum Error {
         detail: String,
     },
 
+    /// Malformed user-supplied input: a bad value on the command line, or a
+    /// malformed record in a user-authored input file (e.g. a BED file or a
+    /// histogram TSV). Distinct from [`Error::Internal`] — this is the caller's
+    /// input to fix, not a bug in prmi.
+    #[error("invalid input: {detail}")]
+    InvalidInput {
+        /// Description of what was invalid (often with `file:line` context).
+        detail: String,
+    },
+
     /// An internal invariant was violated — always indicates a bug.
     #[error("internal invariant violated: {detail}")]
     Internal {
