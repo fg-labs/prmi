@@ -160,10 +160,6 @@ impl ModelFileReader {
     /// `shm_mmap` is the `Arc<Mmap>` of the parent shm blob. `offset` and `len`
     /// identify the component bytes within it. The component must start with a
     /// valid model file header for `expected_layer`.
-    ///
-    /// `#[allow(dead_code)]` because the only caller (`index::shm`) lands in
-    /// PR #5c (`feat/v0.1-index-shm`).
-    #[allow(dead_code)]
     pub(crate) fn from_shm_slice(
         shm_mmap: Arc<Mmap>,
         offset: usize,
