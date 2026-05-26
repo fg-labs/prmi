@@ -109,6 +109,39 @@ pub fn reverse_complement_key(key: u64, len: usize) -> u64 {
     shifted_high | pad_mask
 }
 
+/// Extract the lexicographically-smallest 32-mer from `bases` (2-bit unpacked,
+/// 1 base per byte, values `0..=3`) and return `(key, offset)` where `key` is
+/// its tokenized form and `offset` is its starting index within `bases`.
+///
+/// When `bases.len() < 32` there are no full 32-mers, so `None` is returned.
+///
+/// When multiple 32-mers share the same minimum key the one at the lowest
+/// offset wins (stable left-to-right tiebreak).
+///
+/// This is the classic minimizer primitive for long-read seeding: given a
+/// window of W bases, call `minimizer_32mer(&window[..W])` to obtain the
+/// lex-min 32-mer seed and its offset within the window. The offset can then
+/// be added to the window's start to get the absolute position in the read
+/// before calling `smem_range`.
+///
+/// Complexity: O(N × 32) in the naive implementation — suitable for v0.1.
+pub fn minimizer_32mer(bases: &[u8]) -> Option<(u64, usize)> {
+    let n = bases.len();
+    if n < KMER_LEN {
+        return None;
+    }
+    let mut min_key = u64::MAX;
+    let mut min_off = 0usize;
+    for start in 0..=(n - KMER_LEN) {
+        let key = tokenize_32mer(&bases[start..], KMER_LEN);
+        if key < min_key {
+            min_key = key;
+            min_off = start;
+        }
+    }
+    Some((min_key, min_off))
+}
+
 /// Reverse-complement a slice of 2-bit unpacked bases (1 base per byte,
 /// values `0..=3`). Returns a new Vec; in-place would be possible but
 /// the allocation cost is dwarfed by smem_range's local-search loop.
