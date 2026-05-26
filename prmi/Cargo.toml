@@ -49,3 +49,12 @@ tabular = "0.1"
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "lookup_bench"
+harness = false
+
+[[bench]]
+name = "trainer_bench"
+harness = false

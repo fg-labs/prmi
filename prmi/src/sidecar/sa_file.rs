@@ -379,10 +379,11 @@ impl SaFileReader {
     /// Return the stored ISA (inverse suffix array) value at SA index `i`, if
     /// this file was built in mode 3. Returns `None` for modes 1 and 2.
     ///
-    /// If `sa[i] = p` (i.e., the SA position stored at index `i` is `p`), then
-    /// `isa_at(i) = j` means `sa[j] = p` where `j` is the ISA value such that
-    /// walking forward from position `p+1` in the reference corresponds to SA
-    /// index `j`.
+    /// For the genome offset `p` stored at SA index `i` (`sa[i] = p`),
+    /// `isa_at(i)` returns `isa[p]`: the inverse suffix array, which maps a
+    /// genome position back to its rank in the suffix array. By definition
+    /// `isa[sa[i]] = i`, so this equals `i` for v0.1 sidecars (entries are
+    /// written in SA order).
     ///
     /// # Panics
     ///

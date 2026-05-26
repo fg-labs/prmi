@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege: CI only needs to read the repo contents. No job writes to the
+# repo, issues, PRs, packages, or deployments.
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      # rustfmt.toml uses `ignore` to skip the vendored prmi/src/upstream/ tree,
+      # which is a nightly-only rustfmt feature; stable rustfmt cannot honor it
+      # and would reformat Marcus's verbatim 2020-era code. Install nightly for
+      # the fmt check only. Stable is installed last below so it stays the
+      # default toolchain for clippy/build/test.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-05-21
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
+      # macOS: libsais OpenMP support requires libomp (Apple Clang does not
+      # bundle libomp). .cargo/config.toml sets CFLAGS=-I<brew-prefix>/include;
+      # this step ensures the library exists on the runner.
+      - if: runner.os == 'macOS'
+        run: brew install libomp
+      - run: cargo +nightly fmt --all -- --check
+      # Lint only the Fulcrum-authored crates. prmi/src/upstream/ carries
+      # verbatim 2020-era code; cleaning Marcus's lints would force
+      # `Modified by Fulcrum Genomics 2026` headers across every file and
+      # drown the license-tracking surface in noise.
+      - run: cargo clippy -p prmi -p prmi-sys --all-targets --all-features -- -D warnings
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+
+  cpp-example:
+    name: examples/cpp_caller
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
+      # Build both crates: prmi-sys for libprmi_sys.a (the C link target),
+      # prmi for the `prmi` CLI that examples/run_smoke.sh shells out to.
+      - run: cargo build --release
+      - run: make -C examples
+      - run: ./examples/run_smoke.sh
