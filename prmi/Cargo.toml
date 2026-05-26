@@ -26,6 +26,8 @@ noodles-fasta.workspace = true
 libsais.workspace = true
 sha2.workspace = true
 toml.workspace = true
+serde.workspace = true
+memmap2.workspace = true
 # Upstream (rmi_lib inherited) deps — present because prmi/src/upstream/
 # files import them. Touching these would force upstream source modifications
 # that the LICENSE-FORK-NOTICE tracking is designed to minimize.
@@ -34,3 +36,6 @@ json = "0.12"
 bytesize = "1.0"
 superslice = "1.0"
 tabular = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
