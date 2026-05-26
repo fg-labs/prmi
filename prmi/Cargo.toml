@@ -1,0 +1,31 @@
+[package]
+name = "prmi"
+description = "Piecewise Recursive Model Index over genomic suffix arrays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["bioinformatics", "genomics", "rmi", "learned-index", "suffix-array"]
+categories = ["science", "data-structures"]
+readme = "../README.md"
+homepage = "https://github.com/fg-labs/prmi"
+documentation = "https://docs.rs/prmi"
+
+[lib]
+name = "prmi"
+path = "src/lib.rs"
+
+[dependencies]
+log.workspace = true
+byteorder.workspace = true
+rayon.workspace = true
+# Upstream (rmi_lib inherited) deps — present because prmi/src/upstream/
+# files import them. Touching these would force upstream source modifications
+# that the LICENSE-FORK-NOTICE tracking is designed to minimize.
+indicatif = "0.13"
+json = "0.12"
+bytesize = "1.0"
+superslice = "1.0"
+tabular = "0.1"
