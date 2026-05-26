@@ -16,8 +16,8 @@ pub use models::{
 };
 // `train` and `TrainedRMI` are from Marcus's original two_layer.rs. They are
 // only used via the Fulcrum trainer in train/trainer.rs (through
-// LowerBoundCorrection). The TrainingKey::minus_epsilon impl for u64/u32 has
-// an underflow bug at key=0 (wraps to u64::MAX in release, panics in debug).
-// Gate the whole module pub(crate) so it is not reachable from downstream
-// users of the prmi crate.
+// LowerBoundCorrection). The TrainingKey::minus_epsilon / plus_epsilon impls
+// for u64/u32 use saturating arithmetic so they cannot under/overflow at the
+// key-space boundaries (0 and MAX). Gate the whole module pub(crate) so it is
+// not reachable from downstream users of the prmi crate.
 pub(crate) use train::{train, TrainedRMI};

@@ -70,13 +70,16 @@ pub trait TrainingKey: PartialEq + Copy + Send + Sync + std::fmt::Debug + 'stati
 
 impl TrainingKey for u64 {
     fn minus_epsilon(&self) -> Self {
-        *self - 1
+        // Saturating: `minus_epsilon` at key 0 must not underflow (wraps to
+        // u64::MAX in release, panics in debug). The lower neighbour of 0 is 0.
+        self.saturating_sub(1)
     }
     fn zero_value() -> Self {
         0
     }
     fn plus_epsilon(&self) -> Self {
-        *self + 1
+        // Saturating: `plus_epsilon` at u64::MAX must not overflow.
+        self.saturating_add(1)
     }
     fn max_value() -> Self {
         std::u64::MAX
@@ -96,13 +99,15 @@ impl TrainingKey for u64 {
 
 impl TrainingKey for u32 {
     fn minus_epsilon(&self) -> Self {
-        *self - 1
+        // Saturating: see the u64 impl — avoids underflow at key 0.
+        self.saturating_sub(1)
     }
     fn zero_value() -> Self {
         0
     }
     fn plus_epsilon(&self) -> Self {
-        *self + 1
+        // Saturating: avoids overflow at u32::MAX.
+        self.saturating_add(1)
     }
     fn max_value() -> Self {
         std::u32::MAX
@@ -809,5 +814,37 @@ pub trait Model: Sync + Send {
 
     fn set_to_constant_model(&mut self, _constant: u64) -> bool {
         return false;
+    }
+}
+
+#[cfg(test)]
+mod training_key_epsilon_tests {
+    use super::*;
+
+    /// `minus_epsilon`/`plus_epsilon` must saturate at the key-space boundaries
+    /// rather than under/overflow (which wrapped in release and panicked in
+    /// debug). Interior values still step by one.
+    #[test]
+    fn u64_epsilon_saturates_at_boundaries() {
+        assert_eq!(0u64.minus_epsilon(), 0, "minus_epsilon must saturate at 0");
+        assert_eq!(
+            u64::MAX.plus_epsilon(),
+            u64::MAX,
+            "plus_epsilon must saturate at u64::MAX"
+        );
+        assert_eq!(5u64.minus_epsilon(), 4);
+        assert_eq!(5u64.plus_epsilon(), 6);
+    }
+
+    #[test]
+    fn u32_epsilon_saturates_at_boundaries() {
+        assert_eq!(0u32.minus_epsilon(), 0, "minus_epsilon must saturate at 0");
+        assert_eq!(
+            u32::MAX.plus_epsilon(),
+            u32::MAX,
+            "plus_epsilon must saturate at u32::MAX"
+        );
+        assert_eq!(5u32.minus_epsilon(), 4);
+        assert_eq!(5u32.plus_epsilon(), 6);
     }
 }

@@ -3,10 +3,9 @@
 
 //! prmi — Piecewise Recursive Model Index over genomic suffix arrays.
 //!
-//! The full crate surface lands across the v0.1 stack. This commit
-//! introduces the Fulcrum-authored utility modules
-//! ([`encoding`], [`fasta`], [`sa`], [`error`], [`sidecar::magic`])
-//! that the trainer, sidecar reader, and index runtime consume.
+//! This commit introduces the cleanroom trainer ([`train`]) and the shared
+//! §4.4 lookup math ([`index::lookup`]). The runtime `LearnedIndex`, priors,
+//! memory modes, CLI, and FFI land in subsequent PRs.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -14,8 +13,10 @@
 pub mod encoding;
 pub mod error;
 pub mod fasta;
+pub mod index;
 pub mod sa;
 pub mod sidecar;
+pub mod train;
 pub use error::{Error, Result};
 
 // Upstream code carries its own (often minimal) docs from Marcus 2020.

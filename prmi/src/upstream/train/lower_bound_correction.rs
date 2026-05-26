@@ -139,26 +139,38 @@ impl<T: TrainingKey> LowerBoundCorrection<T> {
 
         let mut last_target = 0;
         let mut current_run_length = 0;
-        let mut current_run_key = data.get_key(0);
-        for (x, y) in data.iter() {
-            let leaf_idx = pred_func(x.into());
-            let target = u64::min(num_leaf_models - 1, leaf_idx) as usize;
+        // Guard empty input: `data.get_key(0)` panics on an empty dataset and
+        // there are no runs to record. The iterator below is also empty, so
+        // first/last/next/prev stay correctly unpopulated.
+        if data.len() > 0 {
+            let mut current_run_key = data.get_key(0);
+            for (x, y) in data.iter() {
+                let leaf_idx = pred_func(x.into());
+                let target = u64::min(num_leaf_models - 1, leaf_idx) as usize;
 
-            if target == last_target && x == current_run_key {
-                current_run_length += 1;
-            } else if target != last_target || x != current_run_key {
-                max_run_length[last_target] =
-                    u64::max(max_run_length[last_target], current_run_length);
+                if target == last_target && x == current_run_key {
+                    current_run_length += 1;
+                } else if target != last_target || x != current_run_key {
+                    max_run_length[last_target] =
+                        u64::max(max_run_length[last_target], current_run_length);
 
-                current_run_length = 1;
-                current_run_key = x;
-                last_target = target;
+                    current_run_length = 1;
+                    current_run_key = x;
+                    last_target = target;
+                }
+
+                if first_key_for_leaf[target].is_none() {
+                    first_key_for_leaf[target] = Some((y, x));
+                }
+                last_key_for_leaf[target] = Some((y, x));
             }
 
-            if first_key_for_leaf[target].is_none() {
-                first_key_for_leaf[target] = Some((y, x));
-            }
-            last_key_for_leaf[target] = Some((y, x));
+            // Flush the final run. The loop only commits a run to
+            // `max_run_length` on a transition, so the last run — and the only
+            // run for a single-run dataset — would otherwise never be recorded,
+            // making `longest_run` underreport (returning 0 for single-run data).
+            max_run_length[last_target] =
+                u64::max(max_run_length[last_target], current_run_length);
         }
 
         let (next_for_leaf, next_is_real) =
@@ -370,5 +382,37 @@ mod tests {
             prev0.is_none(),
             "leaf 0 has no predecessor; prev_real should be None"
         );
+    }
+
+    /// Regression: a single-run dataset (all entries share one key/leaf, so the
+    /// run-length loop never sees a transition) must still report the full run
+    /// length. Before the final-run flush, `longest_run` returned 0 here.
+    ///
+    /// All iterated entries fall in one run, so `longest_run(0)` must equal the
+    /// number of entries the trainer iterates. (We derive the expected count
+    /// from `data.iter()` rather than hard-coding it, since `FixDupsIter` adds a
+    /// trailing replay of the last element.)
+    #[test]
+    fn single_run_reports_full_length() {
+        let pairs: Vec<(u64, usize)> = vec![(5u64, 0), (5u64, 1), (5u64, 2)];
+        let data = RMITrainingData::<u64>::new(Box::new(pairs));
+        let expected = data.iter().count() as u64;
+        assert!(expected > 0, "test setup: dataset must be non-empty");
+        let lbc = LowerBoundCorrection::new(|k: u64| k >> 60, 16, &data);
+        assert_eq!(
+            lbc.longest_run(0),
+            expected,
+            "single-run dataset should report longest_run equal to its iterated length"
+        );
+    }
+
+    /// Regression: building over an empty dataset must not panic (the run-length
+    /// loop previously called `data.get_key(0)` unconditionally).
+    #[test]
+    fn empty_data_does_not_panic() {
+        let lbc = build_lbc(Vec::new(), 16);
+        assert_eq!(lbc.longest_run(0), 0);
+        assert!(lbc.first_key(0).is_none());
+        assert!(lbc.next_real(0).is_none());
     }
 }
