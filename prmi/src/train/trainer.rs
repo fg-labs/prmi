@@ -19,7 +19,9 @@ use crate::train::config::TrainerConfig;
 use crate::train::prmi::PrmiModel;
 use crate::train::training_set::TrainingSet;
 use crate::upstream::train::lower_bound_correction::LowerBoundCorrection;
-use crate::upstream::{LinearModel, LinearSplineModel, Model, ModelParam, RMITrainingData};
+use crate::upstream::{
+    weighted_slr, LinearModel, LinearSplineModel, Model, ModelParam, RMITrainingData,
+};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -171,6 +173,10 @@ pub fn train_with_config(
         .collect();
     let data = RMITrainingData::<u64>::new(Box::new(pairs));
 
+    // Resolve the global weight vector. `None` means uniform (weight=1.0).
+    // Stored as a reference to avoid cloning when not needed.
+    let global_weights: Option<&Vec<f64>> = ts.weights.as_ref();
+
     // ── step 4: LowerBoundCorrection over full data ───────────────────────
     // `pred_func` is the L2 routing function: key >> bit_shift, clamped to
     // [0, l2_leaf_count). Used by LBC to compute per-leaf first/last/next/prev.
@@ -259,7 +265,14 @@ pub fn train_with_config(
         if leaf_len <= config.fallback_threshold {
             // ── case b: direct leaf (DIRECT path) ────────────────────────
             l2.push(fit_direct_leaf(
-                &lbc, ts, start, end, leaf_idx, bit_shift, sa_num,
+                &lbc,
+                ts,
+                start,
+                end,
+                leaf_idx,
+                bit_shift,
+                sa_num,
+                global_weights,
             )?);
         } else {
             // ── case c: large leaf — try fallback, downgrade if needed ───
@@ -270,11 +283,26 @@ pub fn train_with_config(
                 // DBZ guard: all keys in this leaf map to the same SA position.
                 // Downgrade to direct fit. [A] audit, §Issues "Division by zero".
                 l2.push(fit_direct_leaf(
-                    &lbc, ts, start, end, leaf_idx, bit_shift, sa_num,
+                    &lbc,
+                    ts,
+                    start,
+                    end,
+                    leaf_idx,
+                    bit_shift,
+                    sa_num,
+                    global_weights,
                 )?);
             } else {
                 l2.push(fit_fallback_leaf(
-                    ts, start, end, start_y, end_y, &mut l1, config, sa_num,
+                    ts,
+                    start,
+                    end,
+                    start_y,
+                    end_y,
+                    &mut l1,
+                    config,
+                    sa_num,
+                    global_weights,
                 )?);
             }
         }
@@ -301,10 +329,15 @@ pub fn train_with_config(
 
 /// Fit a direct (non-fallback) L2 leaf entry.
 ///
-/// 1. Fit a `LinearModel` on the leaf's training pairs.
+/// 1. Fit a `LinearModel` on the leaf's training pairs (weighted if `weights`
+///    is `Some`; uniform otherwise).
 /// 2. NaN-guard the resulting (alpha, beta).
 /// 3. Compute `err` = max absolute prediction error, widened by the LBC
 ///    neighbor-correction term (spec §5.10 step 7b).
+///
+/// The verify pass (error computation) always uses uniform measurement against
+/// each pair's true SA index — weights affect only the fit, not the error bound.
+#[allow(clippy::too_many_arguments)]
 fn fit_direct_leaf(
     lbc: &LowerBoundCorrection<u64>,
     ts: &TrainingSet,
@@ -314,19 +347,40 @@ fn fit_direct_leaf(
     bit_shift: u32,
     // Full SA size (for prediction clamping — may exceed ts.len() when masking).
     sa_num: u64,
+    // Global per-pair weights. `None` means uniform (1.0).
+    weights: Option<&Vec<f64>>,
 ) -> Result<ModelEntry> {
-    // Build a soft-copy restricted to this leaf's range.
-    // We build a new Vec for the leaf slice. This is O(leaf_len) per leaf —
-    // acceptable since leaves are O(fallback_threshold) = O(1000) entries.
-    let leaf_pairs: Vec<(u64, usize)> = ts.keys[start..end]
-        .iter()
-        .zip(ts.sa_indices[start..end].iter())
-        .map(|(&k, &s)| (k, s as usize))
-        .collect();
-    let leaf_data = RMITrainingData::<u64>::new(Box::new(leaf_pairs));
+    let (alpha, beta) = if let Some(ws) = weights {
+        // Weighted fit using per-pair weights from the training set.
+        let leaf_pairs: Vec<(f64, f64)> = ts.keys[start..end]
+            .iter()
+            .zip(ts.sa_indices[start..end].iter())
+            .map(|(&k, &s)| (k as f64, s as f64))
+            .collect();
+        let leaf_weights: Vec<f64> = ws[start..end].to_vec();
+        let (a, b) = weighted_slr(&leaf_pairs, &leaf_weights);
+        (a, b)
+    } else {
+        // Unweighted fit (original path).
+        let leaf_pairs: Vec<(u64, usize)> = ts.keys[start..end]
+            .iter()
+            .zip(ts.sa_indices[start..end].iter())
+            .map(|(&k, &s)| (k, s as usize))
+            .collect();
+        let leaf_data = RMITrainingData::<u64>::new(Box::new(leaf_pairs));
+        let model = LinearModel::new(&leaf_data);
+        // Validate and extract (alpha, beta) from the model.
+        let (a, b) = alpha_beta(&model)?;
+        (a, b)
+    };
 
-    let model = LinearModel::new(&leaf_data);
-    let (alpha, beta) = alpha_beta(&model)?;
+    // Validate params (the weighted_slr path returns finite values by
+    // construction, but check anyway for defence-in-depth).
+    if !alpha.is_finite() || !beta.is_finite() {
+        return Err(Error::Internal {
+            detail: format!("non-finite model params: alpha={alpha}, beta={beta}"),
+        });
+    }
 
     // Compute in-leaf error: max |predict(k) - sa_idx| over all leaf keys.
     let mut err = 0u64;
@@ -396,11 +450,16 @@ fn fit_direct_leaf(
 /// Algorithm (spec §5.10 step 7c):
 /// 1. Compute `partial_num = ceil(leaf_len / partial_target_size)`.
 /// 2. Build a rescaled view of the leaf data for the routing model.
-/// 3. Fit a `LinearModel` routing model on the rescaled view.
+/// 3. Fit a `LinearModel` routing model on the rescaled view (weighted if
+///    `weights` is `Some`).
 /// 4. Partition the leaf into `partial_num` sub-leaves via routing predictions.
-/// 5. For each sub-leaf: fit `LinearSplineModel` (≥2 keys), constant (1 key),
-///    or constant-to-next (empty).
+/// 5. For each sub-leaf: fit `LinearSplineModel` (≥2 keys; weighted if
+///    `weights` is `Some`), constant (1 key), or constant-to-next (empty).
 /// 6. Append sub-leaf entries to `l1`; emit routing L2 entry.
+///
+/// The error bound computation (steps 5d and 6d) always uses unweighted
+/// max-absolute-error so that the sidecar's `err` field remains a valid
+/// worst-case bound for all queries, regardless of their BED-coverage status.
 #[allow(clippy::too_many_arguments)]
 fn fit_fallback_leaf(
     ts: &TrainingSet,
@@ -411,6 +470,7 @@ fn fit_fallback_leaf(
     l1: &mut Vec<ModelEntry>,
     config: &TrainerConfig,
     sa_num: u64,
+    weights: Option<&Vec<f64>>,
 ) -> Result<ModelEntry> {
     let leaf_len = end - start;
 
@@ -424,37 +484,57 @@ fn fit_fallback_leaf(
     // since Marcus's reverted RMITrainingData has no set_offset API.
     // [A] audit §"Design decision #6 Scale/offset rescaling".
     let scale = (partial_num - 1) as f64 / (end_y - start_y) as f64;
-    let scaled_pairs: Vec<(u64, usize)> = ts.keys[start..end]
+    let scaled_f64_pairs: Vec<(f64, f64)> = ts.keys[start..end]
         .iter()
         .zip(ts.sa_indices[start..end].iter())
         .map(|(&k, &s)| {
             let shifted = (s as usize).saturating_sub(start_y);
-            let scaled = (shifted as f64 * scale).round() as usize;
-            (k, scaled.min(partial_num - 1))
+            let scaled = (shifted as f64 * scale).round();
+            (k as f64, scaled.min((partial_num - 1) as f64))
         })
         .collect();
-    let scaled_data = RMITrainingData::<u64>::new(Box::new(scaled_pairs));
 
-    // Fit the routing LinearModel on the scaled data.
-    let routing_model = LinearModel::new(&scaled_data);
-    let (routing_alpha, routing_beta) = alpha_beta(&routing_model)?;
+    // Fit the routing LinearModel on the scaled data (weighted if prior active).
+    let (routing_alpha, routing_beta) = if let Some(ws) = weights {
+        let leaf_weights: Vec<f64> = ws[start..end].to_vec();
+        let (a, b) = weighted_slr(&scaled_f64_pairs, &leaf_weights);
+        if !a.is_finite() || !b.is_finite() {
+            return Err(Error::Internal {
+                detail: format!("non-finite routing model params: alpha={a}, beta={b}"),
+            });
+        }
+        (a, b)
+    } else {
+        // Unweighted: use original RMITrainingData path.
+        let scaled_pairs: Vec<(u64, usize)> = scaled_f64_pairs
+            .iter()
+            .map(|&(k, v)| (k as u64, v as usize))
+            .collect();
+        let scaled_data = RMITrainingData::<u64>::new(Box::new(scaled_pairs));
+        let routing_model = LinearModel::new(&scaled_data);
+        alpha_beta(&routing_model)?
+    };
 
     // ── partition leaf into sub-leaves ────────────────────────────────────
-    // `sub_leaf_items[s]` = Vec of (key, sa_index) pairs routed to sub-leaf s.
+    // `sub_leaf_items[s]` = Vec of (key, sa_index, weight) triples routed to sub-leaf s.
     // Routing: clamp(routing_alpha + routing_beta * key, 0, partial_num - 1) using
     // truncation (not rounding) to match the runtime's `clamp_to_int` behavior.
-    let mut sub_leaf_items: Vec<Vec<(u64, usize)>> = vec![Vec::new(); partial_num];
-    for (&k, &sa_idx) in ts.keys[start..end]
+    // Weight is always 1.0 when no prior is active; this keeps the sub-leaf
+    // fitting path uniform regardless of whether weights are present.
+    let mut sub_leaf_items: Vec<Vec<(u64, usize, f64)>> = vec![Vec::new(); partial_num];
+    for (i, (&k, &sa_idx)) in ts.keys[start..end]
         .iter()
         .zip(ts.sa_indices[start..end].iter())
+        .enumerate()
     {
+        let w = weights.map_or(1.0, |ws| ws[start + i]);
         let raw = routing_alpha + routing_beta * k as f64;
         let sub_idx = if raw.is_nan() {
             0
         } else {
             raw.clamp(0.0, (partial_num - 1) as f64) as usize
         };
-        sub_leaf_items[sub_idx].push((k, sa_idx as usize));
+        sub_leaf_items[sub_idx].push((k, sa_idx as usize, w));
     }
 
     // ── compute "next non-empty sub-leaf first sa_index" for empty sub-leaves.
@@ -504,15 +584,29 @@ fn fit_fallback_leaf(
                 }
             }
             _ => {
-                // Two or more keys: fit LinearSplineModel. [A] audit §Q4 decision.
-                let sub_pairs: Vec<(u64, usize)> = items.clone();
-                let sub_data = RMITrainingData::<u64>::new(Box::new(sub_pairs));
-                let sub_model = LinearSplineModel::new(&sub_data);
-                let (sub_alpha, sub_beta) = alpha_beta(&sub_model)?;
+                // Two or more keys: fit LinearSplineModel (weighted if prior active).
+                // [A] audit §Q4 decision.
+                let sub_f64_pairs: Vec<(f64, f64)> = items
+                    .iter()
+                    .map(|&(k, sa, _)| (k as f64, sa as f64))
+                    .collect();
+                let sub_weights: Vec<f64> = items.iter().map(|&(_, _, w)| w).collect();
+                let sub_model = LinearSplineModel::new_weighted(&sub_f64_pairs, &sub_weights);
+                let sub_params = sub_model.params();
+                let sub_alpha = sub_params[0].as_float();
+                let sub_beta = sub_params[1].as_float();
+                if !sub_alpha.is_finite() || !sub_beta.is_finite() {
+                    return Err(Error::Internal {
+                        detail: format!(
+                            "non-finite sub-leaf model params: alpha={sub_alpha}, beta={sub_beta}"
+                        ),
+                    });
+                }
 
                 // Compute err: max |pred - sa_idx| over sub-leaf keys.
+                // Error is always computed without weights (uniform verification truth).
                 let mut sub_err = 0u64;
-                for &(k, sa_idx) in items {
+                for &(k, sa_idx, _) in items {
                     let pred = predict_clamped(sub_alpha, sub_beta, k, sa_num);
                     let d = (pred - sa_idx as i64).unsigned_abs();
                     if d > sub_err {
@@ -552,6 +646,7 @@ mod tests {
             keys,
             sa_indices,
             sa_num,
+            weights: None,
         }
     }
 
