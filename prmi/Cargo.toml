@@ -21,6 +21,11 @@ path = "src/lib.rs"
 log.workspace = true
 byteorder.workspace = true
 rayon.workspace = true
+thiserror.workspace = true
+noodles-fasta.workspace = true
+libsais.workspace = true
+sha2.workspace = true
+toml.workspace = true
 # Upstream (rmi_lib inherited) deps — present because prmi/src/upstream/
 # files import them. Touching these would force upstream source modifications
 # that the LICENSE-FORK-NOTICE tracking is designed to minimize.
