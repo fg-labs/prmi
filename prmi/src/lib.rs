@@ -3,13 +3,20 @@
 
 //! prmi — Piecewise Recursive Model Index over genomic suffix arrays.
 //!
-//! This commit establishes the workspace skeleton and relocates Marcus's
-//! `learnedsystems/RMI` primitives into [`upstream`]. Fulcrum-authored
-//! crate content (encoding, fasta, sa, sidecar, train, index, cli, FFI)
-//! lands in subsequent PRs in the v0.1 stack.
+//! The full crate surface lands across the v0.1 stack. This commit
+//! introduces the Fulcrum-authored utility modules
+//! ([`encoding`], [`fasta`], [`sa`], [`error`], [`sidecar::magic`])
+//! that the trainer, sidecar reader, and index runtime consume.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod encoding;
+pub mod error;
+pub mod fasta;
+pub mod sa;
+pub mod sidecar;
+pub use error::{Error, Result};
 
 // Upstream code carries its own (often minimal) docs from Marcus 2020.
 #[allow(missing_docs)]

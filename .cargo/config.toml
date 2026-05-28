@@ -1,0 +1,22 @@
+# Workspace-level Cargo configuration.
+#
+# macOS / Apple Clang: libsais-sys's build script enables OpenMP via
+# `-Xpreprocessor -fopenmp` but does not inject the libomp include directory
+# into the cc-rs invocation. We expose the include path via cc-rs's
+# target-specific CFLAGS env var so the C compiler finds <omp.h> during
+# libsais-sys compilation.
+#
+# `CFLAGS_aarch64-apple-darwin` is consumed by cc-rs only when building for
+# Apple Silicon, where Homebrew lives at /opt/homebrew. Other targets are
+# untouched:
+#   - Linux uses GCC's libgomp automatically (no -I needed).
+#   - Intel Macs (x86_64-apple-darwin) have Homebrew at /usr/local; on those
+#     hosts, override before building:
+#       CFLAGS="-I$(brew --prefix libomp)/include" cargo build
+#
+# `force = false` lets a user-set CFLAGS env var take precedence.
+#
+# Prerequisite on macOS: `brew install libomp`
+
+[env]
+CFLAGS_aarch64-apple-darwin = { value = "-I/opt/homebrew/opt/libomp/include", force = false }
