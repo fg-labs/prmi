@@ -1,0 +1,22 @@
+[package]
+name = "prmi-sys"
+description = "C ABI shim for the prmi crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["bioinformatics", "genomics", "ffi", "learned-index", "c-api"]
+categories = ["external-ffi-bindings", "science"]
+readme = "../README.md"
+homepage = "https://github.com/fg-labs/prmi"
+documentation = "https://docs.rs/prmi-sys"
+
+[lib]
+name = "prmi_sys"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Dependencies, FFI exports, build.rs cbindgen wiring, and the C header
+# land in PR #7 (`feat/v0.1-prmi-sys`). This crate is included in the
+# workspace from PR #1 onward so the stack's workspace shape is stable.

@@ -5,3 +5,7 @@ Cargo.lock
 *\#
 \#*
 rmi_data
+# cbindgen output — landed in PR #7 (`feat/v0.1-prmi-sys`)
+prmi-sys/include/
+# C++ example binary
+examples/cpp_caller
