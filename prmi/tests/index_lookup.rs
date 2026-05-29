@@ -73,8 +73,15 @@ fn corrupt_l2_routing_index_out_of_bounds_does_not_panic() {
     let l1: Vec<ModelEntry> = vec![];
     let sa_num = 50u64;
     let (pos, err) = lookup_with_components(5, &l1, &l2, 0, sa_num);
-    assert!(pos < sa_num, "position {pos} must be clamped into the SA range");
-    assert_eq!(err, u64::MAX, "out-of-range routing must widen the error bound");
+    assert!(
+        pos < sa_num,
+        "position {pos} must be clamped into the SA range"
+    );
+    assert_eq!(
+        err,
+        u64::MAX,
+        "out-of-range routing must widen the error bound"
+    );
 }
 
 #[test]
@@ -103,7 +110,10 @@ fn corrupt_l1_fallback_range_out_of_bounds_does_not_panic() {
     let sa_num = 100u64;
     let bit_shift = 64; // 1 L2 leaf
     let (pos, _err) = lookup_with_components(1, &l1, &l2, bit_shift, sa_num);
-    assert!(pos < sa_num, "position {pos} must be clamped into the SA range");
+    assert!(
+        pos < sa_num,
+        "position {pos} must be clamped into the SA range"
+    );
 }
 
 #[test]

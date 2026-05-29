@@ -71,13 +71,25 @@ fn mask_n_runs_default_on_excludes_n_window() {
         .collect();
 
     // Unmasked: all SA entries used.
-    let ts_full = masked_training_set(&sa, &bases, &n_positions, &MaskConfig::default());
+    let ts_full = masked_training_set(
+        &sa,
+        &bases,
+        &n_positions,
+        &MaskConfig::default(),
+        &prmi::train::prior::Prior::Uniform,
+    );
     // Masked: N-run positions excluded.
     let mask_on = MaskConfig {
         mask_n_runs: true,
         ..Default::default()
     };
-    let ts_masked = masked_training_set(&sa, &bases, &n_positions, &mask_on);
+    let ts_masked = masked_training_set(
+        &sa,
+        &bases,
+        &n_positions,
+        &mask_on,
+        &prmi::train::prior::Prior::Uniform,
+    );
 
     // Masked must have fewer training pairs.
     assert!(
