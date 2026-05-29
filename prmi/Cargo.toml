@@ -28,6 +28,7 @@ sha2.workspace = true
 toml.workspace = true
 serde.workspace = true
 memmap2.workspace = true
+time.workspace = true
 # Upstream (rmi_lib inherited) deps — present because prmi/src/upstream/
 # files import them. Touching these would force upstream source modifications
 # that the LICENSE-FORK-NOTICE tracking is designed to minimize.
@@ -39,3 +40,4 @@ tabular = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
