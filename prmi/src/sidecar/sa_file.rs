@@ -292,11 +292,6 @@ impl SaFileReader {
     /// `shm_mmap` is the `Arc<Mmap>` of the parent shm blob. `offset` and `len`
     /// identify the `.sa` component within it (as returned by `ShmBlob`).
     /// The component bytes must start with a valid `.sa` header.
-    ///
-    /// `#[allow(dead_code)]` because the only caller (`index::shm`) lands in
-    /// PR #5c (`feat/v0.1-index-shm`); shipping the constructor here keeps
-    /// the sidecar/index file boundary clean for stacked-PR review.
-    #[allow(dead_code)]
     pub(crate) fn from_shm_slice(shm_mmap: Arc<Mmap>, offset: usize, len: usize) -> Result<Self> {
         // Build a fake path for error messages.
         let fake_path = PathBuf::from("<shm>");

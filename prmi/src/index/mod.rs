@@ -7,11 +7,13 @@
 
 /// §4.4 lookup math: parameterized over mmap-backed readers or in-memory slices.
 pub mod lookup;
+pub mod shm;
 pub mod smem;
 pub mod smem_simd;
 
 use crate::error::{Error, Result};
 use crate::index::lookup::lookup_core;
+use crate::index::shm::{read_shm_blob, write_shm_blob};
 use crate::sidecar::magic::META_MAGIC;
 use crate::sidecar::meta::Meta;
 use crate::sidecar::model_file::{ModelFileReader, ModelLayer};
@@ -60,6 +62,93 @@ impl LearnedIndex {
             l2,
             skc,
         })
+    }
+
+    /// Open a sidecar previously loaded into a shm blob by `prmi shm load`.
+    ///
+    /// `shm_path` is the path to the shm blob file (typically
+    /// `/dev/shm/<name>` on Linux or `/tmp/<name>` on macOS). The blob must
+    /// have been written by [`write_shm_blob`] (or `prmi shm load`).
+    ///
+    /// Pages are mmap'd with `MAP_SHARED`; multiple processes that open the
+    /// same `shm_path` share the same OS page-cache pages without re-paying
+    /// I/O or page-fault costs after the first open. Cross-process sharing
+    /// relies on the OS honouring `MAP_SHARED` for the backing store (tmpfs on
+    /// Linux, APFS on macOS); this is standard behaviour for any regular file
+    /// or `/dev/shm` entry on both platforms.
+    ///
+    /// Thread-safe after return: `LearnedIndex` is `Send + Sync`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob file is absent, truncated, has an
+    /// unrecognised wrapper header, or contains a component that fails
+    /// sidecar validation.
+    ///
+    /// # Limitations
+    ///
+    /// - Concurrent writers are not supported. If `prmi shm load` is still
+    ///   running when `open_shm` is called, behavior is undefined.
+    /// - Crash safety is not provided: a partially written blob produces an
+    ///   error rather than silently corrupt data (the component headers are
+    ///   validated before any lookup).
+    pub fn open_shm(shm_path: impl AsRef<Path>) -> Result<Self> {
+        let shm_path = shm_path.as_ref();
+        let blob = read_shm_blob(shm_path)?;
+
+        // Parse the meta TOML from the blob's meta component.
+        let meta_slice = &blob.mmap[blob.meta_offset..blob.meta_offset + blob.meta_len];
+        let meta_str = std::str::from_utf8(meta_slice).map_err(|_| Error::Internal {
+            detail: "shm blob meta component is not valid UTF-8".to_string(),
+        })?;
+        let meta = Meta::from_toml_str(meta_str)?;
+
+        // SHM blobs pack only the four core components; the `.skc` companion is
+        // not included. Fail fast rather than silently loading a
+        // suffix_key_cache sidecar with `skc = None`, which would change
+        // `key_at()` semantics relative to a file-backed `open`.
+        if meta.sa.mode == "suffix_key_cache" {
+            return Err(Error::SidecarMismatch {
+                file: shm_path.to_path_buf(),
+                detail: "suffix_key_cache sidecars are not supported in SHM blobs".to_string(),
+            });
+        }
+
+        let sa = SaFileReader::from_shm_slice(blob.mmap.clone(), blob.sa_offset, blob.sa_len)?;
+        let l1 = ModelFileReader::from_shm_slice(
+            blob.mmap.clone(),
+            blob.l1_offset,
+            blob.l1_len,
+            ModelLayer::L1,
+        )?;
+        let l2 = ModelFileReader::from_shm_slice(
+            blob.mmap.clone(),
+            blob.l2_offset,
+            blob.l2_len,
+            ModelLayer::L2,
+        )?;
+
+        // Re-use cross_validate with a synthetic path for error messages.
+        let fake_paths = SidecarPaths::from_prefix(shm_path);
+        cross_validate(&fake_paths, &meta, &sa, &l1, &l2)?;
+        // Always `None` here: suffix_key_cache (the only mode with a `.skc`) was
+        // rejected above, so the remaining modes carry no companion cache.
+        let skc = None;
+        Ok(Self {
+            meta,
+            sa,
+            l1,
+            l2,
+            skc,
+        })
+    }
+
+    /// Pack this sidecar's four component files into a single shm blob at
+    /// `shm_path`. Convenience wrapper around [`write_shm_blob`].
+    ///
+    /// Equivalent to running `prmi shm load <prefix> <shm_path>` from the CLI.
+    pub fn write_shm(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
+        write_shm_blob(sidecar_prefix, shm_path)
     }
 
     /// Number of entries in the suffix array.
