@@ -368,3 +368,21 @@ pub fn prior_from_cli_fastq(histogram_path: &Path, base_weight: f64) -> Result<P
         path: Some(histogram_path.to_path_buf()),
     })
 }
+
+/// Validate that the mutually-exclusive prior inputs are not both supplied.
+///
+/// `--prior-bed` and `--prior-fastq-histogram` select different weighting
+/// schemes and cannot be combined. Returns `Err(Error::Internal)` if both
+/// paths are `Some`. This is the shared guard the CLI calls before resolving a
+/// [`Prior`]; living here next to `prior_from_cli` / `prior_from_cli_fastq`
+/// lets it be unit-tested without driving the binary.
+pub fn validate_prior_paths(prior_bed: Option<&Path>, prior_fastq: Option<&Path>) -> Result<()> {
+    if prior_bed.is_some() && prior_fastq.is_some() {
+        return Err(Error::Internal {
+            detail: "--prior-bed and --prior-fastq-histogram are mutually exclusive; \
+                     supply at most one"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
