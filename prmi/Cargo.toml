@@ -17,8 +17,16 @@ documentation = "https://docs.rs/prmi"
 name = "prmi"
 path = "src/lib.rs"
 
+[[bin]]
+name = "prmi"
+path = "src/main.rs"
+
 [dependencies]
 log.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+hex.workspace = true
 byteorder.workspace = true
 rayon.workspace = true
 thiserror.workspace = true

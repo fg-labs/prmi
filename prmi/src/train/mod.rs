@@ -306,7 +306,7 @@ pub fn prior_from_cli(prior_bed: Option<&Path>, prior_bed_weight: f64) -> Result
         None => Ok(Prior::Uniform),
         Some(path) => {
             if prior_bed_weight <= 0.0 {
-                return Err(Error::Internal {
+                return Err(Error::InvalidInput {
                     detail: format!("--prior-bed-weight must be > 0, got {prior_bed_weight}"),
                 });
             }
@@ -357,7 +357,7 @@ fn build_isa(sa: &[u64]) -> Result<Vec<u64>> {
 /// cannot be parsed.
 pub fn prior_from_cli_fastq(histogram_path: &Path, base_weight: f64) -> Result<Prior> {
     if base_weight <= 0.0 {
-        return Err(Error::Internal {
+        return Err(Error::InvalidInput {
             detail: format!("--prior-fastq-base-weight must be > 0, got {base_weight}"),
         });
     }
@@ -372,13 +372,13 @@ pub fn prior_from_cli_fastq(histogram_path: &Path, base_weight: f64) -> Result<P
 /// Validate that the mutually-exclusive prior inputs are not both supplied.
 ///
 /// `--prior-bed` and `--prior-fastq-histogram` select different weighting
-/// schemes and cannot be combined. Returns `Err(Error::Internal)` if both
+/// schemes and cannot be combined. Returns `Err(Error::InvalidInput)` if both
 /// paths are `Some`. This is the shared guard the CLI calls before resolving a
 /// [`Prior`]; living here next to `prior_from_cli` / `prior_from_cli_fastq`
 /// lets it be unit-tested without driving the binary.
 pub fn validate_prior_paths(prior_bed: Option<&Path>, prior_fastq: Option<&Path>) -> Result<()> {
     if prior_bed.is_some() && prior_fastq.is_some() {
-        return Err(Error::Internal {
+        return Err(Error::InvalidInput {
             detail: "--prior-bed and --prior-fastq-histogram are mutually exclusive; \
                      supply at most one"
                 .to_string(),

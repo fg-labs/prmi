@@ -67,7 +67,7 @@ pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
         }
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() < 3 {
-            return Err(Error::Internal {
+            return Err(Error::InvalidInput {
                 detail: format!(
                     "BED parse error at line {}: need 3 columns, got {}",
                     lineno + 1,
@@ -75,14 +75,14 @@ pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
                 ),
             });
         }
-        let start: u64 = cols[1].parse().map_err(|_| Error::Internal {
+        let start: u64 = cols[1].parse().map_err(|_| Error::InvalidInput {
             detail: format!(
                 "BED parse error at line {}: bad start {:?}",
                 lineno + 1,
                 cols[1]
             ),
         })?;
-        let end: u64 = cols[2].parse().map_err(|_| Error::Internal {
+        let end: u64 = cols[2].parse().map_err(|_| Error::InvalidInput {
             detail: format!(
                 "BED parse error at line {}: bad end {:?}",
                 lineno + 1,
@@ -90,7 +90,7 @@ pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
             ),
         })?;
         if end <= start {
-            return Err(Error::Internal {
+            return Err(Error::InvalidInput {
                 detail: format!(
                     "BED parse error at line {}: end <= start ({} <= {})",
                     lineno + 1,
