@@ -23,11 +23,48 @@ if(NOT TARGET PrmiSys::prmi_sys)
         INTERFACE_INCLUDE_DIRECTORIES "${PRMISYS_INCLUDE_DIR}"
     )
 
+    # libsais's OpenMP object code is statically embedded in libprmi_sys.a, so a
+    # consumer of the static archive must link an OpenMP runtime itself (the
+    # cdylib had it linked in already). We link the runtime directly rather than
+    # via find_package(OpenMP): on macOS, AppleClang has no built-in OpenMP and
+    # CMake's FindOpenMP fails without explicit Homebrew hints.
     if(APPLE)
+        # AppleClang has no built-in OpenMP, and libomp is keg-only (not on the
+        # default linker path), so we link it by absolute path. Resolve it in
+        # priority order: an explicit PRMISYS_LIBOMP_LIBRARY (full path to the
+        # dylib), else an explicit PRMISYS_LIBOMP_PREFIX (install prefix), else
+        # Homebrew discovery via `brew --prefix libomp` (find_program locates
+        # brew on PATH or in standard install locations; skipped if not found).
+        if(NOT PRMISYS_LIBOMP_LIBRARY)
+            if(NOT PRMISYS_LIBOMP_PREFIX)
+                find_program(PRMISYS_BREW brew)
+                if(PRMISYS_BREW)
+                    execute_process(COMMAND "${PRMISYS_BREW}" --prefix libomp
+                        OUTPUT_VARIABLE PRMISYS_LIBOMP_PREFIX
+                        OUTPUT_STRIP_TRAILING_WHITESPACE
+                        RESULT_VARIABLE PRMISYS_BREW_RC)
+                    if(NOT PRMISYS_BREW_RC EQUAL 0)
+                        set(PRMISYS_LIBOMP_PREFIX "")
+                    endif()
+                endif()
+            endif()
+            if(PRMISYS_LIBOMP_PREFIX)
+                set(PRMISYS_LIBOMP_LIBRARY "${PRMISYS_LIBOMP_PREFIX}/lib/libomp.dylib")
+            endif()
+        endif()
+        if(NOT PRMISYS_LIBOMP_LIBRARY OR NOT EXISTS "${PRMISYS_LIBOMP_LIBRARY}")
+            message(FATAL_ERROR
+                "prmi-sys requires libomp on macOS but could not locate it. "
+                "Install it (`brew install libomp`), or set PRMISYS_LIBOMP_LIBRARY "
+                "to the full path of libomp.dylib (or PRMISYS_LIBOMP_PREFIX to its "
+                "install prefix).")
+        endif()
         target_link_libraries(PrmiSys::prmi_sys INTERFACE
-            "-framework Security" "-framework CoreFoundation")
+            "-framework Security" "-framework CoreFoundation"
+            "${PRMISYS_LIBOMP_LIBRARY}")
     elseif(UNIX)
-        target_link_libraries(PrmiSys::prmi_sys INTERFACE pthread dl m)
+        # GCC's libgomp provides the omp_* / GOMP_* runtime symbols.
+        target_link_libraries(PrmiSys::prmi_sys INTERFACE pthread dl m gomp)
     endif()
 endif()
 

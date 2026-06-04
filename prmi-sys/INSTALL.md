@@ -61,7 +61,7 @@ prefix=$HOME/.local
 mkdir -p $prefix/lib/pkgconfig $prefix/include $prefix/lib
 sed -e "s|@PREFIX@|$prefix|" \
     -e "s|@VERSION@|0.1.0|" \
-    -e "s|@PLATFORM_LIBS@|-lpthread -ldl -lm|" \
+    -e "s|@PLATFORM_LIBS@|-lpthread -ldl -lm -lgomp|" \
     prmi-sys/prmi-sys.pc.in > $prefix/lib/pkgconfig/prmi-sys.pc
 
 cp target/release/libprmi_sys.a $prefix/lib/
@@ -75,8 +75,14 @@ pkg-config --libs --cflags prmi-sys
 ```
 
 Platform-specific link flags for `@PLATFORM_LIBS@`:
-- Linux: `-lpthread -ldl -lm`
-- macOS: `-framework Security -framework CoreFoundation`
+- Linux: `-lpthread -ldl -lm -lgomp`
+- macOS: `-framework Security -framework CoreFoundation -L$(brew --prefix libomp)/lib -lomp`
+
+The OpenMP runtime (`-lgomp` on Linux/GCC, `-lomp` on macOS) is required
+because `libsais`'s OpenMP object code is statically embedded in
+`libprmi_sys.a` (see below) — a consumer of the static archive must supply the
+runtime itself. On macOS, `-L$(brew --prefix libomp)/lib` points the linker at
+the Homebrew `libomp`.
 
 ## CMake
 
