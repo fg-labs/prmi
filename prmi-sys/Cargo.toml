@@ -17,6 +17,12 @@ documentation = "https://docs.rs/prmi-sys"
 name = "prmi_sys"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-# Dependencies, FFI exports, build.rs cbindgen wiring, and the C header
-# land in PR #7 (`feat/v0.1-prmi-sys`). This crate is included in the
-# workspace from PR #1 onward so the stack's workspace shape is stable.
+[dependencies]
+prmi = { path = "../prmi", version = "0.1.0" }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cbindgen = "0.27"

@@ -1,0 +1,15 @@
+language = "C"
+header = "/* Copyright (C) 2026 Fulcrum Genomics LLC; SPDX-License-Identifier: MIT */\n\n/* MEMORY OWNERSHIP. All memory allocated by prmi is owned by prmi and\n * freed by prmi (typically via prmi_close). Callers never free any\n * pointer returned by a prmi_* function. The const char* returned by\n * prmi_last_error_message is thread-local and lives until the next\n * prmi_* call on the same thread; do not free it. */"
+include_guard = "PRMI_H"
+cpp_compat = true
+sys_includes = ["stddef.h", "stdint.h"]
+no_includes = true
+documentation = true
+documentation_style = "doxy"
+after_includes = "/* Opaque handle — consumers use only through pointers; never allocate directly. */\ntypedef struct prmi_index_t prmi_index_t;"
+
+[parse]
+parse_deps = false
+
+[export]
+exclude = ["prmi_index_t"]

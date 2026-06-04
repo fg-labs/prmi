@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: prmi-sys
+Description: C ABI for prmi (P-RMI learned suffix-array index)
+URL: https://github.com/fg-labs/prmi
+Version: @VERSION@
+Libs: -L${libdir} -lprmi_sys @PLATFORM_LIBS@
+Cflags: -I${includedir}
