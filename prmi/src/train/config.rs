@@ -102,6 +102,12 @@ pub struct TrainerConfig {
     /// accelerates `forward_spectrum`'s shallow prefix bands. `None` (default)
     /// builds no table. `k` is capped to the reference size at build time.
     pub kmer_table_k: Option<u32>,
+
+    /// If `true`, also emit a `.isa` inverse-suffix-array sidecar (the ISA launch
+    /// hint for `prmi_mem_search`'s no-search fast path). `false` (default) builds
+    /// no `.isa`. Costs ~+5 B per SA entry on disk (~+32 GB at hg38) — opt-in via
+    /// `prmi build --with-isa`.
+    pub with_isa: bool,
 }
 
 impl Default for TrainerConfig {
@@ -113,6 +119,7 @@ impl Default for TrainerConfig {
             prior: Prior::Uniform,
             memory_mode: MemoryMode::Mode1,
             kmer_table_k: None,
+            with_isa: false,
         }
     }
 }
@@ -139,6 +146,12 @@ impl TrainerConfig {
             memory_mode: mode,
             ..self
         }
+    }
+
+    /// Return a copy of this config that also emits a `.isa` inverse-suffix-array
+    /// sidecar (the ISA launch hint).
+    pub fn with_isa(self, with_isa: bool) -> Self {
+        Self { with_isa, ..self }
     }
 }
 

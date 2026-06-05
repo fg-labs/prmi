@@ -4,6 +4,7 @@
 //! On-disk sidecar format: TOML meta + binary `.sa` / `.l1` / `.l2`, plus an
 //! optional `.kmt` k-mer-table accelerator sidecar.
 
+pub mod isa_file;
 pub mod kmt_file;
 pub mod magic;
 pub mod meta;
@@ -29,6 +30,8 @@ pub struct SidecarPaths {
     pub l2: PathBuf,
     /// Path to the optional `.kmt` k-mer table file (forward-shallow accelerator).
     pub kmt: PathBuf,
+    /// Path to the optional `.isa` inverse-suffix-array file (ISA launch hint).
+    pub isa: PathBuf,
 }
 
 impl SidecarPaths {
@@ -49,6 +52,7 @@ impl SidecarPaths {
             l1: with(".l1"),
             l2: with(".l2"),
             kmt: with(".kmt"),
+            isa: with(".isa"),
         }
     }
 }

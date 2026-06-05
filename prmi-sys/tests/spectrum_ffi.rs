@@ -11,8 +11,8 @@ use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
     prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
     prmi_bwd_task_t, prmi_close, prmi_forward_spectrum, prmi_forward_spectrum_batch,
-    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_open, prmi_sa_positions,
-    prmi_sa_positions_strided, prmi_smem_step_t, PRMI_MEM_WANT_INTERVAL,
+    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_open, prmi_sa_num,
+    prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t, PRMI_MEM_WANT_INTERVAL,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -1224,6 +1224,65 @@ fn mem_search_ffi_matches_forward_spectrum_maximal() {
         (u64::MAX, u64::MAX),
         "no-flag must not touch interval out-ptrs"
     );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_mem_search` with `est_hint > 0` (the ISA/no-search launch) must produce
+/// the byte-identical `(match_len, sa_start, occ)` as `est_hint == 0`, and reject
+/// an out-of-range hint with `-2`.
+#[test]
+fn mem_search_ffi_est_hint_equals_unhinted() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases = pac_unpacked.len() as u64;
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+
+    let call = |est_hint: u64| -> (i32, u32, u64, u64) {
+        let (mut ml, mut ss, mut occ) = (0u32, 0u64, 0u64);
+        let rc = unsafe {
+            prmi_mem_search(
+                handle,
+                query.as_ptr(),
+                query.len() as i32,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                est_hint,
+                PRMI_MEM_WANT_INTERVAL,
+                &mut ml,
+                &mut ss,
+                &mut occ,
+            )
+        };
+        (rc, ml, ss, occ)
+    };
+
+    // Unhinted (model launch) result is the reference.
+    let (rc0, ml0, ss0, occ0) = call(0);
+    assert_eq!(rc0, 0);
+    assert!(ml0 > 0 && occ0 > 0, "reference-lifted query should match");
+
+    // Every SA index in the maximal interval is a valid exact hint and must
+    // reproduce the identical result.
+    for off in 0..occ0 {
+        let (rc, ml, ss, occ) = call(ss0 + off);
+        assert_eq!(rc, 0, "hint rc={rc}");
+        assert_eq!(
+            (ml, ss, occ),
+            (ml0, ss0, occ0),
+            "hint={} differs",
+            ss0 + off
+        );
+    }
+
+    // Out-of-range hint → -2.
+    let sa_num = unsafe { prmi_sa_num(handle) } as u64;
+    let (rc_bad, _, _, _) = call(sa_num);
+    assert_eq!(rc_bad, -2, "out-of-range est_hint must return -2");
 
     unsafe { prmi_close(handle) };
     drop(dir);
