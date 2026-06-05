@@ -1024,6 +1024,191 @@ pub unsafe extern "C" fn prmi_backward_spectrum_batch_lockstep(
     }
 }
 
+/// `PRMI_MEM_WANT_INTERVAL`: also write `*out_sa_start`/`*out_occ` (the maximal
+/// match's SA interval). When unset, only `*out_match_len` is written.
+pub const PRMI_MEM_WANT_INTERVAL: u32 = 0x1;
+
+/// One-shot maximal exact forward match. `query` is 2-bit bases (direction/RC
+/// already applied by the caller); finds the longest prefix that occurs in the
+/// reference. `*out_match_len` is ALWAYS written (0 if `query[0]` has no match).
+/// With `flags & PRMI_MEM_WANT_INTERVAL`, also writes `*out_sa_start`/`*out_occ`
+/// (the SA interval at `match_len`). `est_hint` is reserved for the ISA/no-search
+/// launch (spec step 2); it is accepted but currently ignored (ignoring a launch
+/// hint is byte-identical — it only affects speed). Byte-identity: the returned
+/// `(sa_start, occ, match_len)` equals the maximal step `prmi_forward_spectrum`
+/// produces for the same query.
+///
+/// Returns 0 on success; `-1` null handle/pointer, `-2` `query_len < 0` or
+/// `pac_num_bases` too large for this platform, `-3` internal panic.
+///
+/// # Safety
+/// `handle` valid; `query` valid for `query_len` bytes; `pac` valid for
+/// `ceil(pac_num_bases/4)` bytes; `out_match_len` writable; with the flag,
+/// `out_sa_start`/`out_occ` writable.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_mem_search(
+    handle: *const prmi_index_t,
+    query: *const u8,
+    query_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+    est_hint: u64,
+    flags: u32,
+    out_match_len: *mut u32,
+    out_sa_start: *mut u64,
+    out_occ: *mut u64,
+) -> c_int {
+    clear_last_error();
+    let _ = est_hint; // reserved (spec step 2: ISA/no-search launch)
+    if handle.is_null() || query.is_null() || pac.is_null() || out_match_len.is_null() {
+        set_last_error("prmi_mem_search: null pointer");
+        return -1;
+    }
+    // When the interval is requested, validate its out-ptrs up FRONT so an error
+    // return leaves all outputs (incl. `*out_match_len`) untouched.
+    if flags & PRMI_MEM_WANT_INTERVAL != 0 && (out_sa_start.is_null() || out_occ.is_null()) {
+        set_last_error("prmi_mem_search: WANT_INTERVAL set but out_sa_start/out_occ null");
+        return -1;
+    }
+    // NOTE: `< 0` (not `<= 0` as in `prmi_forward_spectrum`) is deliberate —
+    // `query_len == 0` is a valid empty query and yields `match_len == 0`.
+    if query_len < 0 {
+        set_last_error("prmi_mem_search: query_len < 0");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_mem_search: pac_num_bases too large for this platform");
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx.mem_search(q, pac_slice, enc)
+    }));
+    let m = match res {
+        Ok(m) => m,
+        Err(_) => {
+            set_last_error("prmi_mem_search: internal panic");
+            return -3;
+        }
+    };
+    unsafe { *out_match_len = m.match_len as u32 };
+    if flags & PRMI_MEM_WANT_INTERVAL != 0 {
+        // out-ptrs were null-checked up front.
+        unsafe {
+            *out_sa_start = m.sa_start;
+            *out_occ = m.occ;
+        }
+    }
+    0
+}
+
+/// One-shot maximal exact BACKWARD (leftward) match — the backward twin of
+/// `prmi_mem_search`. From the right anchor `(sa_start, occ_count, anchor_len)`
+/// matching `read[pivot..pivot+anchor_len)`, extend leftward and return the
+/// deepest match in a single call. Same `read`/`pivot` convention as
+/// `prmi_backward_spectrum` (full read, 2-bit 1 base/byte; extension goes to
+/// `read[pivot-1]`, `read[pivot-2]`, …).
+///
+/// `*out_match_len` is ALWAYS written = the TOTAL matched span
+/// (`anchor_len + left_ext`). With `flags & PRMI_MEM_WANT_INTERVAL`, also writes
+/// `*out_sa_start`/`*out_occ` (the SA interval at the maximal match). When no
+/// left extension is possible the anchor itself is returned (`match_len ==
+/// anchor_len`); when `occ_count == 0`, all-zero. `est_hint` is reserved for the
+/// ISA launch (spec step 2) and currently ignored (byte-identical to ignore it).
+///
+/// Byte-identity: the returned `(sa_start, occ, match_len)` equals the maximal
+/// step `prmi_backward_spectrum` produces for the same inputs.
+///
+/// Returns 0 on success; `-1` null handle/pointer, `-2` `read_len <= 0`,
+/// `pivot < 0`, or `pac_num_bases` too large for this platform, `-3` internal panic.
+///
+/// # Safety
+/// `handle` valid; `read` valid for `read_len` bytes; `pac` valid for
+/// `ceil(pac_num_bases/4)` bytes; `out_match_len` writable; with the flag,
+/// `out_sa_start`/`out_occ` writable.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn prmi_mem_search_backward(
+    handle: *const prmi_index_t,
+    sa_start: u64,
+    occ_count: u64,
+    anchor_len: u64,
+    read: *const u8,
+    read_len: c_int,
+    pivot: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+    est_hint: u64,
+    flags: u32,
+    out_match_len: *mut u32,
+    out_sa_start: *mut u64,
+    out_occ: *mut u64,
+) -> c_int {
+    clear_last_error();
+    let _ = est_hint; // reserved (spec step 2: ISA/no-search launch)
+    if handle.is_null() || read.is_null() || pac.is_null() || out_match_len.is_null() {
+        set_last_error("prmi_mem_search_backward: null pointer");
+        return -1;
+    }
+    // Validate interval out-ptrs up front so an error return leaves outputs
+    // untouched (see prmi_mem_search).
+    if flags & PRMI_MEM_WANT_INTERVAL != 0 && (out_sa_start.is_null() || out_occ.is_null()) {
+        set_last_error("prmi_mem_search_backward: WANT_INTERVAL set but out_sa_start/out_occ null");
+        return -1;
+    }
+    if read_len <= 0 || pivot < 0 {
+        set_last_error("prmi_mem_search_backward: invalid read_len or pivot");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let r = unsafe { std::slice::from_raw_parts(read, read_len as usize) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_mem_search_backward: pac_num_bases too large for this platform");
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx.mem_search_backward(
+            sa_start,
+            occ_count,
+            anchor_len,
+            r,
+            pivot as usize,
+            pac_slice,
+            enc,
+        )
+    }));
+    let m = match res {
+        Ok(m) => m,
+        Err(_) => {
+            set_last_error("prmi_mem_search_backward: internal panic");
+            return -3;
+        }
+    };
+    unsafe { *out_match_len = m.match_len as u32 };
+    if flags & PRMI_MEM_WANT_INTERVAL != 0 {
+        unsafe {
+            *out_sa_start = m.sa_start;
+            *out_occ = m.occ;
+        }
+    }
+    0
+}
+
 /// Reverse-complement a tokenized 32-mer key (2-bit packed, MSB-first).
 /// `len` is the number of valid bases (1..=32; values outside that range
 /// are clamped to 32). Writes the rev-comp key to *out_key.
