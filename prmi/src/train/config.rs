@@ -11,8 +11,8 @@ use crate::train::prior::Prior;
 /// Memory-mode for the `.sa` sidecar file.
 ///
 /// Each mode trades additional disk/RAM for faster lookup by storing extra
-/// data alongside each SA position so that the `smem_range` inner loop can
-/// skip per-candidate `read_unpacked_window + tokenize_32mer` calls.
+/// data alongside each SA position so that the query path's candidate-scan
+/// loop can skip per-candidate pac reads and tokenization.
 ///
 /// Sizes below assume the 2× sidecar layout (`2*l_pac + 1` SA entries — forward
 /// + reverse-complement + sentinel), so they are roughly double a forward-only SA.
@@ -30,7 +30,7 @@ pub enum MemoryMode {
     #[default]
     Mode1,
     /// 13 B/entry — position + stored 32-mer key. Skips per-candidate
-    /// pac tokenization in `smem_range`.
+    /// pac tokenization in the query path.
     Mode2,
 }
 

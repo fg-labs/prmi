@@ -63,28 +63,3 @@ fn phix_scale_roundtrip_every_suffix_within_bound() {
         );
     }
 }
-
-#[test]
-#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
-fn phix_scale_smem_range_resolves_first_suffix() {
-    let dir = tempdir().unwrap();
-    let fa = dir.path().join("phix.fa");
-    std::fs::write(&fa, deterministic_fasta(5386, 0xDEAD_BEEF_C0DE)).unwrap();
-    let prefix = dir.path().join("phix.fa.prmi");
-    build_sidecar(&fa, &prefix, None, Default::default(), 1).unwrap();
-
-    let idx = LearnedIndex::open(&prefix).unwrap();
-    let (bases, _) = prmi::fasta::fasta_file_to_2bit(&fa).unwrap();
-
-    // Take the first 32-base suffix; smem_range must return a non-empty
-    // SA interval whose s (matched length) is at least 32.
-    let query = bases[0..32].to_vec();
-    let (k, l, s) = idx.smem_range(&query, &bases).unwrap();
-    assert!(l > 0, "expected non-empty SA range at first suffix");
-    assert!(s >= 32, "expected s >= 32, got {s}");
-    assert!(
-        k < idx.sa_num(),
-        "k={k} out of range (sa_num={})",
-        idx.sa_num()
-    );
-}

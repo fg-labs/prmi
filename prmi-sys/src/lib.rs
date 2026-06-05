@@ -31,14 +31,13 @@ pub unsafe extern "C" fn prmi_open(
     out_handle: *mut *mut prmi_index_t,
 ) -> c_int {
     clear_last_error();
-    // Clear any stale handle the caller may be reusing before validating, so
-    // every error path (including this null-argument one) leaves `*out_handle`
-    // NULL as documented.
-    if !out_handle.is_null() {
-        unsafe { *out_handle = std::ptr::null_mut() };
-    }
     if sidecar_prefix.is_null() || out_handle.is_null() {
         set_last_error("prmi_open: null pointer argument");
+        // Clear any stale handle the caller is reusing (only when out_handle
+        // itself is non-null and thus safe to write through).
+        if !out_handle.is_null() {
+            unsafe { *out_handle = std::ptr::null_mut() };
+        }
         return -1;
     }
     let cstr = unsafe { CStr::from_ptr(sidecar_prefix) };
@@ -52,7 +51,7 @@ pub unsafe extern "C" fn prmi_open(
     };
     match LearnedIndex::open(Path::new(s)) {
         Ok(idx) => {
-            unsafe { *out_handle = Handle(idx).into_raw() };
+            unsafe { *out_handle = Handle::new(idx).into_raw() };
             0
         }
         Err(e) => {
@@ -88,12 +87,13 @@ pub unsafe extern "C" fn prmi_open_shm(
     out_handle: *mut *mut prmi_index_t,
 ) -> c_int {
     clear_last_error();
-    // Clear any stale handle before validating (see `prmi_open`).
-    if !out_handle.is_null() {
-        unsafe { *out_handle = std::ptr::null_mut() };
-    }
     if shm_path.is_null() || out_handle.is_null() {
         set_last_error("prmi_open_shm: null pointer argument");
+        // Clear any stale handle the caller is reusing (only when out_handle
+        // itself is non-null and thus safe to write through).
+        if !out_handle.is_null() {
+            unsafe { *out_handle = std::ptr::null_mut() };
+        }
         return -1;
     }
     let cstr = unsafe { CStr::from_ptr(shm_path) };
@@ -107,7 +107,7 @@ pub unsafe extern "C" fn prmi_open_shm(
     };
     match LearnedIndex::open_shm(std::path::Path::new(s)) {
         Ok(idx) => {
-            unsafe { *out_handle = Handle(idx).into_raw() };
+            unsafe { *out_handle = Handle::new(idx).into_raw() };
             0
         }
         Err(e) => {
@@ -159,323 +159,12 @@ pub unsafe extern "C" fn prmi_lookup(
         return -1;
     }
     let h = unsafe { Handle::as_ref(handle) };
-    let (pos, err) = h.0.lookup(key);
+    let (pos, err) = h.idx.lookup(key);
     unsafe {
         *out_predicted_sa_pos = pos;
         *out_err = err;
     }
     0
-}
-
-/// Resolve an SA range matching the query against the caller-owned pac.
-///
-/// `query_len` **must be exactly 32**. Shorter or longer queries are
-/// rejected with a negative return code and a thread-local error message
-/// (see `prmi_last_error_message`). The 32-base constraint exists because
-/// the trainer's 32-mer T-padding does not preserve lexicographic sort
-/// order for sub-32-mer keys against longer SA suffixes, so the per-leaf
-/// `err` bound does not cover the discrepancy for short queries; rather
-/// than silently returning wrong answers, the function refuses.
-///
-/// For aligners with reads near reference / N-run boundaries where fewer
-/// than 32 valid bases remain at a pivot, skip the pivot rather than
-/// truncating the query.
-///
-/// `pac` is a 2-bit-coded reference at **1 base per byte** (values 0..=3).
-/// `pac_len` is its length in bytes — explicit to avoid silent overruns
-/// (the brief §5 omits the length; we add it as an authorized deviation).
-///
-/// Returns 0 on match (l > 0), 1 if no match (l == 0), negative on error
-/// (including `query_len != 32`).
-///
-/// # Safety
-/// All pointers must be valid. `query` and `pac` must point to slices of
-/// length `query_len` and `pac_len` respectively. Out-pointers must be
-/// valid writable u64 locations.
-#[no_mangle]
-pub unsafe extern "C" fn prmi_smem_range(
-    handle: *const prmi_index_t,
-    query: *const u8,
-    query_len: c_int,
-    pac: *const u8,
-    pac_len: size_t,
-    out_k: *mut u64,
-    out_l: *mut u64,
-    out_s: *mut u64,
-) -> c_int {
-    clear_last_error();
-    if handle.is_null()
-        || query.is_null()
-        || pac.is_null()
-        || out_k.is_null()
-        || out_l.is_null()
-        || out_s.is_null()
-    {
-        set_last_error("prmi_smem_range: null pointer argument");
-        return -1;
-    }
-    if query_len < 0 {
-        set_last_error("prmi_smem_range: negative query_len");
-        return -2;
-    }
-    let h = unsafe { Handle::as_ref(handle) };
-    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
-    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_len) };
-
-    match h.0.smem_range(q, pac_slice) {
-        Ok((k, l, s)) => {
-            unsafe {
-                *out_k = k;
-                *out_l = l;
-                *out_s = s;
-            }
-            if l == 0 {
-                1
-            } else {
-                0
-            }
-        }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            -3
-        }
-    }
-}
-
-/// Resolve an SA range matching the query against a caller-owned 2-bit
-/// packed pac (BWA / BWA-MEME `bntpac` convention: 4 bases per byte,
-/// MSB-first within each byte — base 0 in bits 6-7, base 1 in bits 4-5,
-/// base 2 in bits 2-3, base 3 in bits 0-1).
-///
-/// `query_len` **must be exactly 32**. See `prmi_smem_range` for the
-/// rationale (T-padding does not preserve lex order vs longer SA
-/// suffixes, so per-leaf `err` bounds do not cover sub-32-mer queries).
-///
-/// `pac_num_bases` is the exact number of bases (not bytes) the pac holds;
-/// `pac` must point to at least `ceil(pac_num_bases / 4)` bytes.
-///
-/// Returns 0 on match (l > 0), 1 if no match (l == 0), negative on error
-/// (including `query_len != 32`).
-///
-/// # Safety
-/// All pointers must be valid. `query` must point to `query_len` bytes.
-/// `pac` must point to at least `ceil(pac_num_bases / 4)` bytes.
-/// Out-pointers must be valid writable u64 locations.
-#[no_mangle]
-pub unsafe extern "C" fn prmi_smem_range_packed(
-    handle: *const prmi_index_t,
-    query: *const u8,
-    query_len: c_int,
-    pac: *const u8,
-    pac_num_bases: u64,
-    out_k: *mut u64,
-    out_l: *mut u64,
-    out_s: *mut u64,
-) -> c_int {
-    clear_last_error();
-    if handle.is_null()
-        || query.is_null()
-        || pac.is_null()
-        || out_k.is_null()
-        || out_l.is_null()
-        || out_s.is_null()
-    {
-        set_last_error("prmi_smem_range_packed: null pointer argument");
-        return -1;
-    }
-    if query_len < 0 {
-        set_last_error("prmi_smem_range_packed: negative query_len");
-        return -2;
-    }
-    let h = unsafe { Handle::as_ref(handle) };
-    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
-    let pac_bytes = pac_num_bases.div_ceil(4) as usize;
-    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
-
-    match h.0.smem_range_packed(q, pac_slice, pac_num_bases) {
-        Ok((k, l, s)) => {
-            unsafe {
-                *out_k = k;
-                *out_l = l;
-                *out_s = s;
-            }
-            if l == 0 {
-                1
-            } else {
-                0
-            }
-        }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            -3
-        }
-    }
-}
-
-/// Batch variant of `prmi_smem_range`. For each `i` in `[0, count)`, resolves
-/// `queries[i*32..(i+1)*32]` (a 32-base 2-bit-encoded slice, values 0..=3)
-/// against the same unpacked pac, writing the result to `out_k[i]`, `out_l[i]`,
-/// `out_s[i]`.
-///
-/// `queries` is a flat `count * 32` byte buffer; each 32-byte chunk is one
-/// 2-bit-encoded query (values 0..=3). The per-query length is fixed at 32;
-/// the batch API does not accept a per-query length parameter.
-///
-/// `pac` is a 1-base-per-byte reference (values 0..=3). `pac_len` is its length
-/// in bytes.
-///
-/// `out_k`, `out_l`, `out_s` are parallel arrays of `count` u64s each.
-///
-/// Returns 0 on success. Returns `-1` on setup error (null pointer argument,
-/// or null `queries` with `count > 0`). Returns `-3` if any query fails length
-/// validation (queries are stored as fixed-32-byte slices, so this is currently
-/// reachable only via an internal pre-condition violation): on `-3` the whole
-/// batch fails, every output slot is zeroed, and the failing query's index is
-/// included in `prmi_last_error_message`.
-///
-/// Thread-safe: concurrent batches on the same handle are safe.
-///
-/// # Safety
-/// All pointers must be valid for their declared sizes. `queries` must point to
-/// `count * 32` readable bytes. `out_k`, `out_l`, `out_s` must each point to
-/// `count` writable u64 slots.
-#[no_mangle]
-pub unsafe extern "C" fn prmi_smem_range_batch(
-    handle: *const prmi_index_t,
-    queries: *const u8,
-    count: u64,
-    pac: *const u8,
-    pac_len: size_t,
-    out_k: *mut u64,
-    out_l: *mut u64,
-    out_s: *mut u64,
-) -> c_int {
-    clear_last_error();
-    if handle.is_null() || pac.is_null() || out_k.is_null() || out_l.is_null() || out_s.is_null() {
-        set_last_error("prmi_smem_range_batch: null pointer argument");
-        return -1;
-    }
-    // queries may be null when count == 0; check after the zero-count fast-path.
-    if count == 0 {
-        return 0;
-    }
-    if queries.is_null() {
-        set_last_error("prmi_smem_range_batch: null queries with count > 0");
-        return -1;
-    }
-    let count_usize = count as usize;
-    let queries_buf = unsafe { std::slice::from_raw_parts(queries, count_usize * 32) };
-    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_len) };
-    let h = unsafe { Handle::as_ref(handle) };
-
-    let query_slices: Vec<&[u8]> = (0..count_usize)
-        .map(|i| &queries_buf[i * 32..(i + 1) * 32])
-        .collect();
-
-    let out_k_slice = unsafe { std::slice::from_raw_parts_mut(out_k, count_usize) };
-    let out_l_slice = unsafe { std::slice::from_raw_parts_mut(out_l, count_usize) };
-    let out_s_slice = unsafe { std::slice::from_raw_parts_mut(out_s, count_usize) };
-
-    match h.0.smem_range_batch(&query_slices, pac_slice) {
-        Ok(results) => {
-            for (i, r) in results.iter().enumerate() {
-                out_k_slice[i] = r.k;
-                out_l_slice[i] = r.l;
-                out_s_slice[i] = r.s;
-            }
-            0
-        }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            for i in 0..count_usize {
-                out_k_slice[i] = 0;
-                out_l_slice[i] = 0;
-                out_s_slice[i] = 0;
-            }
-            -3
-        }
-    }
-}
-
-/// Same as `prmi_smem_range_batch` but for BWA / BWA-MEME-style 2-bit packed pac.
-///
-/// `pac_num_bases` is the exact number of bases (not bytes) encoded in `pac`;
-/// `pac` must point to at least `ceil(pac_num_bases / 4)` bytes. See
-/// `prmi_smem_range_packed` for the packed-pac convention.
-///
-/// Returns 0 on success. Returns `-1` on setup error (null pointer argument,
-/// or null `queries` with `count > 0`). Returns `-3` if any query fails length
-/// validation: the whole batch fails, every output slot is zeroed, and the
-/// failing query's index is included in `prmi_last_error_message`. Thread-safe.
-///
-/// # Safety
-/// All pointers must be valid. `queries` must point to `count * 32` readable
-/// bytes when `count > 0`. `pac` must point to at least
-/// `ceil(pac_num_bases / 4)` bytes. `out_k`, `out_l`, `out_s` must each point
-/// to `count` writable u64 slots.
-#[no_mangle]
-pub unsafe extern "C" fn prmi_smem_range_batch_packed(
-    handle: *const prmi_index_t,
-    queries: *const u8,
-    count: u64,
-    pac: *const u8,
-    pac_num_bases: u64,
-    out_k: *mut u64,
-    out_l: *mut u64,
-    out_s: *mut u64,
-) -> c_int {
-    clear_last_error();
-    if handle.is_null() || pac.is_null() || out_k.is_null() || out_l.is_null() || out_s.is_null() {
-        set_last_error("prmi_smem_range_batch_packed: null pointer argument");
-        return -1;
-    }
-    if count == 0 {
-        return 0;
-    }
-    if queries.is_null() {
-        set_last_error("prmi_smem_range_batch_packed: null queries with count > 0");
-        return -1;
-    }
-    let count_usize = count as usize;
-    let queries_buf = unsafe { std::slice::from_raw_parts(queries, count_usize * 32) };
-    let pac_bytes = pac_num_bases.div_ceil(4) as usize;
-    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
-    let h = unsafe { Handle::as_ref(handle) };
-
-    let query_slices: Vec<&[u8]> = (0..count_usize)
-        .map(|i| &queries_buf[i * 32..(i + 1) * 32])
-        .collect();
-
-    let out_k_slice = unsafe { std::slice::from_raw_parts_mut(out_k, count_usize) };
-    let out_l_slice = unsafe { std::slice::from_raw_parts_mut(out_l, count_usize) };
-    let out_s_slice = unsafe { std::slice::from_raw_parts_mut(out_s, count_usize) };
-
-    use prmi::index::smem::PacEncoding;
-    match h.0.smem_range_enc(
-        &query_slices,
-        pac_slice,
-        PacEncoding::Packed {
-            num_bases: pac_num_bases,
-        },
-    ) {
-        Ok(results) => {
-            for (i, r) in results.iter().enumerate() {
-                out_k_slice[i] = r.k;
-                out_l_slice[i] = r.l;
-                out_s_slice[i] = r.s;
-            }
-            0
-        }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            for i in 0..count_usize {
-                out_k_slice[i] = 0;
-                out_l_slice[i] = 0;
-                out_s_slice[i] = 0;
-            }
-            -3
-        }
-    }
 }
 
 /// Number of SA entries in the loaded sidecar.
@@ -487,7 +176,7 @@ pub unsafe extern "C" fn prmi_sa_num(handle: *const prmi_index_t) -> size_t {
     if handle.is_null() {
         return 0;
     }
-    unsafe { Handle::as_ref(handle) }.0.sa_num() as size_t
+    unsafe { Handle::as_ref(handle) }.idx.sa_num() as size_t
 }
 
 /// Global max prediction error stored in the sidecar.
@@ -499,19 +188,24 @@ pub unsafe extern "C" fn prmi_max_error_bound(handle: *const prmi_index_t) -> u6
     if handle.is_null() {
         return 0;
     }
-    unsafe { Handle::as_ref(handle) }.0.max_error_bound()
+    unsafe { Handle::as_ref(handle) }.idx.max_error_bound()
 }
 
-/// Format version string — always "PRMIv1" for v0.1. Always non-NULL.
+/// Format magic string from the loaded sidecar (e.g. `"PRMIv2"`). Always non-NULL.
+///
+/// The returned pointer is valid for the lifetime of the handle. If `handle`
+/// is NULL, returns a pointer to a static empty C string (`""`).
 ///
 /// # Safety
-/// `handle` may be NULL; the returned pointer is a static C string and
-/// remains valid for the lifetime of the process.
+/// `handle` may be NULL. If non-NULL, it must be a valid handle from
+/// `prmi_open` or `prmi_open_shm` that has not yet been closed.
 #[no_mangle]
 pub unsafe extern "C" fn prmi_format_version(handle: *const prmi_index_t) -> *const c_char {
-    static CSTR: &[u8] = b"PRMIv1\0";
-    let _ = handle;
-    CSTR.as_ptr() as *const c_char
+    static EMPTY: &[u8] = b"\0";
+    if handle.is_null() {
+        return EMPTY.as_ptr() as *const c_char;
+    }
+    unsafe { Handle::as_ref(handle) }.magic.as_ptr()
 }
 
 /// Tokenize up to 32 bases (2-bit packed, MSB-first, T-pad short queries)
@@ -553,8 +247,7 @@ pub unsafe extern "C" fn prmi_tokenize_32mer(
 /// `out_positions` must point to at least `count` u64s. Each position
 /// is a forward-strand genome offset (per the sidecar's `[sa] strand`
 /// convention). For reverse-strand matches, tokenize the
-/// reverse-complement of the query and call `prmi_lookup` /
-/// `prmi_smem_range[_packed]` a second time.
+/// reverse-complement of the query and call `prmi_lookup` a second time.
 ///
 /// Returns 0 on success and 0 with no writes if `count == 0`. Error codes:
 ///   - `-1` — `handle` is NULL.
@@ -601,7 +294,7 @@ pub unsafe extern "C" fn prmi_sa_positions(
         }
     };
     let slice = unsafe { std::slice::from_raw_parts_mut(out_positions, count_usize) };
-    match h.0.sa_positions(k, slice) {
+    match h.idx.sa_positions(k, slice) {
         Ok(()) => 0,
         Err(e) => {
             set_last_error(&format!("prmi_sa_positions: {e}"));
@@ -610,230 +303,603 @@ pub unsafe extern "C" fn prmi_sa_positions(
     }
 }
 
-/// Seed a single long read at multiple pivot offsets in one call.
+/// Read `n_out` raw 2× SA positions starting at SA index `k`, sampling every
+/// `step`-th entry: `out[j] = SA[k + j*step]`. Mirrors the FMI's strided fetch
+/// for the `>max_occ` path (caller sets `step = s / max_occ`, `n_out = max_occ`).
 ///
-/// For a long read of `read_len` bases stored 1-base-per-byte in `read_bases`
-/// (values 0..=3), seed at each of the `npivots` positions in `pivot_offsets`.
+/// Returns 0 on success; 0 with no writes if `n_out == 0`. Error codes:
+///   - `-1` — `handle` is NULL.
+///   - `-2` — `out_positions` is NULL with `n_out > 0`.
+///   - `-3` — `n_out` does not fit in `usize` on this target.
+///   - `-4` — last index `k + (n_out-1)*step >= sa_num`, overflow, or another
+///     internal error from `LearnedIndex::sa_positions_strided`; see
+///     `prmi_last_error_message`.
 ///
-/// For each pivot `i`:
-/// - If `pivot_offsets[i] + 32 > read_len`: `out_k[i]=0, out_l[i]=0, out_s[i]=0`
-///   (the 32-mer window runs past the read end — skip it).
-/// - Otherwise: the 32 bases at `read_bases[pivot_offsets[i]..]` are tokenized
-///   and looked up; `(out_k[i], out_l[i], out_s[i])` receives the SA range.
+/// These codes are part of the stable ABI. `prmi_last_error_message()` always
+/// carries a human-readable description.
 ///
-/// `pac` is the reference in 1-base-per-byte unpacked form (values 0..=3);
-/// `pac_len` is the number of bytes (= number of bases).
-///
-/// Returns 0 on success; negative on error (null pointers, length mismatch).
+/// Thread-safe: concurrent calls on the same handle are intended and safe.
 ///
 /// # Safety
-/// All pointers must be valid for their declared sizes. `read_bases` must be
-/// `read_len` bytes. `pivot_offsets` must be `npivots` u64s. `out_k`, `out_l`,
-/// `out_s` must each point to `npivots` writable u64 slots.
+/// `handle` must be a valid handle from `prmi_open` (or NULL → error).
+/// `out_positions` must point to writable memory of size
+/// `n_out * sizeof(uint64_t)` when `n_out > 0`.
 #[no_mangle]
-pub unsafe extern "C" fn prmi_smem_range_long_read(
+pub unsafe extern "C" fn prmi_sa_positions_strided(
     handle: *const prmi_index_t,
-    read_bases: *const u8,
-    read_len: u64,
-    pivot_offsets: *const u64,
-    npivots: u64,
-    pac: *const u8,
-    pac_len: size_t,
-    out_k: *mut u64,
-    out_l: *mut u64,
-    out_s: *mut u64,
+    k: u64,
+    step: u64,
+    n_out: u64,
+    out_positions: *mut u64,
 ) -> c_int {
     clear_last_error();
-    if handle.is_null() || pac.is_null() || out_k.is_null() || out_l.is_null() || out_s.is_null() {
-        set_last_error("prmi_smem_range_long_read: null pointer argument");
+    if handle.is_null() {
+        set_last_error("prmi_sa_positions_strided: NULL handle");
         return -1;
     }
-    // read_bases may be null when read_len == 0.
-    if npivots == 0 {
+    if n_out == 0 {
         return 0;
     }
-    if read_bases.is_null() && read_len > 0 {
-        set_last_error("prmi_smem_range_long_read: null read_bases with read_len > 0");
-        return -1;
+    if out_positions.is_null() {
+        set_last_error("prmi_sa_positions_strided: NULL out_positions with n_out > 0");
+        return -2;
     }
-    if pivot_offsets.is_null() {
-        set_last_error("prmi_smem_range_long_read: null pivot_offsets with npivots > 0");
-        return -1;
-    }
-
-    let npivots_usize = npivots as usize;
-    // `from_raw_parts` requires a non-null, aligned pointer even for length 0,
-    // so map the documented `read_bases == NULL` + `read_len == 0` case to an
-    // empty slice rather than constructing a slice from a null pointer (UB).
-    let read_slice: &[u8] = if read_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(read_bases, read_len as usize) }
-    };
-    let pivots = unsafe { std::slice::from_raw_parts(pivot_offsets, npivots_usize) };
-    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_len) };
     let h = unsafe { Handle::as_ref(handle) };
-
-    let out_k_s = unsafe { std::slice::from_raw_parts_mut(out_k, npivots_usize) };
-    let out_l_s = unsafe { std::slice::from_raw_parts_mut(out_l, npivots_usize) };
-    let out_s_s = unsafe { std::slice::from_raw_parts_mut(out_s, npivots_usize) };
-
-    match h
-        .0
-        .smem_range_long_read(read_slice, read_len, pivots, pac_slice)
-    {
-        Ok(results) => {
-            for (i, r) in results.iter().enumerate() {
-                out_k_s[i] = r.k;
-                out_l_s[i] = r.l;
-                out_s_s[i] = r.s;
-            }
-            0
+    let n_out_usize = match usize::try_from(n_out) {
+        Ok(n) => n,
+        Err(_) => {
+            set_last_error("prmi_sa_positions_strided: n_out exceeds usize range");
+            return -3;
         }
+    };
+    let out = unsafe { std::slice::from_raw_parts_mut(out_positions, n_out_usize) };
+    match h.idx.sa_positions_strided(k, step, out) {
+        Ok(()) => 0,
         Err(e) => {
-            set_last_error(&format!("{e}"));
-            for i in 0..npivots_usize {
-                out_k_s[i] = 0;
-                out_l_s[i] = 0;
-                out_s_s[i] = 0;
-            }
-            -3
+            set_last_error(&format!("prmi_sa_positions_strided: {e}"));
+            -4
         }
     }
 }
 
-/// Same as `prmi_smem_range_long_read` but with a 2-bit packed pac
-/// (BWA / BWA-MEME `bntpac` convention: 4 bases per byte, MSB-first).
+/// One SMEM spectrum breakpoint: the SA interval `[sa_start, sa_start+occ_count)`
+/// matching the query to length `match_len`. Mirrors `prmi::index::spectrum::SmemStep`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct prmi_smem_step_t {
+    /// SA interval start index (raw 2× SA).
+    pub sa_start: u64,
+    /// Occurrence count = SA interval size (both strands, native to the 2× SA).
+    pub occ_count: u64,
+    /// Match length (LCP) at this breakpoint.
+    pub match_len: u64,
+}
+
+/// Packed-pac byte length (`ceil(num_bases / 4)`) as `usize`, or `None` if the
+/// value does not fit `usize` (only possible on narrow-`usize` targets). Guards
+/// the u64→usize narrowing before a packed-pac slice is constructed.
+#[inline]
+fn packed_pac_bytes(pac_num_bases: u64) -> Option<usize> {
+    usize::try_from(pac_num_bases.div_ceil(4)).ok()
+}
+
+/// Forward spectrum from a pivot: writes the breakpoint trace (ascending match_len,
+/// up to the maximal forward match) into the caller-allocated `out_steps`
+/// (capacity `max_steps`), and the count to `*out_nsteps`. `nsteps <= query_len`,
+/// so `max_steps >= query_len` always suffices.
 ///
-/// `pac_num_bases` is the exact number of bases encoded in `pac`; `pac` must
-/// point to at least `ceil(pac_num_bases / 4)` bytes.
+/// `query` = read[pivot..], 2-bit 0..3. `pac` is the FORWARD pac in BWA bntpac
+/// packed form (4 bases/byte); `pac_num_bases` = l_pac.
 ///
-/// Returns 0 on success; negative on error.
+/// Returns 0 on success (out_nsteps may be 0 = no match), negative on error:
+///   -1 null handle, -2 null/invalid arg, query_len<=0, or pac_num_bases too large
+///      for this platform, -3 internal/panic,
+///   -4 max_steps < produced nsteps (buffer too small; *out_nsteps set to needed).
 ///
 /// # Safety
-/// All pointers must be valid for their declared sizes.
+/// All pointers valid; `query` has `query_len` bytes; `pac` has
+/// `ceil(pac_num_bases/4)` bytes; `out_steps` has capacity `max_steps`.
 #[no_mangle]
-pub unsafe extern "C" fn prmi_smem_range_long_read_packed(
+pub unsafe extern "C" fn prmi_forward_spectrum(
     handle: *const prmi_index_t,
-    read_bases: *const u8,
-    read_len: u64,
-    pivot_offsets: *const u64,
-    npivots: u64,
+    query: *const u8,
+    query_len: c_int,
     pac: *const u8,
     pac_num_bases: u64,
-    out_k: *mut u64,
-    out_l: *mut u64,
-    out_s: *mut u64,
+    out_steps: *mut prmi_smem_step_t,
+    max_steps: u64,
+    out_nsteps: *mut u64,
 ) -> c_int {
     clear_last_error();
-    if handle.is_null() || pac.is_null() || out_k.is_null() || out_l.is_null() || out_s.is_null() {
-        set_last_error("prmi_smem_range_long_read_packed: null pointer argument");
-        return -1;
-    }
-    if npivots == 0 {
-        return 0;
-    }
-    if read_bases.is_null() && read_len > 0 {
-        set_last_error("prmi_smem_range_long_read_packed: null read_bases with read_len > 0");
-        return -1;
-    }
-    if pivot_offsets.is_null() {
-        set_last_error("prmi_smem_range_long_read_packed: null pivot_offsets with npivots > 0");
-        return -1;
-    }
-
-    let npivots_usize = npivots as usize;
-    // See `prmi_smem_range_long_read`: avoid building a slice from a null
-    // pointer when `read_len == 0`.
-    let read_slice: &[u8] = if read_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(read_bases, read_len as usize) }
-    };
-    let pivots = unsafe { std::slice::from_raw_parts(pivot_offsets, npivots_usize) };
-    let pac_bytes = pac_num_bases.div_ceil(4) as usize;
-    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
-    let h = unsafe { Handle::as_ref(handle) };
-
-    let out_k_s = unsafe { std::slice::from_raw_parts_mut(out_k, npivots_usize) };
-    let out_l_s = unsafe { std::slice::from_raw_parts_mut(out_l, npivots_usize) };
-    let out_s_s = unsafe { std::slice::from_raw_parts_mut(out_s, npivots_usize) };
-
-    match h
-        .0
-        .smem_range_long_read_packed(read_slice, read_len, pivots, pac_slice, pac_num_bases)
+    if handle.is_null()
+        || query.is_null()
+        || pac.is_null()
+        || out_steps.is_null()
+        || out_nsteps.is_null()
     {
-        Ok(results) => {
-            for (i, r) in results.iter().enumerate() {
-                out_k_s[i] = r.k;
-                out_l_s[i] = r.l;
-                out_s_s[i] = r.s;
-            }
-            0
-        }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            for i in 0..npivots_usize {
-                out_k_s[i] = 0;
-                out_l_s[i] = 0;
-                out_s_s[i] = 0;
-            }
-            -3
-        }
+        set_last_error("prmi_forward_spectrum: null pointer argument");
+        return -1;
     }
+    if query_len <= 0 {
+        set_last_error("prmi_forward_spectrum: query_len must be > 0");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_forward_spectrum: pac_num_bases too large for this platform");
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx.forward_spectrum(q, pac_slice, enc)
+    }));
+    let steps = match result {
+        Ok(s) => s,
+        Err(_) => {
+            set_last_error("prmi_forward_spectrum: internal panic");
+            return -3;
+        }
+    };
+    unsafe { *out_nsteps = steps.len() as u64 };
+    if steps.len() as u64 > max_steps {
+        set_last_error("prmi_forward_spectrum: max_steps too small");
+        return -4;
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(out_steps, steps.len()) };
+    for (slot, s) in out.iter_mut().zip(steps.iter()) {
+        *slot = prmi_smem_step_t {
+            sa_start: s.sa_start,
+            occ_count: s.occ_count,
+            match_len: s.match_len,
+        };
+    }
+    0
 }
 
-/// Extract the lexicographically-smallest 32-mer from `bases[..len]` and its
-/// starting offset within `bases`.
+/// Backward spectrum: refine a right-anchored interval leftward. `(sa_start,
+/// occ_count)` and `anchor_len` come from a prior `prmi_forward_spectrum` step.
+/// Each emitted step's `match_len` is the TOTAL span (`left_ext + anchor_len`).
+/// Writes the trace into `out_steps` (capacity `max_steps`; `nsteps <= pivot+1`)
+/// and the count to `*out_nsteps`. `read` is the full read (2-bit 0..=3, 1
+/// base per byte); `pivot` = index where the right anchor begins (i.e.
+/// `read[pivot..pivot+anchor_len)` is the anchored query). `pac` is the FORWARD
+/// pac (BWA bntpac packed: 4 bases/byte, MSB-first); `pac_num_bases` = l_pac.
 ///
-/// `bases` points to `len` bytes, each in `0..=3` (2-bit unpacked, 1 base per
-/// byte). If `len < 32` there are no full 32-mers: returns -1 and writes 0 to
-/// both out-pointers.
-///
-/// On success: writes the lex-min key to `*out_key` and its offset (0-based
-/// index into `bases`) to `*out_offset`; returns 0.
-///
-/// When multiple 32-mers share the same minimum key the leftmost (lowest
-/// offset) wins. This matches the standard minimizer tiebreak.
+/// Returns 0 on success (out_nsteps may be 0 = no left extension exists),
+/// negative on error:
+///   -1 null handle/pointer, -2 invalid read_len (<=0)/pivot (<0) or pac_num_bases
+///      too large for this platform,
+///   -3 internal/panic (including a contiguity-guard failure on a corrupt index),
+///   -4 max_steps too small (*out_nsteps set to the needed count).
 ///
 /// # Safety
-/// `bases` must point to at least `len` valid bytes when `len > 0`. `out_key`
-/// and `out_offset` must be valid writable u64 locations.
+/// All pointers valid; `read` has `read_len` bytes; `pac` has
+/// `ceil(pac_num_bases/4)` bytes; `out_steps` has capacity `max_steps`.
 #[no_mangle]
-pub unsafe extern "C" fn prmi_minimizer_32mer(
-    bases: *const u8,
-    len: u64,
-    out_key: *mut u64,
-    out_offset: *mut u64,
+pub unsafe extern "C" fn prmi_backward_spectrum(
+    handle: *const prmi_index_t,
+    sa_start: u64,
+    occ_count: u64,
+    anchor_len: u64,
+    read: *const u8,
+    read_len: c_int,
+    pivot: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+    out_steps: *mut prmi_smem_step_t,
+    max_steps: u64,
+    out_nsteps: *mut u64,
 ) -> c_int {
     clear_last_error();
-    if out_key.is_null() || out_offset.is_null() {
-        set_last_error("prmi_minimizer_32mer: null out pointer");
+    if handle.is_null()
+        || read.is_null()
+        || pac.is_null()
+        || out_steps.is_null()
+        || out_nsteps.is_null()
+    {
+        set_last_error("prmi_backward_spectrum: null pointer argument");
         return -1;
     }
-    if bases.is_null() && len > 0 {
-        unsafe {
-            *out_key = 0;
-            *out_offset = 0;
+    if read_len <= 0 || pivot < 0 {
+        set_last_error("prmi_backward_spectrum: invalid read_len or pivot");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let r = unsafe { std::slice::from_raw_parts(read, read_len as usize) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_backward_spectrum: pac_num_bases too large for this platform");
+            return -2;
         }
-        set_last_error("prmi_minimizer_32mer: null bases with len > 0");
-        return -1;
-    }
-    if len < 32 {
-        unsafe {
-            *out_key = 0;
-            *out_offset = 0;
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let pivot_us = pivot as usize;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx
+            .backward_spectrum(sa_start, occ_count, anchor_len, r, pivot_us, pac_slice, enc)
+    }));
+    let steps = match result {
+        Ok(s) => s,
+        Err(_) => {
+            set_last_error("prmi_backward_spectrum: internal panic (possible corrupt SA/ISA)");
+            return -3;
         }
+    };
+    unsafe { *out_nsteps = steps.len() as u64 };
+    if steps.len() as u64 > max_steps {
+        set_last_error("prmi_backward_spectrum: max_steps too small");
+        return -4;
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(out_steps, steps.len()) };
+    for (slot, s) in out.iter_mut().zip(steps.iter()) {
+        *slot = prmi_smem_step_t {
+            sa_start: s.sa_start,
+            occ_count: s.occ_count,
+            match_len: s.match_len,
+        };
+    }
+    0
+}
+
+/// One forward-spectrum batch task: read `query_len` bytes at `query_off` in the
+/// shared queries arena; write up to `max_steps` steps at index `steps_off` in the
+/// shared steps arena.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct prmi_fwd_task_t {
+    /// Byte offset into the queries arena where this task's query begins.
+    pub query_off: u64,
+    /// Number of query bytes (= query length in bases).
+    pub query_len: u32,
+    /// Step index (not byte offset) into the steps arena where this task writes.
+    pub steps_off: u32,
+    /// Maximum number of steps this task may write; 0 triggers the -4 overflow path.
+    pub max_steps: u32,
+}
+
+/// One backward-spectrum batch task.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct prmi_bwd_task_t {
+    /// SA interval start (from a prior forward step).
+    pub sa_start: u64,
+    /// Occurrence count (from a prior forward step).
+    pub occ_count: u64,
+    /// Anchor match length (from a prior forward step).
+    pub anchor_len: u64,
+    /// Byte offset into the reads arena where this task's read begins.
+    pub read_off: u64,
+    /// Number of read bytes.
+    pub read_len: u32,
+    /// Pivot index within the read (where the right anchor starts).
+    pub pivot: u32,
+    /// Step index into the steps arena where this task writes.
+    pub steps_off: u32,
+    /// Maximum number of steps this task may write.
+    pub max_steps: u32,
+}
+
+/// Run `ntasks` forward spectra (correctness-first loop; lockstep
+/// predict→prefetch→compare is a deferred perf optimization — see the design
+/// spec). `queries_arena` holds all task query bytes (2-bit 0..3, caller-owned,
+/// NOT copied); `queries_arena_len` is its size in bytes. Task i reads
+/// `query_len` bytes at `query_off`. `steps_arena` is a shared caller-owned
+/// output arena; `steps_arena_len` is its capacity in `prmi_smem_step_t`
+/// elements. Task i writes up to `max_steps` steps starting at index
+/// `steps_off`, and its produced count to `out_nsteps[i]` (0 if no match).
+/// `pac` is the FORWARD pac (packed); `pac_num_bases` = l_pac.
+///
+/// Returns 0 on success. Error codes:
+///   - `-1` — null pointer (with ntasks>0).
+///   - `-2` — a task descriptor's query or steps window falls outside its arena
+///     (bad programming error), or `ntasks` / a task's `query_off` / the packed
+///     pac length does not fit `usize` on this target; `prmi_last_error_message`
+///     names the offending task index and which window violated the bound. The
+///     whole batch is aborted on the first violation; no arena memory is read or
+///     written for the violating task.
+///   - `-3` — internal/panic.
+///   - `-4` — a task's produced nsteps exceeds its `max_steps`; that task's
+///     `out_nsteps[i]` is set to the needed count; its steps region is left
+///     unwritten/partial — caller should re-run that task with a larger buffer.
+///
+/// # Safety
+/// All pointers valid for their declared sizes; arenas at least as large as
+/// declared; `out_nsteps` has `ntasks` u64 slots.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_forward_spectrum_batch(
+    handle: *const prmi_index_t,
+    queries_arena: *const u8,
+    queries_arena_len: u64,
+    tasks: *const prmi_fwd_task_t,
+    ntasks: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    steps_arena: *mut prmi_smem_step_t,
+    steps_arena_len: u64,
+    out_nsteps: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null() || pac.is_null() {
+        set_last_error("prmi_forward_spectrum_batch: null pointer");
         return -1;
     }
-    let slice = unsafe { std::slice::from_raw_parts(bases, len as usize) };
-    // `encoding::minimizer_32mer` returns `None` only when `slice.len() < 32`,
-    // which the `len < 32` short-circuit above already rejected; the `Some` arm
-    // is the only reachable path here. The `unwrap_or` is defensive.
-    let (key, off) = prmi::encoding::minimizer_32mer(slice).unwrap_or((0, 0));
-    unsafe {
-        *out_key = key;
-        *out_offset = off as u64;
+    if ntasks == 0 {
+        return 0;
+    }
+    if queries_arena.is_null() || tasks.is_null() || steps_arena.is_null() || out_nsteps.is_null() {
+        set_last_error("prmi_forward_spectrum_batch: null arena/tasks/out with ntasks > 0");
+        return -1;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error(
+                "prmi_forward_spectrum_batch: pac_num_bases too large for this platform",
+            );
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let nt = match usize::try_from(ntasks) {
+        Ok(n) => n,
+        Err(_) => {
+            set_last_error("prmi_forward_spectrum_batch: ntasks exceeds usize range");
+            return -2;
+        }
+    };
+    let tasks_s = unsafe { std::slice::from_raw_parts(tasks, nt) };
+    let out_ns = unsafe { std::slice::from_raw_parts_mut(out_nsteps, nt) };
+
+    // Validate all task descriptors against arena bounds before any I/O.
+    for (i, t) in tasks_s.iter().enumerate() {
+        // Guard the u64→usize narrowing used by `queries_arena.add(query_off)`
+        // below; on a narrow-`usize` target a huge offset would misaddress.
+        if usize::try_from(t.query_off).is_err() {
+            set_last_error(&format!(
+                "prmi_forward_spectrum_batch: task {i} query_off={} exceeds usize range",
+                t.query_off
+            ));
+            return -2;
+        }
+        let query_end = (t.query_off as u128)
+            .checked_add(t.query_len as u128)
+            .map(|e| e <= queries_arena_len as u128)
+            .unwrap_or(false);
+        if !query_end {
+            set_last_error(&format!(
+                "prmi_forward_spectrum_batch: task {i} query window \
+                 [query_off={}, query_len={}] out of queries_arena_len={}",
+                t.query_off, t.query_len, queries_arena_len
+            ));
+            return -2;
+        }
+        let steps_end = (t.steps_off as u128)
+            .checked_add(t.max_steps as u128)
+            .map(|e| e <= steps_arena_len as u128)
+            .unwrap_or(false);
+        if !steps_end {
+            set_last_error(&format!(
+                "prmi_forward_spectrum_batch: task {i} steps window \
+                 [steps_off={}, max_steps={}] out of steps_arena_len={}",
+                t.steps_off, t.max_steps, steps_arena_len
+            ));
+            return -2;
+        }
+    }
+
+    // One catch_unwind around the whole loop — panic anywhere → -3.
+    let mut overflow = false;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (i, t) in tasks_s.iter().enumerate() {
+            let q = unsafe {
+                std::slice::from_raw_parts(
+                    queries_arena.add(t.query_off as usize),
+                    t.query_len as usize,
+                )
+            };
+            let steps = h.idx.forward_spectrum(q, pac_slice, enc);
+            out_ns[i] = steps.len() as u64;
+            if steps.len() as u64 > u64::from(t.max_steps) {
+                overflow = true;
+                // Leave this task's region unwritten; caller re-runs with a larger buffer.
+                continue;
+            }
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
+            };
+            for (slot, s) in dst.iter_mut().zip(steps.iter()) {
+                *slot = prmi_smem_step_t {
+                    sa_start: s.sa_start,
+                    occ_count: s.occ_count,
+                    match_len: s.match_len,
+                };
+            }
+        }
+    }));
+    if res.is_err() {
+        set_last_error("prmi_forward_spectrum_batch: internal panic");
+        return -3;
+    }
+    if overflow {
+        set_last_error("prmi_forward_spectrum_batch: a task's max_steps too small");
+        return -4;
+    }
+    0
+}
+
+/// Run `ntasks` backward spectra (correctness-first loop; lockstep pipeline is
+/// a deferred perf optimization — see the design spec). `reads_arena` holds all
+/// task read bytes (2-bit 0..3, caller-owned, NOT copied); `reads_arena_len`
+/// is its size in bytes. Task i reads `read_len` bytes at `read_off`.
+/// `steps_arena` is a shared caller-owned output arena; `steps_arena_len` is
+/// its capacity in `prmi_smem_step_t` elements. Task i writes up to `max_steps`
+/// steps at index `steps_off`, and its count to `out_nsteps[i]` (0 if no left
+/// extension). `pac` is the FORWARD pac (packed); `pac_num_bases` = l_pac.
+///
+/// Returns 0 on success. Error codes:
+///   - `-1` — null pointer (with ntasks>0).
+///   - `-2` — a task descriptor's read or steps window falls outside its arena
+///     (bad programming error), or `ntasks` / a task's `read_off` / the packed
+///     pac length does not fit `usize` on this target; `prmi_last_error_message`
+///     names the offending task index and which window violated the bound. The
+///     whole batch is aborted on the first violation; no arena memory is read or
+///     written for the violating task.
+///   - `-3` — internal/panic (including a contiguity-guard failure on a corrupt
+///     index).
+///   - `-4` — a task's produced nsteps exceeds its `max_steps`; that task's
+///     `out_nsteps[i]` is set to the needed count; its steps region is left
+///     unwritten/partial.
+///
+/// # Safety
+/// All pointers valid for their declared sizes; arenas at least as large as
+/// declared; `out_nsteps` has `ntasks` u64 slots.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_backward_spectrum_batch(
+    handle: *const prmi_index_t,
+    reads_arena: *const u8,
+    reads_arena_len: u64,
+    tasks: *const prmi_bwd_task_t,
+    ntasks: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    steps_arena: *mut prmi_smem_step_t,
+    steps_arena_len: u64,
+    out_nsteps: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null() || pac.is_null() {
+        set_last_error("prmi_backward_spectrum_batch: null pointer");
+        return -1;
+    }
+    if ntasks == 0 {
+        return 0;
+    }
+    if reads_arena.is_null() || tasks.is_null() || steps_arena.is_null() || out_nsteps.is_null() {
+        set_last_error("prmi_backward_spectrum_batch: null arena/tasks/out with ntasks > 0");
+        return -1;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error(
+                "prmi_backward_spectrum_batch: pac_num_bases too large for this platform",
+            );
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let nt = match usize::try_from(ntasks) {
+        Ok(n) => n,
+        Err(_) => {
+            set_last_error("prmi_backward_spectrum_batch: ntasks exceeds usize range");
+            return -2;
+        }
+    };
+    let tasks_s = unsafe { std::slice::from_raw_parts(tasks, nt) };
+    let out_ns = unsafe { std::slice::from_raw_parts_mut(out_nsteps, nt) };
+
+    // Validate all task descriptors against arena bounds before any I/O.
+    for (i, t) in tasks_s.iter().enumerate() {
+        // Guard the u64→usize narrowing used by `reads_arena.add(read_off)`
+        // below; on a narrow-`usize` target a huge offset would misaddress.
+        if usize::try_from(t.read_off).is_err() {
+            set_last_error(&format!(
+                "prmi_backward_spectrum_batch: task {i} read_off={} exceeds usize range",
+                t.read_off
+            ));
+            return -2;
+        }
+        let read_end = (t.read_off as u128)
+            .checked_add(t.read_len as u128)
+            .map(|e| e <= reads_arena_len as u128)
+            .unwrap_or(false);
+        if !read_end {
+            set_last_error(&format!(
+                "prmi_backward_spectrum_batch: task {i} read window \
+                 [read_off={}, read_len={}] out of reads_arena_len={}",
+                t.read_off, t.read_len, reads_arena_len
+            ));
+            return -2;
+        }
+        let steps_end = (t.steps_off as u128)
+            .checked_add(t.max_steps as u128)
+            .map(|e| e <= steps_arena_len as u128)
+            .unwrap_or(false);
+        if !steps_end {
+            set_last_error(&format!(
+                "prmi_backward_spectrum_batch: task {i} steps window \
+                 [steps_off={}, max_steps={}] out of steps_arena_len={}",
+                t.steps_off, t.max_steps, steps_arena_len
+            ));
+            return -2;
+        }
+    }
+
+    // One catch_unwind around the whole loop — panic anywhere (incl. contiguity
+    // guard in backward_spectrum) → -3.
+    let mut overflow = false;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (i, t) in tasks_s.iter().enumerate() {
+            let read = unsafe {
+                std::slice::from_raw_parts(
+                    reads_arena.add(t.read_off as usize),
+                    t.read_len as usize,
+                )
+            };
+            let steps = h.idx.backward_spectrum(
+                t.sa_start,
+                t.occ_count,
+                t.anchor_len,
+                read,
+                t.pivot as usize,
+                pac_slice,
+                enc,
+            );
+            out_ns[i] = steps.len() as u64;
+            if steps.len() as u64 > u64::from(t.max_steps) {
+                overflow = true;
+                continue;
+            }
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
+            };
+            for (slot, s) in dst.iter_mut().zip(steps.iter()) {
+                *slot = prmi_smem_step_t {
+                    sa_start: s.sa_start,
+                    occ_count: s.occ_count,
+                    match_len: s.match_len,
+                };
+            }
+        }
+    }));
+    if res.is_err() {
+        set_last_error("prmi_backward_spectrum_batch: internal panic");
+        return -3;
+    }
+    if overflow {
+        set_last_error("prmi_backward_spectrum_batch: a task's max_steps too small");
+        return -4;
     }
     0
 }
@@ -857,8 +923,9 @@ pub unsafe extern "C" fn prmi_reverse_complement_key(
         set_last_error("prmi_reverse_complement_key: null out_key");
         return -1;
     }
-    // Per the documented contract, any `len` outside `1..=32` clamps to 32;
-    // that includes `len == 0`, which must not fall through as a zero length.
+    // Match main's FFI contract: a non-positive `len` (including 0) means "use
+    // the full 32-mer", not "zero valid bases" — callers pass 0 to mean a full
+    // key, never an empty one.
     let n = if len <= 0 { 32 } else { (len as usize).min(32) };
     let rc = prmi::encoding::reverse_complement_key(key, n);
     unsafe { *out_key = rc };
