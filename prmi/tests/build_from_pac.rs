@@ -63,63 +63,6 @@ fn pac_build_with_store_keys_is_mode2() {
 }
 
 #[test]
-fn pac_built_sidecar_has_correct_isa() {
-    use prmi::index::LearnedIndex;
-    use prmi::sidecar::isa_file::IsaFileReader;
-
-    let dir = tempdir().unwrap();
-    let bases: Vec<u8> = (0..40).map(|i| (i % 4) as u8).collect();
-    let pac = dir.path().join("ref.pac");
-    write_pac(&pac, &bases);
-    let prefix = dir.path().join("ref.prmi");
-    prmi::train::build_sidecar_from_pac(&pac, &prefix, None, MaskConfig::default(), 1).unwrap();
-
-    let paths = SidecarPaths::from_prefix(&prefix);
-    let idx = LearnedIndex::open(&prefix).unwrap();
-    let isa = IsaFileReader::open(&paths.isa).unwrap();
-    let n = 2 * bases.len() as u64 + 1;
-    assert_eq!(isa.num_entries(), n);
-    // For several SA indices i: isa[ SA[i] ] == i.
-    for i in [0u64, 1, 5, 17, n - 1] {
-        let pos = idx.sa_position_for(i);
-        assert_eq!(
-            isa.sa_index_for_refpos(pos),
-            i,
-            "isa inverse failed at SA index {i}"
-        );
-    }
-}
-
-#[test]
-fn isa_inverts_sa_for_all_indices_on_real_build() {
-    use prmi::index::LearnedIndex;
-    use prmi::sidecar::isa_file::IsaFileReader;
-
-    let dir = tempdir().unwrap();
-    let bases: Vec<u8> = (0..47).map(|i| (i % 4) as u8).collect(); // small N-free ref
-    let pac = dir.path().join("ref.pac");
-    write_pac(&pac, &bases); // helper already defined in this file
-    let prefix = dir.path().join("ref.prmi");
-    prmi::train::build_sidecar_from_pac(&pac, &prefix, None, MaskConfig::default(), 1).unwrap();
-
-    let paths = SidecarPaths::from_prefix(&prefix);
-    let idx = LearnedIndex::open(&prefix).unwrap();
-    let isa = IsaFileReader::open(&paths.isa).unwrap();
-    let n = 2 * bases.len() as u64 + 1;
-    assert_eq!(idx.sa_num(), n);
-    assert_eq!(isa.num_entries(), n);
-    // Full SA↔ISA loop over every index, including the sentinel row.
-    for i in 0..n {
-        let pos = idx.sa_position_for(i);
-        assert_eq!(
-            isa.sa_index_for_refpos(pos),
-            i,
-            "isa[sa[{i}]] mismatch (pos={pos})"
-        );
-    }
-}
-
-#[test]
 fn pac_and_fasta_agree_on_sa_for_n_free_reference() {
     use prmi::index::LearnedIndex;
     // N-free sequence; FASTA(N->A) and .pac(no N to substitute) carry identical bases.

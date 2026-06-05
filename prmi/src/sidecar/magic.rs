@@ -19,5 +19,5 @@ pub const L1_MAGIC: u32 = u32::from_le_bytes(*b"PML1");
 /// Magic for `.l2` file header (ASCII "PML2", little-endian).
 pub const L2_MAGIC: u32 = u32::from_le_bytes(*b"PML2");
 
-/// Magic for `.isa` file header (ASCII "PISA", little-endian).
-pub const ISA_MAGIC: u32 = u32::from_le_bytes(*b"PISA");
+/// Magic for the `.kmt` k-mer table file header (ASCII "PMKT", little-endian).
+pub const KMT_MAGIC: u32 = u32::from_le_bytes(*b"PMKT");

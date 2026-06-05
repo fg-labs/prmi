@@ -17,6 +17,14 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
 
+/// Packed-pac byte length (`ceil(num_bases / 4)`) as `usize`, or `None` if the
+/// value does not fit `usize` (only possible on narrow-`usize` targets). Guards
+/// the u64→usize narrowing before a packed-pac slice is constructed.
+#[inline]
+fn packed_pac_bytes(pac_num_bases: u64) -> Option<usize> {
+    usize::try_from(pac_num_bases.div_ceil(4)).ok()
+}
+
 /// Open a sidecar by prefix; expects `<prefix>.{meta,sa,l1,l2}`.
 ///
 /// Returns 0 on success and writes the handle to *out_handle.
@@ -375,14 +383,6 @@ pub struct prmi_smem_step_t {
     pub match_len: u64,
 }
 
-/// Packed-pac byte length (`ceil(num_bases / 4)`) as `usize`, or `None` if the
-/// value does not fit `usize` (only possible on narrow-`usize` targets). Guards
-/// the u64→usize narrowing before a packed-pac slice is constructed.
-#[inline]
-fn packed_pac_bytes(pac_num_bases: u64) -> Option<usize> {
-    usize::try_from(pac_num_bases.div_ceil(4)).ok()
-}
-
 /// Forward spectrum from a pivot: writes the breakpoint trace (ascending match_len,
 /// up to the maximal forward match) into the caller-allocated `out_steps`
 /// (capacity `max_steps`), and the count to `*out_nsteps`. `nsteps <= query_len`,
@@ -439,7 +439,9 @@ pub unsafe extern "C" fn prmi_forward_spectrum(
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.idx.forward_spectrum(q, pac_slice, enc)
+        // `_auto` transparently uses the loaded `.kmt` table when present
+        // (byte-identical output), else the full search.
+        h.idx.forward_spectrum_auto(q, pac_slice, enc)
     }));
     let steps = match result {
         Ok(s) => s,
@@ -604,12 +606,13 @@ pub struct prmi_bwd_task_t {
 ///
 /// Returns 0 on success. Error codes:
 ///   - `-1` — null pointer (with ntasks>0).
-///   - `-2` — a task descriptor's query or steps window falls outside its arena
-///     (bad programming error), or `ntasks` / a task's `query_off` / the packed
-///     pac length does not fit `usize` on this target; `prmi_last_error_message`
-///     names the offending task index and which window violated the bound. The
-///     whole batch is aborted on the first violation; no arena memory is read or
-///     written for the violating task.
+///   - `-2` — a task descriptor's query or steps window falls outside its arena,
+///     or `ntasks` / a task's `query_off` / the packed pac length does not fit
+///     `usize` on this target
+///     (bad programming error); `prmi_last_error_message` names the offending
+///     task index and which window violated the bound. The whole batch is
+///     aborted on the first violation; no arena memory is read or written for
+///     the violating task.
 ///   - `-3` — internal/panic.
 ///   - `-4` — a task's produced nsteps exceeds its `max_steps`; that task's
 ///     `out_nsteps[i]` is set to the needed count; its steps region is left
@@ -714,7 +717,7 @@ pub unsafe extern "C" fn prmi_forward_spectrum_batch(
                     t.query_len as usize,
                 )
             };
-            let steps = h.idx.forward_spectrum(q, pac_slice, enc);
+            let steps = h.idx.forward_spectrum_auto(q, pac_slice, enc);
             out_ns[i] = steps.len() as u64;
             if steps.len() as u64 > u64::from(t.max_steps) {
                 overflow = true;
@@ -744,34 +747,17 @@ pub unsafe extern "C" fn prmi_forward_spectrum_batch(
     0
 }
 
-/// Run `ntasks` backward spectra (correctness-first loop; lockstep pipeline is
-/// a deferred perf optimization — see the design spec). `reads_arena` holds all
-/// task read bytes (2-bit 0..3, caller-owned, NOT copied); `reads_arena_len`
-/// is its size in bytes. Task i reads `read_len` bytes at `read_off`.
-/// `steps_arena` is a shared caller-owned output arena; `steps_arena_len` is
-/// its capacity in `prmi_smem_step_t` elements. Task i writes up to `max_steps`
-/// steps at index `steps_off`, and its count to `out_nsteps[i]` (0 if no left
-/// extension). `pac` is the FORWARD pac (packed); `pac_num_bases` = l_pac.
-///
-/// Returns 0 on success. Error codes:
-///   - `-1` — null pointer (with ntasks>0).
-///   - `-2` — a task descriptor's read or steps window falls outside its arena
-///     (bad programming error), or `ntasks` / a task's `read_off` / the packed
-///     pac length does not fit `usize` on this target; `prmi_last_error_message`
-///     names the offending task index and which window violated the bound. The
-///     whole batch is aborted on the first violation; no arena memory is read or
-///     written for the violating task.
-///   - `-3` — internal/panic (including a contiguity-guard failure on a corrupt
-///     index).
-///   - `-4` — a task's produced nsteps exceeds its `max_steps`; that task's
-///     `out_nsteps[i]` is set to the needed count; its steps region is left
-///     unwritten/partial.
+/// Shared impl for the two backward-batch entry points. `lockstep == false` runs
+/// the correctness-first serial loop (one `backward_spectrum` per task);
+/// `lockstep == true` drives all tasks through `backward_spectrum_lockstep`
+/// (memory-level parallelism via batched probe loads). Output is byte-identical
+/// between the two strategies — they differ only in execution order and timing.
 ///
 /// # Safety
 /// All pointers valid for their declared sizes; arenas at least as large as
 /// declared; `out_nsteps` has `ntasks` u64 slots.
-#[no_mangle]
-pub unsafe extern "C" fn prmi_backward_spectrum_batch(
+#[allow(clippy::too_many_arguments)]
+unsafe fn backward_spectrum_batch_impl(
     handle: *const prmi_index_t,
     reads_arena: *const u8,
     reads_arena_len: u64,
@@ -782,6 +768,7 @@ pub unsafe extern "C" fn prmi_backward_spectrum_batch(
     steps_arena: *mut prmi_smem_step_t,
     steps_arena_len: u64,
     out_nsteps: *mut u64,
+    lockstep: bool,
 ) -> c_int {
     clear_last_error();
     if handle.is_null() || pac.is_null() {
@@ -856,26 +843,55 @@ pub unsafe extern "C" fn prmi_backward_spectrum_batch(
         }
     }
 
-    // One catch_unwind around the whole loop — panic anywhere (incl. contiguity
+    // One catch_unwind around the whole batch — panic anywhere (incl. contiguity
     // guard in backward_spectrum) → -3.
     let mut overflow = false;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for (i, t) in tasks_s.iter().enumerate() {
-            let read = unsafe {
-                std::slice::from_raw_parts(
-                    reads_arena.add(t.read_off as usize),
-                    t.read_len as usize,
-                )
-            };
-            let steps = h.idx.backward_spectrum(
-                t.sa_start,
-                t.occ_count,
-                t.anchor_len,
-                read,
-                t.pivot as usize,
-                pac_slice,
-                enc,
-            );
+        let all_steps: Vec<Vec<prmi::index::spectrum::SmemStep>> = if lockstep {
+            let bwd_tasks: Vec<_> = tasks_s
+                .iter()
+                .map(|t| {
+                    let read = unsafe {
+                        std::slice::from_raw_parts(
+                            reads_arena.add(t.read_off as usize),
+                            t.read_len as usize,
+                        )
+                    };
+                    prmi::index::spectrum::BwdTask {
+                        sa_start: t.sa_start,
+                        occ_count: t.occ_count,
+                        anchor_len: t.anchor_len,
+                        read,
+                        pivot: t.pivot as usize,
+                    }
+                })
+                .collect();
+            h.idx.backward_spectrum_lockstep(&bwd_tasks, pac_slice, enc)
+        } else {
+            // Correctness-first serial loop: one `backward_spectrum` per task.
+            tasks_s
+                .iter()
+                .map(|t| {
+                    let read = unsafe {
+                        std::slice::from_raw_parts(
+                            reads_arena.add(t.read_off as usize),
+                            t.read_len as usize,
+                        )
+                    };
+                    h.idx.backward_spectrum(
+                        t.sa_start,
+                        t.occ_count,
+                        t.anchor_len,
+                        read,
+                        t.pivot as usize,
+                        pac_slice,
+                        enc,
+                    )
+                })
+                .collect()
+        };
+        for (i, steps) in all_steps.iter().enumerate() {
+            let t = &tasks_s[i];
             out_ns[i] = steps.len() as u64;
             if steps.len() as u64 > u64::from(t.max_steps) {
                 overflow = true;
@@ -902,6 +918,110 @@ pub unsafe extern "C" fn prmi_backward_spectrum_batch(
         return -4;
     }
     0
+}
+
+/// Run `ntasks` backward spectra with the correctness-first SERIAL strategy (one
+/// `backward_spectrum` per task). This is the safe default: it never regresses
+/// relative to calling `prmi_backward_spectrum` in a loop, and it amortizes the
+/// FFI crossing. `reads_arena` holds all task read bytes (2-bit 0..3, caller-
+/// owned, NOT copied); `reads_arena_len` is its size in bytes. Task i reads
+/// `read_len` bytes at `read_off`. `steps_arena` is a shared caller-owned output
+/// arena; `steps_arena_len` is its capacity in `prmi_smem_step_t` elements.
+/// Task i writes up to `max_steps` steps at index `steps_off`, and its count to
+/// `out_nsteps[i]` (0 if no left extension). `pac` is the FORWARD pac (packed);
+/// `pac_num_bases` = l_pac.
+///
+/// For the memory-level-parallelism variant, see
+/// `prmi_backward_spectrum_batch_lockstep` — byte-identical output, faster on
+/// high-DRAM-latency microarchitectures, slower on low-latency ones (measure).
+///
+/// Returns 0 on success. Error codes:
+///   - `-1` — null pointer (with ntasks>0).
+///   - `-2` — a task descriptor's read or steps window falls outside its arena,
+///     or `ntasks` / a task's `read_off` / the packed pac length does not fit
+///     `usize` on this target;
+///     `prmi_last_error_message` names the offending task index and window. The
+///     whole batch is aborted on the first violation; no arena memory is read or
+///     written for the violating task.
+///   - `-3` — internal/panic (including a contiguity-guard failure).
+///   - `-4` — a task's produced nsteps exceeds its `max_steps`; that task's
+///     `out_nsteps[i]` is set to the needed count; its steps region is left
+///     unwritten/partial.
+///
+/// # Safety
+/// All pointers valid for their declared sizes; arenas at least as large as
+/// declared; `out_nsteps` has `ntasks` u64 slots.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_backward_spectrum_batch(
+    handle: *const prmi_index_t,
+    reads_arena: *const u8,
+    reads_arena_len: u64,
+    tasks: *const prmi_bwd_task_t,
+    ntasks: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    steps_arena: *mut prmi_smem_step_t,
+    steps_arena_len: u64,
+    out_nsteps: *mut u64,
+) -> c_int {
+    unsafe {
+        backward_spectrum_batch_impl(
+            handle,
+            reads_arena,
+            reads_arena_len,
+            tasks,
+            ntasks,
+            pac,
+            pac_num_bases,
+            steps_arena,
+            steps_arena_len,
+            out_nsteps,
+            false,
+        )
+    }
+}
+
+/// Run `ntasks` backward spectra with the LOCKSTEP strategy: all tasks are driven
+/// in parallel, batching their cold SA/model probe loads each round so the memory
+/// latency overlaps (memory-level parallelism). Byte-identical output to
+/// `prmi_backward_spectrum_batch` — same intervals, same order — differing only
+/// in execution strategy. Faster on high-DRAM-latency microarchitectures (server
+/// x86 / Graviton); can be SLOWER on low-latency ones (e.g. Apple Silicon, which
+/// already hides the latency). A/B both entry points on the target hardware and
+/// pick the winner. Same arguments, arena contract, and error codes as
+/// `prmi_backward_spectrum_batch`.
+///
+/// # Safety
+/// All pointers valid for their declared sizes; arenas at least as large as
+/// declared; `out_nsteps` has `ntasks` u64 slots.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_backward_spectrum_batch_lockstep(
+    handle: *const prmi_index_t,
+    reads_arena: *const u8,
+    reads_arena_len: u64,
+    tasks: *const prmi_bwd_task_t,
+    ntasks: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    steps_arena: *mut prmi_smem_step_t,
+    steps_arena_len: u64,
+    out_nsteps: *mut u64,
+) -> c_int {
+    unsafe {
+        backward_spectrum_batch_impl(
+            handle,
+            reads_arena,
+            reads_arena_len,
+            tasks,
+            ntasks,
+            pac,
+            pac_num_bases,
+            steps_arena,
+            steps_arena_len,
+            out_nsteps,
+            true,
+        )
+    }
 }
 
 /// Reverse-complement a tokenized 32-mer key (2-bit packed, MSB-first).

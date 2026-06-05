@@ -4,8 +4,11 @@
 //! Integration tests for the shared-memory loader (`prmi shm load` + `open_shm`).
 
 use prmi::index::shm::{read_shm_blob, write_shm_blob};
+use prmi::index::smem::PacEncoding;
 use prmi::index::LearnedIndex;
 use prmi::train::build_sidecar;
+use prmi::train::build_sidecar_with_config;
+use prmi::train::config::TrainerConfig;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -161,6 +164,188 @@ fn open_shm_corrupt_magic_returns_error() {
     assert!(result.is_err(), "open_shm on corrupt magic should fail");
 }
 
+// ── LearnedIndex::write_shm helper ───────────────────────────────────────────
+
+#[test]
+fn write_shm_convenience_method_produces_valid_blob() {
+    let (_dir, prefix) = build_test_sidecar();
+    let shm_path = _dir.path().join("helper.shm");
+
+    LearnedIndex::write_shm(&prefix, &shm_path).expect("write_shm should succeed");
+    let idx = LearnedIndex::open_shm(&shm_path).expect("open_shm should succeed");
+    assert!(idx.sa_num() > 0, "index must have at least one SA entry");
+}
+
+// ── open_shm: .kmt carriage ──────────────────────────────────────────────────
+
+/// A sidecar built WITHOUT `--kmer-table-k` produces a blob with no `.kmt`
+/// component, and `open_shm` reports `has_kmt() == false` (it falls back to the
+/// full forward search). This also guards the backward-compatible header: the
+/// reserved `[88..104]` bytes read as zero.
+#[test]
+fn open_shm_without_kmt_has_no_table() {
+    let (_dir, prefix) = build_test_sidecar();
+    let shm_path = _dir.path().join("no_kmt.shm");
+
+    write_shm_blob(&prefix, &shm_path).unwrap();
+
+    let blob = read_shm_blob(&shm_path).unwrap();
+    assert_eq!(blob.kmt_len, 0, "no .kmt was built, so kmt_len must be 0");
+
+    let idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(
+        !idx.has_kmt(),
+        "an shm blob without .kmt must not load a table"
+    );
+}
+
+/// Build a sidecar WITH a `.kmt` k-mer table in `dir`, returning the sidecar
+/// prefix and the unpacked reference bases (for forward-spectrum queries). The
+/// reference is chosen to produce a non-empty forward spectrum.
+fn build_kmt_sidecar(dir: &std::path::Path) -> (PathBuf, Vec<u8>) {
+    let fa = dir.join("ref.fa");
+    let pac_unpacked: Vec<u8> = (0u64..256).map(|i| ((i * 5 + 1) % 4) as u8).collect();
+    let mut fa_bytes = b">ref\n".to_vec();
+    for &b in &pac_unpacked {
+        fa_bytes.push(b"ACGT"[b as usize]);
+    }
+    fa_bytes.push(b'\n');
+    std::fs::write(&fa, &fa_bytes).unwrap();
+
+    let prefix = dir.join("ref.fa.prmi");
+    let cfg = TrainerConfig::default().with_kmer_table_k(6);
+    build_sidecar_with_config(&fa, &prefix, Some(16), Default::default(), 1, Some(cfg)).unwrap();
+    (prefix, pac_unpacked)
+}
+
+/// The file-backed full forward search over a 24-base query drawn from the
+/// reference — the byte-identity reference output any accelerator must match.
+fn full_search_reference(prefix: &std::path::Path, pac_unpacked: &[u8]) -> Vec<u8> {
+    let file_idx = LearnedIndex::open(prefix).unwrap();
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+    let steps = file_idx.forward_spectrum(&query, pac_unpacked, PacEncoding::Unpacked);
+    assert!(!steps.is_empty(), "expected a non-empty forward spectrum");
+    // Flatten to a comparable byte vector via debug encoding of each step.
+    format!("{steps:?}").into_bytes()
+}
+
+/// A sidecar built WITH `--kmer-table-k` carries the `.kmt` into the shm blob;
+/// `open_shm` loads it (`has_kmt()`), and `forward_spectrum_auto` over the
+/// shm-loaded table is byte-identical to the file-backed index's full forward
+/// search. This proves the shm carriage neither drops nor corrupts the table.
+#[test]
+fn open_shm_with_kmt_is_byte_identical_to_full_search() {
+    let dir = tempdir().unwrap();
+    let (prefix, pac_unpacked) = build_kmt_sidecar(dir.path());
+
+    let shm_path = dir.path().join("with_kmt.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+
+    // The blob must carry the .kmt component.
+    let blob = read_shm_blob(&shm_path).unwrap();
+    assert!(blob.kmt_len > 0, ".kmt must be carried in the blob");
+    // .kmt sits after .l2 and stays within the blob.
+    assert!(blob.l2_offset + blob.l2_len <= blob.kmt_offset);
+    assert_eq!(blob.kmt_offset % 4096, 0, "kmt_offset must be page-aligned");
+
+    // shm-loaded index loads the table.
+    let shm_idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(shm_idx.has_kmt(), "open_shm must load the carried .kmt");
+
+    // Reference: the file-backed full forward search (the table is a pure
+    // accelerator, so its tabled output must equal the untabled search).
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+    let file_idx = LearnedIndex::open(&prefix).unwrap();
+    let reference = file_idx.forward_spectrum(&query, &pac_unpacked, PacEncoding::Unpacked);
+    assert!(
+        !reference.is_empty(),
+        "expected a non-empty forward spectrum"
+    );
+
+    let via_shm_table = shm_idx.forward_spectrum_auto(&query, &pac_unpacked, PacEncoding::Unpacked);
+    assert_eq!(
+        via_shm_table, reference,
+        "shm-table forward spectrum must be byte-identical to the full search"
+    );
+}
+
+/// Best-effort, never-silently-wrong: a carried `.kmt` whose own header is
+/// corrupt (magic clobbered) must be rejected by `from_shm_slice`, so `open_shm`
+/// still succeeds with `has_kmt() == false`. The full forward search remains
+/// correct (byte-identical to a clean file open). Exercises the corrupt-slice
+/// fallback branch in the shm load path.
+#[test]
+fn open_shm_with_corrupt_kmt_falls_back() {
+    let dir = tempdir().unwrap();
+    let (prefix, pac_unpacked) = build_kmt_sidecar(dir.path());
+    let reference = full_search_reference(&prefix, &pac_unpacked);
+
+    let shm_path = dir.path().join("corrupt_kmt.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+
+    // Clobber the carried .kmt's 4-byte magic (at the start of its component).
+    let blob = read_shm_blob(&shm_path).unwrap();
+    let kmt_off = blob.kmt_offset;
+    assert!(blob.kmt_len > 0);
+    drop(blob); // release the mmap before rewriting the file
+    let mut bytes = std::fs::read(&shm_path).unwrap();
+    bytes[kmt_off..kmt_off + 4].fill(0xff);
+    std::fs::write(&shm_path, &bytes).unwrap();
+
+    // open_shm must still succeed, ignore the corrupt table, and stay correct.
+    let idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(
+        !idx.has_kmt(),
+        "a corrupt carried .kmt must be ignored, not loaded"
+    );
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+    let via_fallback = idx.forward_spectrum_auto(&query, &pac_unpacked, PacEncoding::Unpacked);
+    assert_eq!(
+        format!("{via_fallback:?}").into_bytes(),
+        reference,
+        "fallback forward search must match the full search"
+    );
+}
+
+/// Best-effort binding: a carried `.kmt` whose own header is structurally valid
+/// but whose `ref_digest` no longer matches the sidecar must be rejected by the
+/// `kmt_matches` reference-binding check (NOT by `from_shm_slice`), so `open_shm`
+/// still succeeds with `has_kmt() == false`. This locks the reference-binding on
+/// the shm path, mirroring the file path's `load_kmt_best_effort`.
+#[test]
+fn open_shm_with_ref_mismatched_kmt_falls_back() {
+    let dir = tempdir().unwrap();
+    let (prefix, pac_unpacked) = build_kmt_sidecar(dir.path());
+    let reference = full_search_reference(&prefix, &pac_unpacked);
+
+    let shm_path = dir.path().join("mismatch_kmt.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+
+    // Flip one byte of the carried .kmt's `ref_digest` (kmt header bytes 24..56),
+    // leaving its magic/version/sa_num intact so the slice opens but the digest
+    // binding fails.
+    let blob = read_shm_blob(&shm_path).unwrap();
+    let digest_byte = blob.kmt_offset + 24;
+    assert!(blob.kmt_len > 56);
+    drop(blob);
+    let mut bytes = std::fs::read(&shm_path).unwrap();
+    bytes[digest_byte] ^= 0xff;
+    std::fs::write(&shm_path, &bytes).unwrap();
+
+    let idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(
+        !idx.has_kmt(),
+        "a ref-mismatched carried .kmt must be ignored, not loaded"
+    );
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+    let via_fallback = idx.forward_spectrum_auto(&query, &pac_unpacked, PacEncoding::Unpacked);
+    assert_eq!(
+        format!("{via_fallback:?}").into_bytes(),
+        reference,
+        "fallback forward search must match the full search"
+    );
+}
+
 // ── read_shm_blob: wrapper-layout invariant enforcement ──────────────────────
 
 /// Read a blob file's raw bytes, overwrite the little-endian u64 header field at
@@ -213,14 +398,17 @@ fn read_shm_blob_rejects_overlapping_components() {
     );
 }
 
-// ── LearnedIndex::write_shm helper ───────────────────────────────────────────
-
 #[test]
-fn write_shm_convenience_method_produces_valid_blob() {
+fn read_shm_blob_rejects_zero_length_core_component() {
     let (_dir, prefix) = build_test_sidecar();
-    let shm_path = _dir.path().join("helper.shm");
-
-    LearnedIndex::write_shm(&prefix, &shm_path).expect("write_shm should succeed");
-    let idx = LearnedIndex::open_shm(&shm_path).expect("open_shm should succeed");
-    assert!(idx.sa_num() > 0, "index must have at least one SA entry");
+    let shm_path = _dir.path().join("zero_meta.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+    // meta_len lives at header bytes [32..40]. Only `.kmt` may be absent; a
+    // zero-length CORE component is a malformed blob and must be rejected, not
+    // silently passed through as an empty slice.
+    patch_header_u64(&shm_path, 32, 0);
+    assert!(
+        read_shm_blob(&shm_path).is_err(),
+        "a zero-length core component (meta) must be rejected"
+    );
 }

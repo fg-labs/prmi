@@ -11,7 +11,6 @@ fn from_prefix_appends_suffixes() {
     assert_eq!(p.sa, PathBuf::from("/data/hg38.fa.prmi.sa"));
     assert_eq!(p.l1, PathBuf::from("/data/hg38.fa.prmi.l1"));
     assert_eq!(p.l2, PathBuf::from("/data/hg38.fa.prmi.l2"));
-    assert_eq!(p.isa, PathBuf::from("/data/hg38.fa.prmi.isa"));
 }
 
 #[test]

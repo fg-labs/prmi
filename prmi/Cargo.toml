@@ -17,6 +17,13 @@ documentation = "https://docs.rs/prmi"
 name = "prmi"
 path = "src/lib.rs"
 
+[features]
+# Test/profiling-only: count SA probes (cold sa_position reads) per backward
+# left step via a thread-local counter, for the chr17 cold-probe measurement in
+# examples/profile_spectrum.rs. OFF by default; the production hot path has no
+# counter when this feature is not enabled.
+spectrum-probe-count = []
+
 [[bin]]
 name = "prmi"
 path = "src/main.rs"
@@ -57,4 +64,8 @@ harness = false
 
 [[bench]]
 name = "trainer_bench"
+harness = false
+
+[[bench]]
+name = "spectrum_bench"
 harness = false

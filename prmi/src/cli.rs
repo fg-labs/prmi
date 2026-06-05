@@ -105,6 +105,11 @@ pub enum Cmd {
             default_missing_value = "true",
         )]
         store_keys: bool,
+        /// Build and persist a `.kmt` k-mer table of order K (forward-spectrum
+        /// shallow-band accelerator; K capped to the reference size). Recommended
+        /// K=12 (~358 MB) for human-scale references. Omit to build no table.
+        #[arg(long, value_name = "K")]
+        kmer_table_k: Option<u32>,
     },
     /// Convert a KMC text-format dump to a prmi u64-key histogram TSV.
     ///
@@ -206,6 +211,7 @@ impl Cli {
                 prior_fastq_base_weight,
                 threads,
                 store_keys,
+                kmer_table_k,
             } => {
                 // Resolve the reference source: exactly one of the positional
                 // FASTA or `--pac`. clap's `conflicts_with` rejects both; here
@@ -270,6 +276,7 @@ impl Cli {
                 let trainer_config = crate::train::config::TrainerConfig {
                     prior,
                     memory_mode: mem_mode,
+                    kmer_table_k,
                     ..Default::default()
                 };
 

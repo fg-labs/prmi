@@ -97,6 +97,11 @@ pub struct TrainerConfig {
     /// layout and what extra data is stored alongside each SA position.
     /// Defaults to [`MemoryMode::Mode1`] (position only, 5 B/entry).
     pub memory_mode: MemoryMode,
+
+    /// If `Some(k)`, build and persist a `.kmt` k-mer table of order `k` that
+    /// accelerates `forward_spectrum`'s shallow prefix bands. `None` (default)
+    /// builds no table. `k` is capped to the reference size at build time.
+    pub kmer_table_k: Option<u32>,
 }
 
 impl Default for TrainerConfig {
@@ -107,11 +112,24 @@ impl Default for TrainerConfig {
             max_l1_entries: (1 << 31) - 1,
             prior: Prior::Uniform,
             memory_mode: MemoryMode::Mode1,
+            kmer_table_k: None,
         }
     }
 }
 
 impl TrainerConfig {
+    /// Return a copy of this config that builds a `.kmt` k-mer table of order
+    /// `k` (forward-spectrum shallow-band accelerator).
+    ///
+    /// Convenience method for external callers that cannot use struct
+    /// initialisation syntax due to the `#[non_exhaustive]` attribute.
+    pub fn with_kmer_table_k(self, k: u32) -> Self {
+        Self {
+            kmer_table_k: Some(k),
+            ..self
+        }
+    }
+
     /// Return a copy of this config with the given [`MemoryMode`].
     ///
     /// Convenience method for external callers that cannot use struct

@@ -11,16 +11,16 @@ fn uniform_set_pairs_keys_with_sa_indices() {
 
     assert_eq!(ts.len(), sa.len());
     assert!(!ts.is_empty());
-    assert_eq!(ts.keys.len(), ts.sa_indices.len());
+    assert_eq!(ts.len(), ts.sa_indices.len());
 
     // sa_indices is identity 0..n
-    for (i, &idx) in ts.sa_indices.iter().enumerate() {
+    for (i, idx) in ts.sa_indices.iter().enumerate() {
         assert_eq!(idx, i as u64, "sa_indices must be 0..n for uniform set");
     }
 
     // keys match what sa_to_keys would produce directly
     let direct_keys = prmi::train::keys::sa_to_keys(&sa, &bases);
-    assert_eq!(ts.keys, direct_keys);
+    assert_eq!(ts.keys_iter().collect::<Vec<_>>(), direct_keys);
 }
 
 #[test]

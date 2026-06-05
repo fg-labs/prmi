@@ -6,8 +6,8 @@
 //! # Overview
 //!
 //! `write_shm_blob` packs the four sidecar files (`.meta`, `.sa`, `.l1`, `.l2`)
-//! into a single blob file. The blob header records the byte offset and length of
-//! each component; each component starts on a 4 KiB-aligned boundary.
+//! into a single blob file. The blob header records the byte offset and
+//! length of each component; each component starts on a 4 KiB-aligned boundary.
 //!
 //! `read_shm_blob` opens and mmaps a previously-written blob, validates the
 //! wrapper header, and returns an [`ShmBlob`] describing the layout.
@@ -17,23 +17,33 @@
 //! # Blob wrapper format
 //!
 //! ```text
-//! [0..16)   : magic "PRMI_SHM_v1\0\0\0\0\0"  (16 bytes, NUL-padded)
-//! [16..24)  : u64 wrapper_format_version = 1   (little-endian)
-//! [24..32)  : u64 meta_offset
-//! [32..40)  : u64 meta_len
-//! [40..48)  : u64 sa_offset
-//! [48..56)  : u64 sa_len
-//! [56..64)  : u64 l1_offset
-//! [64..72)  : u64 l1_len
-//! [72..80)  : u64 l2_offset
-//! [80..88)  : u64 l2_len
-//! [88..4096): zero padding (reserved)
-//! [4096..)  : concatenated components, each starting on a 4 KiB boundary
+//! [0..16)    : magic "PRMI_SHM_v3\0\0\0\0\0"  (16 bytes, NUL-padded)
+//! [16..24)   : u64 wrapper_format_version = 3   (little-endian)
+//! [24..32)   : u64 meta_offset
+//! [32..40)   : u64 meta_len
+//! [40..48)   : u64 sa_offset
+//! [48..56)   : u64 sa_len
+//! [56..64)   : u64 l1_offset
+//! [64..72)   : u64 l1_len
+//! [72..80)   : u64 l2_offset
+//! [80..88)   : u64 l2_len
+//! [88..96)   : u64 kmt_offset  (0 when no `.kmt` is carried)
+//! [96..104)  : u64 kmt_len     (0 when no `.kmt` is carried)
+//! [104..4096): zero padding (reserved)
+//! [4096..)   : concatenated components, each starting on a 4 KiB boundary
 //! ```
 //!
 //! All multi-byte integers are little-endian. Component alignment to 4 KiB
 //! ensures that each component starts on a page boundary, which is necessary for
 //! callers that want to mmap individual components independently.
+//!
+//! The optional `.kmt` (a 5th component, a forward k-mer table) was added without
+//! bumping the wrapper version: `[88..104)` were specified-zero from the start, so
+//! a `kmt_len == 0` reads as "no table" on both old and new readers. The version
+//! is therefore *intentionally* retained at 3 — do not bump it for `.kmt`. An old
+//! reader simply ignores a carried table; a new reader treats an old (zero) blob
+//! as table-less. The table is a pure accelerator, so either way the result is
+//! correct (see [`LearnedIndex::open_shm`] best-effort loading).
 //!
 //! # Cross-process sharing
 //!
@@ -63,10 +73,13 @@ use std::sync::Arc;
 // ── constants ─────────────────────────────────────────────────────────────────
 
 /// Wrapper header magic string (16 bytes, NUL-padded ASCII).
-pub const SHM_MAGIC: &[u8; 16] = b"PRMI_SHM_v1\x00\x00\x00\x00\x00";
+pub const SHM_MAGIC: &[u8; 16] = b"PRMI_SHM_v3\x00\x00\x00\x00\x00";
 
 /// Wrapper format version stored at offset 16.
-pub const SHM_WRAPPER_VERSION: u64 = 1;
+///
+/// Bumped to 3 when the `.isa` component was removed (the format is unreleased,
+/// so older blobs are rejected outright rather than supported).
+pub const SHM_WRAPPER_VERSION: u64 = 3;
 
 /// Total wrapper header size; components are aligned to this boundary.
 const HEADER_SIZE: usize = 4096;
@@ -99,6 +112,10 @@ pub struct ShmBlob {
     pub l2_offset: usize,
     /// Byte length of the `.l2` component.
     pub l2_len: usize,
+    /// Byte offset of the optional `.kmt` component (`0` when absent).
+    pub kmt_offset: usize,
+    /// Byte length of the optional `.kmt` component (`0` when absent).
+    pub kmt_len: usize,
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
@@ -148,10 +165,10 @@ fn write_padding(
 
 /// Pack a sidecar into a single shm blob at `shm_path`.
 ///
-/// Reads the four sidecar files from `<sidecar_prefix>.{meta,sa,l1,l2}` and
-/// concatenates them into a blob at `shm_path`. An existing file at `shm_path`
-/// is overwritten. The blob can be opened by [`read_shm_blob`] or
-/// [`LearnedIndex::open_shm`].
+/// Reads the four sidecar files from `<sidecar_prefix>.{meta,sa,l1,l2}` (plus
+/// the optional `.kmt` forward k-mer table, when present) and concatenates them
+/// into a blob at `shm_path`. An existing file at `shm_path` is overwritten. The
+/// blob can be opened by [`read_shm_blob`] or [`LearnedIndex::open_shm`].
 ///
 /// The typical destination on Linux is `/dev/shm/<name>` (tmpfs-backed shared
 /// memory). On macOS `/tmp/<name>` is the equivalent. Multiple processes that
@@ -165,12 +182,31 @@ pub fn write_shm_blob(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
     let sa_bytes = read_all(&paths.sa)?;
     let l1_bytes = read_all(&paths.l1)?;
     let l2_bytes = read_all(&paths.l2)?;
+    // Optional `.kmt` forward k-mer table (a 5th component). Absent for sidecars
+    // built without `--kmer-table-k`; carried so shm-loaded indexes get the
+    // table acceleration too.
+    // Read the `.kmt` directly rather than gating on `Path::exists()` (which also
+    // reports `false` when metadata is inaccessible, silently dropping a real
+    // failure): treat only a genuine `NotFound` as "no table", surface any other
+    // I/O error.
+    let kmt_bytes: Option<Vec<u8>> = match std::fs::read(&paths.kmt) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(Error::Io {
+                path: paths.kmt.clone(),
+                source: e,
+            })
+        }
+    };
 
     // Compute component offsets (each 4 KiB-aligned, starting after the header).
     let meta_offset = HEADER_SIZE; // first component starts right after the header
     let sa_offset = align_up(meta_offset + meta_bytes.len(), COMPONENT_ALIGN);
     let l1_offset = align_up(sa_offset + sa_bytes.len(), COMPONENT_ALIGN);
     let l2_offset = align_up(l1_offset + l1_bytes.len(), COMPONENT_ALIGN);
+    let kmt_offset = align_up(l2_offset + l2_bytes.len(), COMPONENT_ALIGN);
+    let kmt_len = kmt_bytes.as_ref().map_or(0, |b| b.len());
 
     // Build the 4 KiB wrapper header.
     let mut header = [0u8; HEADER_SIZE];
@@ -184,7 +220,13 @@ pub fn write_shm_blob(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
     LittleEndian::write_u64(&mut header[64..72], l1_bytes.len() as u64);
     LittleEndian::write_u64(&mut header[72..80], l2_offset as u64);
     LittleEndian::write_u64(&mut header[80..88], l2_bytes.len() as u64);
-    // bytes [88..4096) remain zero (reserved).
+    // `.kmt` component: offset+len, both 0 when absent (backward-compatible —
+    // old blobs leave these reserved bytes zero, which reads as "no table").
+    if kmt_len > 0 {
+        LittleEndian::write_u64(&mut header[88..96], kmt_offset as u64);
+        LittleEndian::write_u64(&mut header[96..104], kmt_len as u64);
+    }
+    // bytes [104..4096) remain zero (reserved).
 
     // Write the blob file.
     let f = OpenOptions::new()
@@ -245,6 +287,20 @@ pub fn write_shm_blob(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
         path: shm_path.to_path_buf(),
         source: e,
     })?;
+    // Optional `.kmt` component.
+    if let Some(kmt) = &kmt_bytes {
+        let off = write_padding(
+            &mut w,
+            l2_offset + l2_bytes.len(),
+            COMPONENT_ALIGN,
+            shm_path,
+        )?;
+        debug_assert_eq!(off, kmt_offset);
+        w.write_all(kmt).map_err(|e| Error::Io {
+            path: shm_path.to_path_buf(),
+            source: e,
+        })?;
+    }
 
     w.flush().map_err(|e| Error::Io {
         path: shm_path.to_path_buf(),
@@ -313,18 +369,44 @@ pub fn read_shm_blob(shm_path: &Path) -> Result<ShmBlob> {
     let l1_len = LittleEndian::read_u64(&blob[64..72]) as usize;
     let l2_offset = LittleEndian::read_u64(&blob[72..80]) as usize;
     let l2_len = LittleEndian::read_u64(&blob[80..88]) as usize;
+    // Optional `.kmt` (both 0 when absent — old blobs leave these zero).
+    let kmt_offset = LittleEndian::read_u64(&blob[88..96]) as usize;
+    let kmt_len = LittleEndian::read_u64(&blob[96..104]) as usize;
 
     // Enforce the documented PRMI_SHM_v1 wrapper layout: every component must
     // start after the reserved header, be 4 KiB-aligned, sit within the blob,
     // and follow the previous component without overlap (components are written
-    // in meta → sa → l1 → l2 order).
+    // in meta → sa → l1 → l2 → kmt order; the optional `.kmt` is len 0 when
+    // absent and so trivially in range).
     let mut prev_end = HEADER_SIZE;
     for (name, offset, len) in [
         ("meta", meta_offset, meta_len),
         ("sa", sa_offset, sa_len),
         ("l1", l1_offset, l1_len),
         ("l2", l2_offset, l2_len),
+        ("kmt", kmt_offset, kmt_len),
     ] {
+        // Only `.kmt` is optional: an absent table is written as offset 0 / len 0
+        // and occupies no bytes, so the strict layout checks (which assume a real,
+        // header-following, page-aligned range) do not apply — skip it, but still
+        // enforce its offset is 0. A zero-length CORE component (meta/sa/l1/l2) is
+        // a malformed wrapper and must be rejected, not silently passed through as
+        // an empty slice.
+        if name == "kmt" && len == 0 {
+            if offset != 0 {
+                return Err(Error::SizeMismatch {
+                    file: shm_path.to_path_buf(),
+                    detail: format!("kmt offset {offset} must be 0 when kmt len is 0"),
+                });
+            }
+            continue;
+        }
+        if len == 0 {
+            return Err(Error::SizeMismatch {
+                file: shm_path.to_path_buf(),
+                detail: format!("{name} component has zero length (malformed blob)"),
+            });
+        }
         if offset < HEADER_SIZE {
             return Err(Error::SizeMismatch {
                 file: shm_path.to_path_buf(),
@@ -371,6 +453,8 @@ pub fn read_shm_blob(shm_path: &Path) -> Result<ShmBlob> {
         l1_len,
         l2_offset,
         l2_len,
+        kmt_offset,
+        kmt_len,
     })
 }
 
