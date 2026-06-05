@@ -965,6 +965,7 @@ impl LearnedIndex {
             let mut a = lo;
             let mut b = hi;
             while a < b {
+                self.prefetch_bsearch(a, b);
                 let mid = a + (b - a) / 2;
                 let pos = self.sa_position_for(mid);
                 bump_probe();
@@ -983,6 +984,7 @@ impl LearnedIndex {
             let mut c = k;
             let mut d = hi;
             while c < d {
+                self.prefetch_bsearch(c, d);
                 let mid = c + (d - c) / 2;
                 let pos = self.sa_position_for(mid);
                 bump_probe();
@@ -1201,6 +1203,7 @@ impl LearnedIndex {
             let mut a = lo;
             let mut b = hi;
             while a < b {
+                self.prefetch_bsearch(a, b);
                 let mid = a + (b - a) / 2;
                 let pos = self.sa_position_for(mid);
                 bump_probe();
@@ -1218,6 +1221,7 @@ impl LearnedIndex {
             let mut c = kk;
             let mut d = hi;
             while c < d {
+                self.prefetch_bsearch(c, d);
                 let mid = c + (d - c) / 2;
                 let pos = self.sa_position_for(mid);
                 bump_probe();
@@ -2203,6 +2207,21 @@ impl LearnedIndex {
         }
     }
 
+    /// Prefetch the two SA entries a binary search over `[lo, hi)` would probe
+    /// next (the children of the current midpoint), so the next cold DRAM read is
+    /// already in flight while the current keyed compare runs. Advisory — it
+    /// never changes a search result, only its latency; out-of-range indices are
+    /// ignored by `prefetch_sa`. Called at the top of every SA binary-search loop.
+    #[inline(always)]
+    fn prefetch_bsearch(&self, lo: u64, hi: u64) {
+        if lo >= hi {
+            return;
+        }
+        let mid = lo + (hi - lo) / 2;
+        self.prefetch_sa(lo + (mid - lo) / 2); // next mid if we branch toward lo
+        self.prefetch_sa(mid + 1 + (hi - mid - 1) / 2); // next mid if we branch toward hi
+    }
+
     /// Find the boundary index in `[domain_lo, domain_hi)` — the first index `i`
     /// where the monotone predicate `go_right(i)` is `false` — seeded from the model
     /// window `[seed_lo, seed_hi)` with exponential expand-on-miss.
@@ -2274,8 +2293,15 @@ impl LearnedIndex {
             }
             break;
         }
-        // `[lo, hi)` now straddles the boundary; standard binary search.
+        // `[lo, hi)` now straddles the boundary; standard binary search. Every
+        // `go_right(mid)` probes SA entry `mid` (a cold DRAM read); prefetch the
+        // two possible next-probe entries so that read is already in flight while
+        // this iteration's keyed compare runs. Advisory only — it never changes
+        // the boundary returned, just the probe latency. (Every caller's
+        // predicate probes SA entry `mid`, so the prefetch targets are SA
+        // indices; out-of-range indices are ignored by `prefetch_sa`.)
         while lo < hi {
+            self.prefetch_bsearch(lo, hi);
             let mid = lo + (hi - lo) / 2;
             if go_right(mid) {
                 lo = mid + 1;

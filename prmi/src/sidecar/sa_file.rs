@@ -359,6 +359,44 @@ impl SaFileReader {
         unpack_position(bytes)
     }
 
+    /// Issue a software prefetch hint for SA entry `i` into L1. Advisory and
+    /// side-effect-free: an out-of-range `i` is ignored, and on architectures
+    /// without a prefetch intrinsic it compiles to nothing. The 5-byte position
+    /// and (mode 2/3) 8-byte key share one entry — a single cache line — so one
+    /// prefetch warms both. Used by the binary-search probe loops to overlap the
+    /// next cold DRAM read with the current keyed compare; it never changes a
+    /// search result, only its latency.
+    #[inline(always)]
+    pub fn prefetch(&self, i: u64) {
+        if i >= self.num_entries {
+            return;
+        }
+        let off = SA_FILE_HEADER_BYTES + (i as usize) * self.bytes_per_entry;
+        // SAFETY: `i < num_entries` and the header validation checked the exact
+        // mapped length, so `off` (the entry start) is within `[0, data_len)`.
+        let addr = unsafe { self.data_ptr.add(off) };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `_mm_prefetch` is a pure hint — it touches no memory
+        // architecturally, never faults, and has no memory-safety effects.
+        unsafe {
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                addr as *const i8,
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: `prfm` is a hint instruction; it never faults and has no
+        // memory-safety effects.
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{0}]",
+                in(reg) addr,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = addr;
+    }
+
     /// Return the stored 32-mer key at SA index `i`, if this file was built in
     /// mode 2 or mode 3 (both of which store the key). Returns `None` for mode 1
     /// and suffix-key-cache mode (where keys are absent or stored separately).
