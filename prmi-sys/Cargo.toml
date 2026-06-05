@@ -17,6 +17,13 @@ documentation = "https://docs.rs/prmi-sys"
 name = "prmi_sys"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Forward prmi's thread-local SA-probe counter through the C ABI
+# (prmi_probe_count_{enabled,reset,get}). OFF by default — the production hot
+# path carries no counter. Build with `--features spectrum-probe-count` for
+# in-situ `--seeding-only` instrumentation runs.
+spectrum-probe-count = ["prmi/spectrum-probe-count"]
+
 [dependencies]
 prmi = { path = "../prmi", version = "0.1.0" }
 libc.workspace = true

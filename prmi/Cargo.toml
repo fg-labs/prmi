@@ -69,3 +69,11 @@ harness = false
 [[bench]]
 name = "spectrum_bench"
 harness = false
+
+[[bench]]
+name = "mem_search_bench"
+harness = false
+
+[[bench]]
+name = "primitives_bench"
+harness = false

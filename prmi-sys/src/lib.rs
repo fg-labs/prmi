@@ -241,6 +241,56 @@ pub unsafe extern "C" fn prmi_isa_at(
     0
 }
 
+/// Whether SA-probe counting is compiled in: `1` if `prmi` was built with the
+/// `spectrum-probe-count` feature (so `prmi_probe_count_get` returns meaningful
+/// numbers), `0` otherwise. Let a consumer distinguish "zero probes" from
+/// "counting disabled" before trusting `prmi_probe_count_get`.
+///
+/// Probe counting is OFF in normal release builds (the production hot path
+/// carries no counter); enable it for `--seeding-only` instrumentation runs by
+/// building `prmi-sys` with `--features spectrum-probe-count`.
+#[no_mangle]
+pub extern "C" fn prmi_probe_count_enabled() -> c_int {
+    #[cfg(feature = "spectrum-probe-count")]
+    {
+        1
+    }
+    #[cfg(not(feature = "spectrum-probe-count"))]
+    {
+        0
+    }
+}
+
+/// Reset the CALLING THREAD's SA-probe counter to zero. The counter is thread-
+/// local, so each worker thread instruments only its own search calls — reset
+/// before a call (or batch) and read with `prmi_probe_count_get` after, on the
+/// same thread. No-op unless built with `spectrum-probe-count`.
+#[no_mangle]
+pub extern "C" fn prmi_probe_count_reset() {
+    #[cfg(feature = "spectrum-probe-count")]
+    {
+        prmi::index::spectrum::probe_count::reset();
+    }
+}
+
+/// Read the CALLING THREAD's SA-probe count (cold `sa_position_for` reads) since
+/// the last `prmi_probe_count_reset`. One probe == one suffix-array position read
+/// — the dominant cost of `prmi_mem_search`, `prmi_mem_search_backward`, and the
+/// spectrum calls — so this is the in-situ confirmation of the per-call probe
+/// reduction the `est_hint` (`prmi_isa_at`) launch buys. Returns `0` when built
+/// without `spectrum-probe-count` (check `prmi_probe_count_enabled`).
+#[no_mangle]
+pub extern "C" fn prmi_probe_count_get() -> u64 {
+    #[cfg(feature = "spectrum-probe-count")]
+    {
+        prmi::index::spectrum::probe_count::get()
+    }
+    #[cfg(not(feature = "spectrum-probe-count"))]
+    {
+        0
+    }
+}
+
 /// Global max prediction error stored in the sidecar.
 ///
 /// # Safety
