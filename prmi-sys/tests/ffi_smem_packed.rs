@@ -125,8 +125,11 @@ fn smem_range_packed_no_match_returns_one() {
     let pac_packed = pack_bases(&pac_unpacked);
     let pac_num_bases: u64 = 256;
 
-    // Query full of T (3) — should not appear in an all-A reference.
-    let query: Vec<u8> = vec![3u8; 32];
+    // Query full of C (1). On the 2× SA the reference is [A×256 || T×256] (RC of
+    // all-A is all-T), so an all-T query WOULD match the reverse-complement half —
+    // only a base absent from BOTH strands is a true no-match. C (and G) appear on
+    // neither the forward (A) nor the RC (T) strand.
+    let query: Vec<u8> = vec![1u8; 32];
 
     let mut k = 0u64;
     let mut l = 0u64;

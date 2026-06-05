@@ -7,8 +7,8 @@ use prmi::Error;
 fn sample() -> Meta {
     Meta {
         prmi: Prmi {
-            magic: "PRMIv1".into(),
-            format_version: 1,
+            magic: "PRMIv2".into(),
+            format_version: 2,
             trainer_version: format!("prmi={}", env!("CARGO_PKG_VERSION")),
             created_utc: "2026-05-20T15:00:00Z".into(),
         },
@@ -23,16 +23,22 @@ fn sample() -> Meta {
             encoding: "packed_lo8_hi32".into(),
             mode: "1".into(),
             skc_cache_size: None,
-            strand: "forward_only".into(),
+            strand: "forward_rc_2x".into(),
             masked_n_runs: false,
             masked_homopolymers: None,
             masked_bed: None,
+            l_pac: None,
+            stored_keys: None,
+            pac_sha256: None,
         },
         rmi: RmiSpec {
             spec: "pwl,linear,linear_spline".into(),
             l2_leaf_count: 256,
             bit_shift: 56,
             max_error_bound: 12345,
+            err_p50: None,
+            err_p90: None,
+            err_p99: None,
         },
         priors: Priors {
             kind: "uniform".into(),
@@ -56,16 +62,16 @@ fn roundtrip_toml() {
 #[test]
 fn reject_bad_magic() {
     let mut m = sample();
-    m.prmi.magic = "RMIv2".into();
+    m.prmi.magic = "RMIv3".into();
     let s = m.to_toml().unwrap();
     let err = Meta::from_toml_str(&s).unwrap_err();
-    assert!(format!("{err}").contains("PRMIv1"));
+    assert!(format!("{err}").contains("PRMIv2"));
 }
 
 #[test]
 fn reject_future_version() {
     let mut m = sample();
-    m.prmi.format_version = 2;
+    m.prmi.format_version = 3;
     let s = m.to_toml().unwrap();
     let err = Meta::from_toml_str(&s).unwrap_err();
     assert!(format!("{err}").contains("version"));
@@ -145,74 +151,6 @@ fn mode2_roundtrips() {
 }
 
 #[test]
-fn mode3_roundtrips() {
-    let mut m = sample();
-    m.sa.mode = "3".into();
-    m.sa.bytes_per_entry = 21;
-    m.sa.encoding = "packed_lo8_hi32_key64_isa64".into();
-    let s = m.to_toml().unwrap();
-    let parsed = Meta::from_toml_str(&s).unwrap();
-    assert_eq!(parsed.sa.mode, "3");
-    assert_eq!(parsed.sa.bytes_per_entry, 21);
-}
-
-#[test]
-fn suffix_key_cache_mode_roundtrips() {
-    let mut m = sample();
-    m.sa.mode = "suffix_key_cache".into();
-    m.sa.bytes_per_entry = 5; // same as mode 1 in the .sa file
-    m.sa.encoding = "packed_lo8_hi32".into();
-    m.sa.skc_cache_size = Some(1_000_000);
-    let s = m.to_toml().unwrap();
-    let parsed = Meta::from_toml_str(&s).unwrap();
-    assert_eq!(parsed.sa.mode, "suffix_key_cache");
-    assert_eq!(parsed.sa.skc_cache_size, Some(1_000_000));
-}
-
-#[test]
-fn reject_suffix_key_cache_without_cache_size() {
-    // mode = "suffix_key_cache" requires skc_cache_size to be set.
-    let mut m = sample();
-    m.sa.mode = "suffix_key_cache".into();
-    m.sa.skc_cache_size = None;
-    let s = m.to_toml().unwrap();
-    let err = Meta::from_toml_str(&s).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("skc_cache_size"),
-        "expected 'skc_cache_size' in: {msg}"
-    );
-    assert!(matches!(err, Error::SizeMismatch { .. }));
-}
-
-#[test]
-fn reject_cache_size_for_non_skc_mode() {
-    // skc_cache_size must be None for modes other than suffix_key_cache.
-    let mut m = sample();
-    // sample() is mode "1"; attach a stray cache size.
-    m.sa.skc_cache_size = Some(1_000);
-    let s = m.to_toml().unwrap();
-    let err = Meta::from_toml_str(&s).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("skc_cache_size"),
-        "expected 'skc_cache_size' in: {msg}"
-    );
-    assert!(matches!(err, Error::SizeMismatch { .. }));
-}
-
-#[test]
-fn reject_zero_cache_size_for_skc_mode() {
-    // A zero-size suffix-key cache is meaningless and should be rejected.
-    let mut m = sample();
-    m.sa.mode = "suffix_key_cache".into();
-    m.sa.skc_cache_size = Some(0);
-    let s = m.to_toml().unwrap();
-    let err = Meta::from_toml_str(&s).unwrap_err();
-    assert!(matches!(err, Error::SizeMismatch { .. }));
-}
-
-#[test]
 fn unknown_mode_is_format_too_new() {
     let mut m = sample();
     m.sa.mode = "future_mode".into();
@@ -281,8 +219,8 @@ fn reject_unknown_field_in_rmi_section() {
 fn reject_unknown_field_in_prmi_section() {
     let toml = sample().to_toml().unwrap();
     let toml_with_extra = toml.replace(
-        "magic = \"PRMIv1\"",
-        "magic = \"PRMIv1\"\nsome_future_field = \"v0.2\"",
+        "magic = \"PRMIv2\"",
+        "magic = \"PRMIv2\"\nsome_future_field = \"v0.2\"",
     );
     let err = Meta::from_toml_str(&toml_with_extra).unwrap_err();
     assert!(

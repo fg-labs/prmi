@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
-//! Trainer: builds a prmi sidecar from a reference FASTA.
+//! Trainer: builds a prmi sidecar from a reference FASTA or bwa `.pac`.
 
 pub mod config;
 pub mod keys;
@@ -15,22 +15,28 @@ pub mod verify;
 use crate::encoding::{tokenize_32mer, BASE_T, KMER_LEN};
 use crate::error::{Error, Result};
 use crate::fasta::fasta_to_2bit_with_sha256;
-use crate::sa::build_suffix_array;
 use crate::sidecar::magic::{FORMAT_VERSION, META_MAGIC};
 use crate::sidecar::meta::{Meta, Priors, Prmi, Ref, RmiSpec, Sa};
 use crate::sidecar::model_file::{ModelFileWriter, ModelLayer};
-use crate::sidecar::sa_file::{SaFileWriter, BPE_MODE2, BPE_MODE3};
-use crate::sidecar::skc_file::SkcFileWriter;
+use crate::sidecar::sa_file::{SaFileWriter, BPE_MODE2};
 use crate::sidecar::SidecarPaths;
 use crate::train::config::{MemoryMode, TrainerConfig};
 use crate::train::mask::MaskConfig;
 use crate::train::prior::Prior;
 use crate::train::trainer::default_l2_leaf_count;
 use crate::train::training_set::masked_training_set;
-use crate::train::verify::compute_max_error_bound;
+use crate::train::verify::{compute_error_distribution, compute_max_error_bound};
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+/// Where the forward reference bases come from.
+pub enum BuildSource<'a> {
+    /// bwa's forward `.pac` — byte-identical to the FMI (N already substituted).
+    Pac(&'a Path),
+    /// A reference FASTA — NOT byte-identical to a bwa FMI (prmi maps N→A).
+    Fasta(&'a Path),
+}
 
 /// Build a complete sidecar (`.meta`, `.sa`, `.l1`, `.l2`) from a reference FASTA.
 ///
@@ -46,22 +52,18 @@ use time::OffsetDateTime;
 /// always contains all genome-region entries regardless of masking; only the
 /// training set is filtered. See [`MaskConfig`] for details.
 ///
-/// `threads` is passed to [`crate::sa::build_suffix_array`]: `0` = auto
-/// (OpenMP default, typically the CPU count), `1` = single-threaded, `N > 1` =
-/// exactly N threads.
+/// `threads` is passed to [`crate::sa::build_gsa`]: `0` = auto (OpenMP default,
+/// typically the CPU count), `1` = single-threaded, `N > 1` = exactly N threads.
 ///
-/// `trainer_config` is optional. When `None`, the default [`TrainerConfig`] is
-/// used (including `Prior::Uniform`). Pass a custom config with
-/// `TrainerConfig { prior: Prior::Bed { .. }, .. }` for target-aware training.
+/// ## 2× (forward + reverse-complement) suffix array
 ///
-/// ## Sentinel padding
-///
-/// To ensure every SA entry covers a full `KMER_LEN`-mer, the reference is
-/// extended with `KMER_LEN - 1` T-bases before suffix-array construction.
-/// SA entries pointing into the padding region are then excluded from the
-/// training set and the `.sa` file, matching BWA-MEME's indexer behaviour.
-/// The SHA-256 hash and `size_bytes` in `.meta` still reflect the original
-/// (unpadded) FASTA, not the extended sequence.
+/// The SA is the generalized suffix array of the doubled text
+/// `[Fwd || RC] + sentinel` in the `b+1` alphabet (see
+/// [`crate::sa::build_doubled_2x_text`]), byte-identical in order to the FMI.
+/// All `2 * l_pac + 1` entries are retained on disk — including the RC half and
+/// the sentinel/empty-suffix row — so SA positions are *doubled coordinates* in
+/// `[0, 2 * l_pac]`. The SHA-256 hash and `size_bytes` in `.meta` reflect the
+/// original (forward-only) FASTA.
 pub fn build_sidecar(
     ref_fa: &Path,
     prefix: &Path,
@@ -69,7 +71,14 @@ pub fn build_sidecar(
     mask: MaskConfig,
     threads: usize,
 ) -> Result<()> {
-    build_sidecar_with_config(ref_fa, prefix, l2_leaf_count, mask, threads, None)
+    build_sidecar_core(
+        BuildSource::Fasta(ref_fa),
+        prefix,
+        l2_leaf_count,
+        mask,
+        threads,
+        None,
+    )
 }
 
 /// Like [`build_sidecar`] but accepts an optional [`TrainerConfig`] for
@@ -82,37 +91,131 @@ pub fn build_sidecar_with_config(
     threads: usize,
     trainer_config: Option<TrainerConfig>,
 ) -> Result<()> {
+    build_sidecar_core(
+        BuildSource::Fasta(ref_fa),
+        prefix,
+        l2_leaf_count,
+        mask,
+        threads,
+        trainer_config,
+    )
+}
+
+/// Build a sidecar from bwa's forward `.pac` (byte-identical path).
+///
+/// The `.pac` carries bwa's N→random substitution, so the SA built here is
+/// byte-identical in rank order to the bwa FM-index. `pac_sha256` in the
+/// resulting `.meta` records the SHA-256 of the `.pac` file for provenance.
+pub fn build_sidecar_from_pac(
+    pac: &Path,
+    prefix: &Path,
+    l2_leaf_count: Option<u64>,
+    mask: MaskConfig,
+    threads: usize,
+) -> Result<()> {
+    build_sidecar_from_pac_with_config(pac, prefix, l2_leaf_count, mask, threads, None)
+}
+
+/// Build a sidecar from bwa's forward `.pac` (byte-identical path), with an
+/// optional [`TrainerConfig`] (e.g. to select `--store-keys` / Mode2).
+pub fn build_sidecar_from_pac_with_config(
+    pac: &Path,
+    prefix: &Path,
+    l2_leaf_count: Option<u64>,
+    mask: MaskConfig,
+    threads: usize,
+    trainer_config: Option<TrainerConfig>,
+) -> Result<()> {
+    build_sidecar_core(
+        BuildSource::Pac(pac),
+        prefix,
+        l2_leaf_count,
+        mask,
+        threads,
+        trainer_config,
+    )
+}
+
+/// Core sidecar builder. All public entry points delegate here.
+fn build_sidecar_core(
+    source: BuildSource<'_>,
+    prefix: &Path,
+    l2_leaf_count: Option<u64>,
+    mask: MaskConfig,
+    threads: usize,
+    trainer_config: Option<TrainerConfig>,
+) -> Result<()> {
     let config = trainer_config.unwrap_or_default();
 
-    let (mut bases, mut n_positions, _fa_stats, sha256_hex, fa_size_bytes) =
-        fasta_to_2bit_with_sha256(ref_fa)?;
+    let (bases, n_positions, ref_path, ref_sha256, ref_size_bytes, pac_sha256) = match source {
+        BuildSource::Fasta(p) => {
+            log::warn!(
+                "building sidecar from FASTA ({}): result is NOT byte-identical to a bwa \
+                 FM-index (prmi maps N→A; bwa substitutes N→random at pack time). \
+                 For byte-identical builds use --pac / BuildSource::Pac.",
+                p.display()
+            );
+            let (bases, n_positions, _stats, sha, size) = fasta_to_2bit_with_sha256(p)?;
+            (bases, n_positions, p.display().to_string(), sha, size, None)
+        }
+        BuildSource::Pac(p) => {
+            let (bases, _l_pac) = crate::pac::read_bwa_pac_forward(p)?;
+            let psha = crate::pac::pac_sha256(p)?;
+            let n_positions = vec![false; bases.len()];
+            let ref_path = p.display().to_string();
+            let ref_sha256 = psha.clone();
+            let ref_size_bytes = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            (
+                bases,
+                n_positions,
+                ref_path,
+                ref_sha256,
+                ref_size_bytes,
+                Some(psha),
+            )
+        }
+    };
 
-    // Record the original genome length before padding.
+    // Forward (unpadded) genome length = l_pac.
     let genome_len = bases.len() as u64;
 
-    // Append KMER_LEN - 1 T-sentinel bases so that every position in the
-    // original genome has a full 32-mer available without wrapping.
-    bases.extend(std::iter::repeat_n(BASE_T, KMER_LEN - 1));
-    // Extend n_positions to match; sentinel bases are not N.
-    n_positions.extend(std::iter::repeat_n(false, KMER_LEN - 1));
-
-    // Build the SA over the padded sequence.
-    let full_sa = build_suffix_array(&bases, threads)?;
-
-    // Filter to only entries pointing into the original genome (positions
-    // 0..genome_len). The filtered slice is a subsequence of the sorted SA,
-    // so it is still non-decreasing in key space.
-    let sa: Vec<u64> = full_sa
-        .into_iter()
-        .filter(|&pos| pos < genome_len)
-        .collect();
+    // Build the 2× generalized suffix array over [Fwd||RC]+sentinel. No
+    // T-padding and no filtering: every entry is retained, including the
+    // sentinel/empty-suffix row, so SA order is byte-identical to the FMI.
+    let text = crate::sa::build_doubled_2x_text(&bases);
+    let sa = crate::sa::build_gsa(&text, threads)?;
 
     // Resolve the optional l2_leaf_count: use provided value or auto-scale.
     let l2_leaf_count = l2_leaf_count.unwrap_or_else(|| default_l2_leaf_count(sa.len()));
 
-    let ts = masked_training_set(&sa, &bases, &n_positions, &mask, &config.prior);
+    // The SA is in doubled coordinates over `text` (length 2*l_pac+1), so the
+    // training set must index bases/n_positions in those same coordinates. Build
+    // the 0..=3 base array from `text` (1..=4, sentinel 0 → T) and an N bitmap in
+    // doubled coordinates: the forward half carries the FASTA N flags, the RC
+    // half mirrors them (the RC of an ambiguous base is itself ambiguous — those
+    // RC suffixes must see the same `mask_n_runs` filtering as the forward half),
+    // and the sentinel row stays non-N.
+    let text_bases: Vec<u8> = text
+        .iter()
+        .map(|&v| crate::sa::text_value_to_base(v))
+        .collect();
+    let l_pac = bases.len();
+    let mut n_positions_2x = vec![false; text.len()];
+    // Forward half: positions 0..l_pac.
+    n_positions_2x[..l_pac].copy_from_slice(&n_positions);
+    // RC half: forward position i maps to doubled coordinate l_pac + (l_pac-1-i),
+    // matching `doubled_base_at`'s reverse-complement mapping.
+    for (i, &is_n) in n_positions.iter().enumerate() {
+        if is_n {
+            n_positions_2x[l_pac + (l_pac - 1 - i)] = true;
+        }
+    }
+
+    let ts = masked_training_set(&sa, &text_bases, &n_positions_2x, &mask, &config.prior);
     let model = crate::train::trainer::train_with_config(&ts, l2_leaf_count, &config)?;
     let max_err = compute_max_error_bound(&model, &ts);
+    let (p50, p90, p99, _dist_max) = compute_error_distribution(&model, &ts);
+    log::info!("prmi model error bound: max={max_err} p50={p50} p90={p90} p99={p99}");
 
     let paths = SidecarPaths::from_prefix(prefix);
 
@@ -131,51 +234,26 @@ pub fn build_sidecar_with_config(
             // Position + 32-mer key, 13 B/entry.
             let mut w = SaFileWriter::create_with_mode(&paths.sa, sa.len() as u64, BPE_MODE2)?;
             for &pos in &sa {
-                let key = key_for_position(pos, &bases);
+                let key = key_for_position_2x(pos, &text);
                 w.write_entry_with_key(pos, key)?;
             }
             w.finish()?;
         }
-        MemoryMode::Mode3 => {
-            // Position + key + ISA, 21 B/entry.
-            // Build the ISA in one pass: isa[sa[i]] = i.
-            let isa = build_isa(&sa)?;
-            let mut w = SaFileWriter::create_with_mode(&paths.sa, sa.len() as u64, BPE_MODE3)?;
-            for &pos in &sa {
-                let key = key_for_position(pos, &bases);
-                let isa_val = isa[pos as usize];
-                w.write_entry_with_key_isa(pos, key, isa_val)?;
-            }
-            w.finish()?;
-        }
-        MemoryMode::SuffixKeyCache { cache_size } => {
-            // .sa is mode-1 (position only, 5 B/entry).
-            // Keys for the top-N SA positions go into a companion `.skc` file.
-            let mut w = SaFileWriter::create(&paths.sa, sa.len() as u64)?;
-            for &pos in &sa {
-                w.write_position(pos)?;
-            }
-            w.finish()?;
+    }
 
-            // Build the suffix-key cache: cache the first `cache_size` SA
-            // entries (indices 0..cache_size). This is a placeholder selection
-            // policy until workload-aware cache content (e.g. driven by a
-            // `--prior-fastq-histogram` analysis) is implemented in a later
-            // release. In genomic 32-mer space the lex-smallest suffixes are
-            // typically dominated by all-A windows from N-runs and homopolymers
-            // — often masked or excluded — so this default produces a low cache
-            // hit rate in practice. Cache misses fall back to on-the-fly pac
-            // tokenization, so correctness is unaffected; only the speed-up
-            // from `suffix_key_cache` mode is muted until the selection policy
-            // is improved.
-            let n = (cache_size as usize).min(sa.len());
-            let mut skc_w = SkcFileWriter::create(&paths.skc, n as u64)?;
-            for (sa_idx, &pos) in sa.iter().enumerate().take(n) {
-                let key = key_for_position(pos, &bases);
-                skc_w.write_entry(sa_idx as u64, key)?;
-            }
-            skc_w.finish()?;
+    // .isa — inverse SA (ref2sa): isa[sa[i]] = i. Length N+1 = sa.len(), covering
+    // all doubled-coordinate positions including the sentinel at 2*l_pac.
+    {
+        let n = sa.len();
+        let mut isa = vec![0u64; n];
+        for (i, &pos) in sa.iter().enumerate() {
+            isa[pos as usize] = i as u64;
         }
+        let mut isa_w = crate::sidecar::isa_file::IsaFileWriter::create(&paths.isa, n as u64)?;
+        for &v in &isa {
+            isa_w.write_entry(v)?;
+        }
+        isa_w.finish()?;
     }
 
     // .l1 / .l2
@@ -201,11 +279,6 @@ pub fn build_sidecar_with_config(
     let (mode_str, skc_cache_size_meta) = match memory_mode {
         MemoryMode::Mode1 => ("1".to_string(), None),
         MemoryMode::Mode2 => ("2".to_string(), None),
-        MemoryMode::Mode3 => ("3".to_string(), None),
-        MemoryMode::SuffixKeyCache { cache_size } => (
-            "suffix_key_cache".to_string(),
-            Some(cache_size.min(sa.len() as u64)),
-        ),
     };
 
     let meta = Meta {
@@ -216,9 +289,9 @@ pub fn build_sidecar_with_config(
             created_utc,
         },
         ref_: Ref {
-            path: ref_fa.display().to_string(),
-            sha256: sha256_hex,
-            size_bytes: fa_size_bytes,
+            path: ref_path,
+            sha256: ref_sha256,
+            size_bytes: ref_size_bytes,
         },
         sa: Sa {
             num_entries: sa.len() as u64,
@@ -226,16 +299,22 @@ pub fn build_sidecar_with_config(
             encoding: memory_mode.encoding_name().to_string(),
             mode: mode_str,
             skc_cache_size: skc_cache_size_meta,
-            strand: "forward_only".into(),
+            strand: "forward_rc_2x".into(),
             masked_n_runs: mask.mask_n_runs,
             masked_homopolymers: mask.mask_homopolymers,
             masked_bed: masked_bed_path,
+            l_pac: Some(genome_len),
+            stored_keys: Some(memory_mode.bytes_per_entry() >= 13),
+            pac_sha256,
         },
         rmi: RmiSpec {
             spec,
             l2_leaf_count,
             bit_shift: model.bit_shift,
             max_error_bound: max_err,
+            err_p50: Some(p50),
+            err_p90: Some(p90),
+            err_p99: Some(p99),
         },
         priors,
     };
@@ -320,35 +399,29 @@ pub fn prior_from_cli(prior_bed: Option<&Path>, prior_bed_weight: f64) -> Result
     }
 }
 
-/// Compute the 32-mer key for a given SA position in the padded `bases` slice.
+/// Compute the 32-mer key for a doubled-coordinate SA position over the
+/// `b+1`-alphabet 2× text. Text values are 1..=4 (+ 0 sentinel); shift back to
+/// 0..=3 for tokenisation, mapping the sentinel `0` to a T (3) terminator (it
+/// only appears once, at the very end, past any real 32-mer window).
+#[inline]
+fn key_for_position_2x(pos: u64, text: &[u8]) -> u64 {
+    let start = pos as usize;
+    let avail = text.len().saturating_sub(start).min(KMER_LEN);
+    let mut window = [BASE_T; KMER_LEN];
+    for (slot, &v) in window.iter_mut().zip(&text[start..start + avail]) {
+        *slot = crate::sa::text_value_to_base(v);
+    }
+    tokenize_32mer(&window[..avail], avail)
+}
+
+/// Compute the 32-mer key for a forward-only SA position. Legacy helper from the v1 forward-only build path; retained pending removal in a later plan.
+#[allow(dead_code)]
 #[inline]
 fn key_for_position(pos: u64, bases: &[u8]) -> u64 {
     let start = pos as usize;
     let n = bases.len();
     let avail = n.saturating_sub(start).min(KMER_LEN);
     tokenize_32mer(&bases[start..start + avail], avail)
-}
-
-/// Build the inverse suffix array (ISA) from a suffix array.
-///
-/// For a suffix array `sa` of length `N`, the ISA satisfies:
-/// `isa[sa[i]] = i` for all `i` in `0..N`.
-///
-/// The `sa` slice must contain positions in `0..N` (no position may exceed
-/// `N - 1`). Returns `Err(Error::Internal)` if any position is out of range.
-fn build_isa(sa: &[u64]) -> Result<Vec<u64>> {
-    let n = sa.len();
-    let mut isa = vec![0u64; n];
-    for (i, &pos) in sa.iter().enumerate() {
-        let p = pos as usize;
-        if p >= n {
-            return Err(Error::Internal {
-                detail: format!("build_isa: SA position {pos} at index {i} exceeds sa.len()={n}"),
-            });
-        }
-        isa[p] = i as u64;
-    }
-    Ok(isa)
 }
 
 /// Resolve a [`Prior::FastqHistogram`] from raw CLI values.

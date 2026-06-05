@@ -23,13 +23,12 @@ fn pseudo_random_dna(len: usize) -> String {
 }
 
 #[test]
-fn writes_all_four_files_for_synthetic_fasta() {
+fn writes_all_sidecar_files_for_synthetic_fasta() {
     let dir = tempdir().unwrap();
     let fa = dir.path().join("test.fa");
-    // 4096 bp pseudo-random sequence. build_sidecar pads the genome with 31
-    // T-sentinel bases before suffix-array construction and then filters out
-    // SA entries for the padding region, so the trained index covers exactly
-    // genome_len = 4096 positions.
+    // 4096 bp pseudo-random sequence. build_sidecar builds the 2× (forward+RC)
+    // generalized suffix array over [Fwd||RC]+sentinel, so the trained index
+    // covers 2*genome_len + 1 = 8193 SA entries (the +1 is the sentinel row).
     let genome_len: usize = 4096;
     let mut content = String::from(">chr1\n");
     content.push_str(&pseudo_random_dna(genome_len));
@@ -44,17 +43,20 @@ fn writes_all_four_files_for_synthetic_fasta() {
     assert!(paths.sa.exists(), "sa missing");
     assert!(paths.l1.exists(), "l1 missing");
     assert!(paths.l2.exists(), "l2 missing");
+    // The v2 writer emits `.isa` (inverse SA) as part of the file-backed
+    // contract on the FASTA build path too, not just the `.pac` path.
+    assert!(paths.isa.exists(), "isa missing");
 
     // The .meta should round-trip parse cleanly.
     let meta = prmi::sidecar::meta::Meta::read_file(&paths.meta).unwrap();
     assert_eq!(meta.sa.bytes_per_entry, 5);
-    assert_eq!(meta.sa.strand, "forward_only");
+    assert_eq!(meta.sa.strand, "forward_rc_2x");
     assert_eq!(meta.priors.kind, "uniform");
     assert_eq!(meta.rmi.l2_leaf_count, 16);
     assert_eq!(meta.rmi.bit_shift, 60);
     assert!(meta.rmi.spec.starts_with("pwl4,linear,linear_spline"));
     assert_eq!(meta.ref_.sha256.len(), 64); // hex sha256
-    assert_eq!(meta.sa.num_entries, genome_len as u64); // padding excluded
+    assert_eq!(meta.sa.num_entries, 2 * genome_len as u64 + 1); // 2× SA + sentinel
 
     // Default (no mask) → all mask fields false/None.
     assert!(!meta.sa.masked_n_runs);

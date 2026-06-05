@@ -39,7 +39,7 @@ fn opens_a_freshly_built_sidecar() {
 
     let idx = LearnedIndex::open(&prefix).unwrap();
     assert!(idx.sa_num() > 0);
-    assert_eq!(idx.format_version(), "PRMIv1");
+    assert_eq!(idx.format_version(), "PRMIv2");
     assert_eq!(idx.bit_shift(), 60);
 
     // Smoke-test a lookup — just verify it doesn't panic and returns within SA bounds.
@@ -68,11 +68,12 @@ fn open_rejects_unknown_strand_as_format_too_new() {
     let prefix = dir.path().join("s.fa.prmi");
     build_sidecar(&fa, &prefix, Some(16), Default::default(), 1).unwrap();
 
-    // Corrupt the .meta to set sa.strand = "forward_reverse" (a hypothetical v0.2 value).
+    // Corrupt the .meta to set sa.strand = "forward_reverse" (a hypothetical
+    // future value not in KNOWN_STRANDS).
     let meta_path = SidecarPaths::from_prefix(&prefix).meta;
     let meta_str = std::fs::read_to_string(&meta_path).unwrap();
     let corrupted = meta_str.replace(
-        r#"strand = "forward_only""#,
+        r#"strand = "forward_rc_2x""#,
         r#"strand = "forward_reverse""#,
     );
     assert!(

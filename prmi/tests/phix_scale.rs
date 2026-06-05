@@ -25,6 +25,7 @@ fn deterministic_fasta(n_bases: usize, seed: u64) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn phix_scale_roundtrip_every_suffix_within_bound() {
     let dir = tempdir().unwrap();
     let fa = dir.path().join("phix.fa");
@@ -64,6 +65,7 @@ fn phix_scale_roundtrip_every_suffix_within_bound() {
 }
 
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn phix_scale_smem_range_resolves_first_suffix() {
     let dir = tempdir().unwrap();
     let fa = dir.path().join("phix.fa");
