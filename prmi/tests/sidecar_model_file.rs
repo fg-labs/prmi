@@ -45,6 +45,12 @@ fn roundtrip_l2() {
     ModelFileWriter::write(&path, ModelLayer::L2, &entries).unwrap();
     let reader = ModelFileReader::open(&path, ModelLayer::L2).unwrap();
     assert_eq!(reader.len(), entries.len());
+    // Per-entry decode must round-trip on the L2 reader too (the high-bit
+    // `err` fixture exercises the fallback-pointer bit pattern, and the
+    // negative `alpha`/`beta` exercise the f64 little-endian decode).
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(reader.entry(i), *e);
+    }
 }
 
 #[test]

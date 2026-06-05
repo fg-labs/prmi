@@ -96,6 +96,33 @@ fn roundtrip_mode3_position_key_and_isa() {
 }
 
 #[test]
+fn roundtrip_across_chunk_flush_boundary() {
+    // The writer accumulates entries in a 64 KiB chunk buffer and flushes per
+    // chunk. With 32 KiB mode-1 entries (5 B each = 160 KiB) the buffer flushes
+    // multiple times mid-stream, plus a partial final flush in finish(). Verify
+    // every position round-trips and the file size is exact.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big.sa");
+    let n: u64 = 32 * 1024;
+    {
+        let mut w = SaFileWriter::create(&path, n).unwrap();
+        for i in 0..n {
+            // Vary positions so a stuck/duplicated buffer would be caught.
+            w.write_position((i * 7) & 0xff_ffff_ffff).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    let file_size = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(file_size, (SA_FILE_HEADER_BYTES as u64) + n * 5);
+
+    let r = SaFileReader::open(&path).unwrap();
+    assert_eq!(r.num_entries(), n);
+    for i in 0..n {
+        assert_eq!(r.position(i), (i * 7) & 0xff_ffff_ffff, "mismatch at {i}");
+    }
+}
+
+#[test]
 fn reject_size_mismatch() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bad.sa");

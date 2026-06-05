@@ -97,6 +97,57 @@ fn ffi_2bit_basic() {
     assert_eq!(out, [3u8, 0, 1, 2, 3]); // TACGT
 }
 
+/// In-place (aliasing): out == in_ must reverse-complement correctly, since the
+/// contract allows the buffers to overlap.
+#[test]
+fn ffi_2bit_in_place_aliased() {
+    // Even length.
+    let mut buf = [0u8, 1, 2, 3, 0, 2]; // ACGTAG
+    let p = buf.as_mut_ptr();
+    let rc = unsafe { prmi_reverse_complement_2bit(p, buf.len() as i32, p) };
+    assert_eq!(rc, 0);
+    // reverse [A C G T A G] = [G A T G C A] = [2,0,3,2,1,0],
+    // complement (^3) = [C T A C G T] = [1, 3, 0, 1, 2, 3].
+    assert_eq!(buf, [1u8, 3, 0, 1, 2, 3]);
+
+    // Odd length exercises the middle-element branch.
+    let mut odd = [0u8, 1, 2]; // ACG
+    let p = odd.as_mut_ptr();
+    let rc = unsafe { prmi_reverse_complement_2bit(p, odd.len() as i32, p) };
+    assert_eq!(rc, 0);
+    // reverse [A C G] = [G C A], complement = [C G T] = [1, 2, 3].
+    assert_eq!(odd, [1u8, 2, 3]);
+}
+
+/// Partial overlap (`out != in_` but the ranges share some bytes) must still
+/// produce the reverse-complement of the ORIGINAL input. The allocation-free
+/// two-ended walk would clobber not-yet-read input here, so the implementation
+/// falls back to a scratch buffer — preserving the prior (always-allocating)
+/// behavior byte-for-byte. Regression test for that fallback.
+#[test]
+fn ffi_2bit_partial_overlap_matches_oracle() {
+    // One backing buffer: in_ = [0..n), out = [shift..shift+n). 0 < shift < n
+    // makes the two ranges partially overlap (and out != in_).
+    let n = 9usize;
+    let shift = 3usize;
+    let original: Vec<u8> = (0..n).map(|i| ((i * 5 + 1) & 0x3) as u8).collect();
+    // Oracle: reverse the bases, then complement each (2-bit value ^ 0x3).
+    let expected: Vec<u8> = original.iter().rev().map(|&b| (b & 0x3) ^ 0x3).collect();
+
+    let mut buf = vec![0u8; shift + n];
+    buf[..n].copy_from_slice(&original);
+    let base = buf.as_mut_ptr();
+    let in_ptr = base as *const u8;
+    let out_ptr = unsafe { base.add(shift) };
+    let rc = unsafe { prmi_reverse_complement_2bit(in_ptr, n as i32, out_ptr) };
+    assert_eq!(rc, 0);
+    assert_eq!(
+        &buf[shift..shift + n],
+        expected.as_slice(),
+        "partial-overlap revcomp must match the oracle on the original input"
+    );
+}
+
 /// Empty slice: len=0 succeeds and writes nothing.
 #[test]
 fn ffi_2bit_zero_len() {

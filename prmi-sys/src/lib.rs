@@ -383,6 +383,40 @@ pub struct prmi_smem_step_t {
     pub match_len: u64,
 }
 
+/// `prmi_smem_step_t` and `prmi::index::spectrum::SmemStep` are both `#[repr(C)]`
+/// with the same three `u64` fields in the same order, so an output buffer of
+/// one can be filled in place as a slice of the other (used by the `*_fill`
+/// paths below to avoid an intermediate `Vec`). This assertion guards
+/// size/alignment; the field order is asserted by inspection and the `#[repr(C)]`
+/// on both types (see `SmemStep`'s doc comment).
+const _: () = {
+    assert!(
+        core::mem::size_of::<prmi_smem_step_t>()
+            == core::mem::size_of::<prmi::index::spectrum::SmemStep>()
+    );
+    assert!(
+        core::mem::align_of::<prmi_smem_step_t>()
+            == core::mem::align_of::<prmi::index::spectrum::SmemStep>()
+    );
+};
+
+/// Reinterpret a `prmi_smem_step_t` output buffer as a `SmemStep` slice so the
+/// search core can fill it directly. Sound by the layout equivalence asserted
+/// above.
+///
+/// # Safety
+/// `out_steps` must be non-null and point to at least `len` writable
+/// `prmi_smem_step_t` slots.
+#[inline]
+unsafe fn out_steps_as_smemstep<'a>(
+    out_steps: *mut prmi_smem_step_t,
+    len: usize,
+) -> &'a mut [prmi::index::spectrum::SmemStep] {
+    unsafe {
+        std::slice::from_raw_parts_mut(out_steps as *mut prmi::index::spectrum::SmemStep, len)
+    }
+}
+
 /// Forward spectrum from a pivot: writes the breakpoint trace (ascending match_len,
 /// up to the maximal forward match) into the caller-allocated `out_steps`
 /// (capacity `max_steps`), and the count to `*out_nsteps`. `nsteps <= query_len`,
@@ -392,9 +426,10 @@ pub struct prmi_smem_step_t {
 /// packed form (4 bases/byte); `pac_num_bases` = l_pac.
 ///
 /// Returns 0 on success (out_nsteps may be 0 = no match), negative on error:
-///   -1 null handle, -2 null/invalid arg, query_len<=0, or pac_num_bases too large
-///      for this platform, -3 internal/panic,
-///   -4 max_steps < produced nsteps (buffer too small; *out_nsteps set to needed).
+///   -1 null handle, -2 null/invalid arg, query_len<=0, pac_num_bases too large
+///      for this platform, or max_steps beyond usize range, -3 internal/panic,
+///   -4 max_steps < produced nsteps (buffer too small; *out_nsteps set to needed;
+///      the first max_steps entries are written — re-run with a larger buffer).
 ///
 /// # Safety
 /// All pointers valid; `query` has `query_len` bytes; `pac` has
@@ -438,30 +473,34 @@ pub unsafe extern "C" fn prmi_forward_spectrum(
         num_bases: pac_num_bases,
     };
 
+    // Fill the caller's buffer directly (no intermediate Vec). `_fill` returns
+    // the TOTAL step count even when it exceeds the buffer, so overflow is
+    // detected without allocating. Guard the u64→usize narrowing so a buffer
+    // length past `usize::MAX` (32-bit targets) can't silently truncate `out`.
+    let max_steps_usize = match usize::try_from(max_steps) {
+        Ok(n) => n,
+        Err(_) => {
+            set_last_error("prmi_forward_spectrum: max_steps exceeds usize range");
+            return -2;
+        }
+    };
+    let out = unsafe { out_steps_as_smemstep(out_steps, max_steps_usize) };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // `_auto` transparently uses the loaded `.kmt` table when present
         // (byte-identical output), else the full search.
-        h.idx.forward_spectrum_auto(q, pac_slice, enc)
+        h.idx.forward_spectrum_auto_fill(q, pac_slice, enc, out)
     }));
-    let steps = match result {
-        Ok(s) => s,
+    let nsteps = match result {
+        Ok(n) => n,
         Err(_) => {
             set_last_error("prmi_forward_spectrum: internal panic");
             return -3;
         }
     };
-    unsafe { *out_nsteps = steps.len() as u64 };
-    if steps.len() as u64 > max_steps {
+    unsafe { *out_nsteps = nsteps as u64 };
+    if nsteps as u64 > max_steps {
         set_last_error("prmi_forward_spectrum: max_steps too small");
         return -4;
-    }
-    let out = unsafe { std::slice::from_raw_parts_mut(out_steps, steps.len()) };
-    for (slot, s) in out.iter_mut().zip(steps.iter()) {
-        *slot = prmi_smem_step_t {
-            sa_start: s.sa_start,
-            occ_count: s.occ_count,
-            match_len: s.match_len,
-        };
     }
     0
 }
@@ -477,10 +516,11 @@ pub unsafe extern "C" fn prmi_forward_spectrum(
 ///
 /// Returns 0 on success (out_nsteps may be 0 = no left extension exists),
 /// negative on error:
-///   -1 null handle/pointer, -2 invalid read_len (<=0)/pivot (<0) or pac_num_bases
-///      too large for this platform,
+///   -1 null handle/pointer, -2 invalid read_len (<=0)/pivot (<0), pac_num_bases
+///      too large for this platform, or max_steps beyond usize range,
 ///   -3 internal/panic (including a contiguity-guard failure on a corrupt index),
-///   -4 max_steps too small (*out_nsteps set to the needed count).
+///   -4 max_steps too small (*out_nsteps set to the needed count; the first
+///      max_steps entries are written — re-run with a larger buffer).
 ///
 /// # Safety
 /// All pointers valid; `read` has `read_len` bytes; `pac` has
@@ -529,29 +569,33 @@ pub unsafe extern "C" fn prmi_backward_spectrum(
     };
     let pivot_us = pivot as usize;
 
+    // Fill the caller's buffer directly (no intermediate Vec). Guard the
+    // u64→usize narrowing so a buffer length past `usize::MAX` (32-bit targets)
+    // can't silently truncate `out`.
+    let max_steps_usize = match usize::try_from(max_steps) {
+        Ok(n) => n,
+        Err(_) => {
+            set_last_error("prmi_backward_spectrum: max_steps exceeds usize range");
+            return -2;
+        }
+    };
+    let out = unsafe { out_steps_as_smemstep(out_steps, max_steps_usize) };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.idx
-            .backward_spectrum(sa_start, occ_count, anchor_len, r, pivot_us, pac_slice, enc)
+        h.idx.backward_spectrum_fill(
+            sa_start, occ_count, anchor_len, r, pivot_us, pac_slice, enc, out,
+        )
     }));
-    let steps = match result {
-        Ok(s) => s,
+    let nsteps = match result {
+        Ok(n) => n,
         Err(_) => {
             set_last_error("prmi_backward_spectrum: internal panic (possible corrupt SA/ISA)");
             return -3;
         }
     };
-    unsafe { *out_nsteps = steps.len() as u64 };
-    if steps.len() as u64 > max_steps {
+    unsafe { *out_nsteps = nsteps as u64 };
+    if nsteps as u64 > max_steps {
         set_last_error("prmi_backward_spectrum: max_steps too small");
         return -4;
-    }
-    let out = unsafe { std::slice::from_raw_parts_mut(out_steps, steps.len()) };
-    for (slot, s) in out.iter_mut().zip(steps.iter()) {
-        *slot = prmi_smem_step_t {
-            sa_start: s.sa_start,
-            occ_count: s.occ_count,
-            match_len: s.match_len,
-        };
     }
     0
 }
@@ -717,22 +761,16 @@ pub unsafe extern "C" fn prmi_forward_spectrum_batch(
                     t.query_len as usize,
                 )
             };
-            let steps = h.idx.forward_spectrum_auto(q, pac_slice, enc);
-            out_ns[i] = steps.len() as u64;
-            if steps.len() as u64 > u64::from(t.max_steps) {
-                overflow = true;
-                // Leave this task's region unwritten; caller re-runs with a larger buffer.
-                continue;
-            }
+            // Fill this task's arena region directly; `_fill` returns the total
+            // count and writes at most `max_steps` steps (overflow → -4, caller
+            // retries with a larger buffer).
             let dst = unsafe {
-                std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
+                out_steps_as_smemstep(steps_arena.add(t.steps_off as usize), t.max_steps as usize)
             };
-            for (slot, s) in dst.iter_mut().zip(steps.iter()) {
-                *slot = prmi_smem_step_t {
-                    sa_start: s.sa_start,
-                    occ_count: s.occ_count,
-                    match_len: s.match_len,
-                };
+            let nsteps = h.idx.forward_spectrum_auto_fill(q, pac_slice, enc, dst);
+            out_ns[i] = nsteps as u64;
+            if nsteps as u64 > u64::from(t.max_steps) {
+                overflow = true;
             }
         }
     }));
@@ -745,6 +783,39 @@ pub unsafe extern "C" fn prmi_forward_spectrum_batch(
         return -4;
     }
     0
+}
+
+/// Write one backward task's steps into the shared `steps_arena`, setting
+/// `*out_ns_i` to the step count. Returns `true` if the count exceeded
+/// `t.max_steps` (the task's arena region is then left unwritten for the caller
+/// to retry with a larger buffer). Used by the lockstep arm, whose
+/// `backward_spectrum_lockstep` returns owned step vectors; the serial arm fills
+/// the arena directly via `backward_spectrum_fill` instead.
+///
+/// # Safety
+/// `steps_arena` must have at least `t.steps_off + steps.len()` slots.
+#[inline]
+unsafe fn write_bwd_task_steps(
+    steps_arena: *mut prmi_smem_step_t,
+    t: &prmi_bwd_task_t,
+    steps: &[prmi::index::spectrum::SmemStep],
+    out_ns_i: &mut u64,
+) -> bool {
+    *out_ns_i = steps.len() as u64;
+    if steps.len() as u64 > u64::from(t.max_steps) {
+        return true;
+    }
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
+    };
+    for (slot, s) in dst.iter_mut().zip(steps.iter()) {
+        *slot = prmi_smem_step_t {
+            sa_start: s.sa_start,
+            occ_count: s.occ_count,
+            match_len: s.match_len,
+        };
+    }
+    false
 }
 
 /// Shared impl for the two backward-batch entry points. `lockstep == false` runs
@@ -847,7 +918,11 @@ unsafe fn backward_spectrum_batch_impl(
     // guard in backward_spectrum) → -3.
     let mut overflow = false;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let all_steps: Vec<Vec<prmi::index::spectrum::SmemStep>> = if lockstep {
+        if lockstep {
+            // Lockstep genuinely needs all tasks resident at once:
+            // `backward_spectrum_lockstep` drives them together for memory-level
+            // parallelism and returns one step vector per task. Write each result
+            // through after the batched call.
             let bwd_tasks: Vec<_> = tasks_s
                 .iter()
                 .map(|t| {
@@ -866,46 +941,43 @@ unsafe fn backward_spectrum_batch_impl(
                     }
                 })
                 .collect();
-            h.idx.backward_spectrum_lockstep(&bwd_tasks, pac_slice, enc)
-        } else {
-            // Correctness-first serial loop: one `backward_spectrum` per task.
-            tasks_s
-                .iter()
-                .map(|t| {
-                    let read = unsafe {
-                        std::slice::from_raw_parts(
-                            reads_arena.add(t.read_off as usize),
-                            t.read_len as usize,
-                        )
-                    };
-                    h.idx.backward_spectrum(
-                        t.sa_start,
-                        t.occ_count,
-                        t.anchor_len,
-                        read,
-                        t.pivot as usize,
-                        pac_slice,
-                        enc,
-                    )
-                })
-                .collect()
-        };
-        for (i, steps) in all_steps.iter().enumerate() {
-            let t = &tasks_s[i];
-            out_ns[i] = steps.len() as u64;
-            if steps.len() as u64 > u64::from(t.max_steps) {
-                overflow = true;
-                continue;
+            let all_steps = h.idx.backward_spectrum_lockstep(&bwd_tasks, pac_slice, enc);
+            for (i, steps) in all_steps.iter().enumerate() {
+                if unsafe { write_bwd_task_steps(steps_arena, &tasks_s[i], steps, &mut out_ns[i]) }
+                {
+                    overflow = true;
+                }
             }
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
-            };
-            for (slot, s) in dst.iter_mut().zip(steps.iter()) {
-                *slot = prmi_smem_step_t {
-                    sa_start: s.sa_start,
-                    occ_count: s.occ_count,
-                    match_len: s.match_len,
+        } else {
+            // Serial: fill each task's arena region directly (mirroring
+            // prmi_forward_spectrum_batch), with no per-task or whole-batch Vec.
+            for (i, t) in tasks_s.iter().enumerate() {
+                let read = unsafe {
+                    std::slice::from_raw_parts(
+                        reads_arena.add(t.read_off as usize),
+                        t.read_len as usize,
+                    )
                 };
+                let dst = unsafe {
+                    out_steps_as_smemstep(
+                        steps_arena.add(t.steps_off as usize),
+                        t.max_steps as usize,
+                    )
+                };
+                let nsteps = h.idx.backward_spectrum_fill(
+                    t.sa_start,
+                    t.occ_count,
+                    t.anchor_len,
+                    read,
+                    t.pivot as usize,
+                    pac_slice,
+                    enc,
+                    dst,
+                );
+                out_ns[i] = nsteps as u64;
+                if nsteps as u64 > u64::from(t.max_steps) {
+                    overflow = true;
+                }
             }
         }
     }));
@@ -1239,7 +1311,13 @@ pub unsafe extern "C" fn prmi_reverse_complement_key(
 
 /// Reverse-complement a 2-bit unpacked base array (1 base per byte,
 /// values 0..=3; A=0, C=1, G=2, T=3). Writes `len` bytes to `out`.
-/// `out` and `in_` may overlap.
+///
+/// `in_` and `out` may overlap arbitrarily. The common cases — `out == in_` (an
+/// in-place transform) and fully disjoint buffers — take an allocation-free
+/// two-ended walk, reading each pair before writing it so full alias is correct.
+/// The rare PARTIAL-overlap case (the buffers share some but not all bytes, where
+/// the two-ended walk would clobber not-yet-read input) falls back to a scratch
+/// buffer, preserving the byte-identical result of the prior implementation.
 ///
 /// Returns 0 on success; -1 if `in_` or `out` is null, or `len < 0`.
 ///
@@ -1258,9 +1336,50 @@ pub unsafe extern "C" fn prmi_reverse_complement_2bit(
         return -1;
     }
     let n = len as usize;
-    // Handle aliasing: build a Vec then write back (allocation-cheap and avoids overlap UB).
-    let input = unsafe { std::slice::from_raw_parts(in_, n) };
-    let rc = prmi::encoding::reverse_complement_2bit(input);
-    unsafe { std::ptr::copy_nonoverlapping(rc.as_ptr(), out, n) };
+    if n == 0 {
+        return 0;
+    }
+    // Partial overlap (buffers share some but not all bytes, and `out != in_`)
+    // is the only case the in-place two-ended walk cannot handle: writing one end
+    // would clobber input the opposite end has not read yet. Detect it by raw
+    // pointer ranges and fall back to a scratch buffer, matching the prior
+    // (always-allocating) implementation byte-for-byte. Full alias (`out == in_`)
+    // and disjoint buffers take the allocation-free fast path below.
+    let in_start = in_ as usize;
+    let out_start = out as usize;
+    let in_end = in_start.saturating_add(n);
+    let out_end = out_start.saturating_add(n);
+    let partial_overlap = in_start != out_start && in_start < out_end && out_start < in_end;
+    if partial_overlap {
+        let mut tmp = Vec::with_capacity(n);
+        unsafe {
+            for i in 0..n {
+                tmp.push((*in_.add(n - 1 - i) & 0x3) ^ 0x3);
+            }
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), out, n);
+        }
+        return 0;
+    }
+    // Two-ended complement-and-reverse directly into `out`, no allocation. Each
+    // pair is read into locals before either end is written, so this is correct
+    // even when `out` and `in_` fully overlap (alias the same buffer). Raw
+    // pointer reads/writes (not slices) avoid forming aliasing &/&mut.
+    unsafe {
+        let mut lo = 0usize;
+        let mut hi = n - 1;
+        while lo < hi {
+            let a = *in_.add(lo);
+            let b = *in_.add(hi);
+            *out.add(lo) = (b & 0x3) ^ 0x3;
+            *out.add(hi) = (a & 0x3) ^ 0x3;
+            lo += 1;
+            hi -= 1;
+        }
+        if lo == hi {
+            // Odd length: complement the middle base in place.
+            let m = *in_.add(lo);
+            *out.add(lo) = (m & 0x3) ^ 0x3;
+        }
+    }
     0
 }

@@ -24,7 +24,7 @@ use crate::sidecar::model_file::{ModelFileWriter, ModelLayer};
 use crate::sidecar::sa_file::{SaFileWriter, BPE_MODE2};
 use crate::sidecar::SidecarPaths;
 use crate::train::config::{MemoryMode, TrainerConfig};
-use crate::train::mask::MaskConfig;
+use crate::train::mask::{MaskConfig, NBitmap};
 use crate::train::prior::Prior;
 use crate::train::trainer::default_l2_leaf_count;
 use crate::train::training_set::{masked_training_set, streamed_training_set};
@@ -159,18 +159,28 @@ fn build_sidecar_core(
                 p.display()
             );
             let (bases, n_positions, _stats, sha, size) = fasta_to_2bit_with_sha256(p)?;
-            (bases, n_positions, p.display().to_string(), sha, size, None)
+            (
+                bases,
+                Some(n_positions),
+                p.display().to_string(),
+                sha,
+                size,
+                None,
+            )
         }
         BuildSource::Pac(p) => {
             let (bases, _l_pac) = crate::pac::read_bwa_pac_forward(p)?;
             let psha = crate::pac::pac_sha256(p)?;
-            let n_positions = vec![false; bases.len()];
+            // bwa already substituted every N at pack time, so the `.pac` has no
+            // N positions. Represent that with `None` instead of allocating (and
+            // later O(N)-scanning) an all-false `vec![false; l_pac]` — a ~3.2 GB
+            // allocation plus a full pass on a human-scale build.
             let ref_path = p.display().to_string();
             let ref_sha256 = psha.clone();
             let ref_size_bytes = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
             (
                 bases,
-                n_positions,
+                None,
                 ref_path,
                 ref_sha256,
                 ref_size_bytes,
@@ -200,7 +210,10 @@ fn build_sidecar_core(
     // nor the `text_bases` / `n_positions_2x` arrays are materialised. The
     // resulting (key, sa_index) pairs — and the model — are byte-identical to
     // the materialized path.
-    let no_n_effect = !mask.mask_n_runs || n_positions.iter().all(|&b| !b);
+    // `None` (the `.pac` path) carries no N positions, so the N-mask is a no-op
+    // without any allocation or scan.
+    let no_n_effect =
+        !mask.mask_n_runs || n_positions.as_ref().is_none_or(|np| np.iter().all(|&b| !b));
     let virtualize = matches!(config.prior, Prior::Uniform)
         && mask.mask_homopolymers.is_none()
         && mask.mask_bed.is_none()
@@ -219,15 +232,29 @@ fn build_sidecar_core(
             .iter()
             .map(|&v| crate::sa::text_value_to_base(v))
             .collect();
-        let l_pac = n_positions.len();
-        let mut n_positions_2x = vec![false; text.len()];
-        // Forward half: positions 0..l_pac.
-        n_positions_2x[..l_pac].copy_from_slice(&n_positions);
-        // RC half: forward position i maps to doubled coordinate l_pac+(l_pac-1-i),
-        // matching `doubled_base_at`'s reverse-complement mapping.
-        for (i, &is_n) in n_positions.iter().enumerate() {
-            if is_n {
-                n_positions_2x[l_pac + (l_pac - 1 - i)] = true;
+        // Bit-packed N bitmap over the doubled text: the forward half carries the
+        // FASTA N flags and the RC half mirrors them (the RC of an ambiguous base
+        // is itself ambiguous — those RC suffixes must see the same `mask_n_runs`
+        // filtering as the forward half; the sentinel row stays non-N).
+        // Only materialise the full doubled bitmap when it will actually carry N
+        // flags (`mask_n_runs` on AND `.pac`/FASTA N positions present). Other
+        // materialised builds — a BED mask, homopolymer mask, or non-uniform
+        // prior with no N effect — keep an empty bitmap, avoiding the large
+        // all-clear allocation (and its OOM risk on big references). An empty
+        // bitmap reads as "no N anywhere": `n_in_window` clamps to its length and
+        // `any()` is false, so `masked_training_set` is byte-identical.
+        let materialise_n = mask.mask_n_runs && n_positions.is_some();
+        let mut n_positions_2x = NBitmap::zeros(if materialise_n { text.len() } else { 0 });
+        if materialise_n {
+            if let Some(ref np) = n_positions {
+                let l_pac = np.len();
+                for (i, &is_n) in np.iter().enumerate() {
+                    if is_n {
+                        n_positions_2x.set(i);
+                        // RC half: forward pos i → doubled coord l_pac+(l_pac-1-i).
+                        n_positions_2x.set(l_pac + (l_pac - 1 - i));
+                    }
+                }
             }
         }
         masked_training_set(&sa, &text_bases, &n_positions_2x, &mask, &config.prior)

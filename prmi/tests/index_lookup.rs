@@ -117,6 +117,40 @@ fn corrupt_l1_fallback_range_out_of_bounds_does_not_panic() {
 }
 
 #[test]
+fn nonzero_beta_prediction_uses_key_on_both_paths() {
+    // Every other fixture uses beta == 0.0, so the `alpha + beta*key` arithmetic
+    // (and the hoisted `key as f64` shared by the L2-direct and L1-fallback
+    // sites) is otherwise untested. Pin both prediction paths with a nonzero
+    // slope and a nonzero key.
+
+    // L2-direct: pred = alpha + beta*key = 10 + 2*5 = 20 (high bit clear).
+    let l2 = vec![ModelEntry {
+        alpha: 10.0,
+        beta: 2.0,
+        err: 0,
+    }];
+    let l1: Vec<ModelEntry> = vec![];
+    let (pred, _err) = lookup_with_components(5, &l1, &l2, 64, 100);
+    assert_eq!(pred, 20);
+
+    // L1-fallback: L2 high bit set (partial_start=0, partial_num=1) routes to
+    // l1[0]; pred = 3 + 4*2 = 11.
+    let l2 = vec![ModelEntry {
+        alpha: 0.0,
+        beta: 0.0,
+        err: (1u64 << 63) | 1u64,
+    }];
+    let l1 = vec![ModelEntry {
+        alpha: 3.0,
+        beta: 4.0,
+        err: 7,
+    }];
+    let (pred, err) = lookup_with_components(2, &l1, &l2, 64, 100);
+    assert_eq!(pred, 11);
+    assert_eq!(err, 7);
+}
+
+#[test]
 fn prediction_clamped_into_sa_range() {
     let l2 = vec![ModelEntry {
         alpha: -100.0,

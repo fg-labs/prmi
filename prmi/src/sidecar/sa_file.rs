@@ -43,6 +43,12 @@ pub const BPE_MODE2: usize = BYTES_PER_PACKED_ENTRY + 8; // 13
 /// Mode 3: position + 8-byte key + 8-byte ISA (21 bytes).
 pub const BPE_MODE3: usize = BYTES_PER_PACKED_ENTRY + 16; // 21
 
+/// Flush the per-entry accumulation buffer once it reaches this many bytes.
+/// Entries are appended to a reusable `Vec` and written out one chunk at a
+/// time, so a whole-genome build issues ~`total_bytes / SA_WRITE_CHUNK_BYTES`
+/// `write_all` calls instead of one (or two, for mode 2) per SA entry.
+const SA_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Streaming writer for the `.sa` file. Writes the 24-byte header on
 /// `create`, accepts one entry at a time via `write_entry`, and validates
 /// the expected-vs-actual entry count on `finish`.
@@ -52,6 +58,8 @@ pub struct SaFileWriter {
     bytes_per_entry: usize,
     expected: u64,
     written: u64,
+    /// Reusable accumulation buffer; flushed to `inner` per `SA_WRITE_CHUNK_BYTES`.
+    chunk: Vec<u8>,
 }
 
 impl SaFileWriter {
@@ -111,7 +119,32 @@ impl SaFileWriter {
             bytes_per_entry,
             expected: expected_entries,
             written: 0,
+            // One extra max-entry's worth of headroom so a final append never
+            // forces a reallocation past the flush threshold.
+            chunk: Vec::with_capacity(SA_WRITE_CHUNK_BYTES + BPE_MODE3),
         })
+    }
+
+    /// Flush the accumulation buffer to `inner` if it has reached the chunk
+    /// threshold. Called after each entry is appended.
+    #[inline]
+    fn maybe_flush_chunk(&mut self) -> Result<()> {
+        if self.chunk.len() >= SA_WRITE_CHUNK_BYTES {
+            self.flush_chunk()?;
+        }
+        Ok(())
+    }
+
+    /// Write any buffered entry bytes to `inner` and clear the buffer.
+    fn flush_chunk(&mut self) -> Result<()> {
+        if !self.chunk.is_empty() {
+            self.inner.write_all(&self.chunk).map_err(|e| Error::Io {
+                path: self.path.clone(),
+                source: e,
+            })?;
+            self.chunk.clear();
+        }
+        Ok(())
     }
 
     /// Append a single packed SA position to a mode-1 file.
@@ -128,13 +161,9 @@ impl SaFileWriter {
                 ),
             });
         }
-        let bytes = pack_position(pos);
-        self.inner.write_all(&bytes).map_err(|e| Error::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        self.chunk.extend_from_slice(&pack_position(pos));
         self.written += 1;
-        Ok(())
+        self.maybe_flush_chunk()
     }
 
     /// Append a mode-2 entry: `pos` (5 bytes) + `key` (8-byte LE u64).
@@ -150,19 +179,10 @@ impl SaFileWriter {
                 ),
             });
         }
-        let pos_bytes = pack_position(pos);
-        self.inner.write_all(&pos_bytes).map_err(|e| Error::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
-        let mut key_bytes = [0u8; 8];
-        LittleEndian::write_u64(&mut key_bytes, key);
-        self.inner.write_all(&key_bytes).map_err(|e| Error::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        self.chunk.extend_from_slice(&pack_position(pos));
+        self.chunk.extend_from_slice(&key.to_le_bytes());
         self.written += 1;
-        Ok(())
+        self.maybe_flush_chunk()
     }
 
     /// Append a mode-3 entry: `pos` (5 bytes) + `key` (8-byte LE u64) + `isa` (8-byte LE u64).
@@ -178,29 +198,16 @@ impl SaFileWriter {
                 ),
             });
         }
-        let pos_bytes = pack_position(pos);
-        self.inner.write_all(&pos_bytes).map_err(|e| Error::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
-        let mut key_bytes = [0u8; 8];
-        LittleEndian::write_u64(&mut key_bytes, key);
-        self.inner.write_all(&key_bytes).map_err(|e| Error::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
-        let mut isa_bytes = [0u8; 8];
-        LittleEndian::write_u64(&mut isa_bytes, isa);
-        self.inner.write_all(&isa_bytes).map_err(|e| Error::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        self.chunk.extend_from_slice(&pack_position(pos));
+        self.chunk.extend_from_slice(&key.to_le_bytes());
+        self.chunk.extend_from_slice(&isa.to_le_bytes());
         self.written += 1;
-        Ok(())
+        self.maybe_flush_chunk()
     }
 
     /// Flush and close the writer, verifying that exactly `expected_entries` were written.
     pub fn finish(mut self) -> Result<()> {
+        self.flush_chunk()?;
         self.inner.flush().map_err(|e| Error::Io {
             path: self.path.clone(),
             source: e,
