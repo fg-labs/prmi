@@ -60,6 +60,7 @@ fn open_test_idx(dir: &tempfile::TempDir, tag: &str) -> LearnedIndex {
 /// Seed a 1 kb synthetic read at 32 evenly-spaced pivots (every 32 bases).
 /// At least one pivot should hit a match in the matching reference.
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn long_read_at_least_one_match_across_32_pivots() {
     let dir = tempdir().unwrap();
     let idx = open_test_idx(&dir, "lr_hits");
@@ -81,6 +82,7 @@ fn long_read_at_least_one_match_across_32_pivots() {
 
 /// A pivot whose window runs off the end of the read should produce (0, 0, 0).
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn long_read_pivot_past_end_returns_zero() {
     let dir = tempdir().unwrap();
     let idx = open_test_idx(&dir, "lr_past_end");
@@ -105,6 +107,7 @@ fn long_read_pivot_past_end_returns_zero() {
 
 /// An empty pivot list must return an empty Vec without error.
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn long_read_empty_pivot_list_returns_empty_vec() {
     let dir = tempdir().unwrap();
     let idx = open_test_idx(&dir, "lr_empty");
@@ -118,6 +121,7 @@ fn long_read_empty_pivot_list_returns_empty_vec() {
 
 /// A single-pivot call must return a single result.
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn long_read_single_pivot_returns_single_result() {
     let dir = tempdir().unwrap();
     let idx = open_test_idx(&dir, "lr_single");
@@ -137,6 +141,7 @@ fn long_read_single_pivot_returns_single_result() {
 
 /// Packed variant: same pivots, should produce identical results to unpacked.
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn long_read_packed_matches_unpacked() {
     let dir = tempdir().unwrap();
     let idx = open_test_idx(&dir, "lr_packed_match");

@@ -61,7 +61,7 @@ pub(crate) fn read_unpacked_window_pub(
 /// bases (4 per byte). Returns `Err(Error::Internal)` rather than letting a
 /// short slice panic on an out-of-bounds byte access inside
 /// [`read_unpacked_window`]. `ctx` names the calling entry point for the error.
-fn validate_packed_pac(pac: &[u8], num_bases: u64, ctx: &str) -> Result<()> {
+pub(crate) fn validate_packed_pac(pac: &[u8], num_bases: u64, ctx: &str) -> Result<()> {
     let required =
         usize::try_from(num_bases.div_ceil(4)).map_err(|_| crate::error::Error::Internal {
             detail: format!("{ctx}: num_bases={num_bases} is too large for this platform"),
@@ -102,6 +102,35 @@ fn read_unpacked_window(pac: &[u8], pos: u64, enc: PacEncoding, out: &mut [u8; 3
                 *slot = (byte >> shift) & 0x3;
             }
             avail
+        }
+    }
+}
+
+/// Decode a single base at position `pos` from `pac`. Returns `None` if
+/// `pos` is out of range. Used by left extension's per-position filter.
+#[inline]
+pub fn pac_base_at(pac: &[u8], pos: u64, enc: PacEncoding) -> Option<u8> {
+    match enc {
+        PacEncoding::Unpacked => {
+            let p = pos as usize;
+            if p >= pac.len() {
+                None
+            } else {
+                Some(pac[p])
+            }
+        }
+        PacEncoding::Packed { num_bases } => {
+            if pos >= num_bases {
+                None
+            } else {
+                let p = pos as usize;
+                // `num_bases` is caller-supplied and may disagree with `pac.len()`
+                // now that this helper is public; index defensively so a
+                // truncated/inconsistent buffer yields `None` instead of panicking.
+                let byte = *pac.get(p / 4)?;
+                let shift = 6 - 2 * ((p % 4) as u32);
+                Some((byte >> shift) & 0x3)
+            }
         }
     }
 }
@@ -224,10 +253,9 @@ impl LearnedIndex {
         let lo = pred.saturating_sub(err);
         let hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
 
-        // Determine if this index has stored keys (modes 2/3 or suffix_key_cache).
-        // When stored keys are available, we can skip tokenize_4_at_once entirely.
-        let has_stored_keys =
-            self.sa().bytes_per_entry() > 5 || self.memory_mode() == "suffix_key_cache";
+        // Determine if this index has stored keys (mode 2). When stored keys
+        // are available, we can skip tokenize_4_at_once entirely.
+        let has_stored_keys = self.sa().bytes_per_entry() > 5;
 
         let mut window = [0u8; 32];
         let mut k = 0u64;
@@ -243,7 +271,9 @@ impl LearnedIndex {
                 let candidate = match self.key_at(sa_idx) {
                     Some(k) => k,
                     None => {
-                        // Cache miss (suffix_key_cache mode). Fall back to pac.
+                        // Defensive fallback: a key should always be present on
+                        // the stored-keys fast path (mode 2). Re-tokenize from
+                        // the pac if it is somehow absent.
                         let avail = read_unpacked_window(pac, sa_pos, enc, &mut window);
                         tokenize_32mer(&window[..avail], avail)
                     }
@@ -602,5 +632,25 @@ mod tests {
         let n = read_unpacked_window(&packed, 2, enc, &mut out);
         assert_eq!(n, 6); // 8 - 2 = 6 bases remaining, capped at min(6, 32)
         assert_eq!(&out[..6], &bases[2..8]);
+    }
+
+    #[test]
+    fn pac_base_at_unpacked() {
+        let bases: Vec<u8> = vec![0, 1, 2, 3, 0, 1];
+        assert_eq!(pac_base_at(&bases, 0, PacEncoding::Unpacked), Some(0));
+        assert_eq!(pac_base_at(&bases, 3, PacEncoding::Unpacked), Some(3));
+        assert_eq!(pac_base_at(&bases, 5, PacEncoding::Unpacked), Some(1));
+        assert_eq!(pac_base_at(&bases, 6, PacEncoding::Unpacked), None);
+    }
+
+    #[test]
+    fn pac_base_at_packed() {
+        let bases: Vec<u8> = vec![0, 1, 2, 3, 0, 1];
+        let packed = pack_bases(&bases);
+        let enc = PacEncoding::Packed { num_bases: 6 };
+        assert_eq!(pac_base_at(&packed, 0, enc), Some(0));
+        assert_eq!(pac_base_at(&packed, 3, enc), Some(3));
+        assert_eq!(pac_base_at(&packed, 5, enc), Some(1));
+        assert_eq!(pac_base_at(&packed, 6, enc), None);
     }
 }

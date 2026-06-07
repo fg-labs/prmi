@@ -10,15 +10,16 @@ pub mod lookup;
 pub mod shm;
 pub mod smem;
 pub mod smem_simd;
+pub mod spectrum;
 
 use crate::error::{Error, Result};
 use crate::index::lookup::lookup_core;
 use crate::index::shm::{read_shm_blob, write_shm_blob};
+use crate::sidecar::isa_file::IsaFileReader;
 use crate::sidecar::magic::META_MAGIC;
 use crate::sidecar::meta::Meta;
 use crate::sidecar::model_file::{ModelFileReader, ModelLayer};
 use crate::sidecar::sa_file::SaFileReader;
-use crate::sidecar::skc_file::SkcFileReader;
 use crate::sidecar::SidecarPaths;
 use std::path::Path;
 
@@ -30,8 +31,8 @@ pub struct LearnedIndex {
     sa: SaFileReader,
     l1: ModelFileReader,
     l2: ModelFileReader,
-    /// Optional suffix-key-cache, present when `[sa] mode = "suffix_key_cache"`.
-    skc: Option<SkcFileReader>,
+    /// Optional inverse SA (ref2sa), present when a `.isa` file exists beside the sidecar.
+    isa: Option<IsaFileReader>,
 }
 
 const _ASSERT_SEND_SYNC: fn() = || {
@@ -41,7 +42,6 @@ const _ASSERT_SEND_SYNC: fn() = || {
 
 impl LearnedIndex {
     /// Open a sidecar by prefix. Expects `<prefix>.{meta,sa,l1,l2}` to exist.
-    /// For `suffix_key_cache` mode, also opens `<prefix>.skc`.
     /// Cross-validates the headers against each other before returning.
     pub fn open(prefix: &Path) -> Result<Self> {
         let paths = SidecarPaths::from_prefix(prefix);
@@ -50,17 +50,34 @@ impl LearnedIndex {
         let l1 = ModelFileReader::open(&paths.l1, ModelLayer::L1)?;
         let l2 = ModelFileReader::open(&paths.l2, ModelLayer::L2)?;
         cross_validate(&paths, &meta, &sa, &l1, &l2)?;
-        let skc = if meta.sa.mode == "suffix_key_cache" {
-            Some(SkcFileReader::open(&paths.skc)?)
-        } else {
-            None
+        // An `.isa` is optional, but if one is present beside the sidecar it must
+        // describe the SAME suffix array — a stale/mismatched `.isa` would make
+        // `isa_for_refpos()` return garbage (or panic) during backward extension.
+        // Validate the entry count against the `.sa` here, and only treat a true
+        // `NotFound` as "no `.isa`" rather than swallowing every open failure.
+        let isa = match IsaFileReader::open(&paths.isa) {
+            Ok(reader) => {
+                if reader.num_entries() != sa.num_entries() {
+                    return Err(Error::SidecarMismatch {
+                        file: paths.isa.clone(),
+                        detail: format!(
+                            ".isa num_entries={} but .sa has {}",
+                            reader.num_entries(),
+                            sa.num_entries()
+                        ),
+                    });
+                }
+                Some(reader)
+            }
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
         };
         Ok(Self {
             meta,
             sa,
             l1,
             l2,
-            skc,
+            isa,
         })
     }
 
@@ -92,6 +109,9 @@ impl LearnedIndex {
     /// - Crash safety is not provided: a partially written blob produces an
     ///   error rather than silently corrupt data (the component headers are
     ///   validated before any lookup).
+    /// - Backward extension ([`isa_for_refpos`](Self::isa_for_refpos)) requires
+    ///   a file-backed [`open`](Self::open); the shm blob does not yet carry the
+    ///   `.isa` (added in a later milestone).
     pub fn open_shm(shm_path: impl AsRef<Path>) -> Result<Self> {
         let shm_path = shm_path.as_ref();
         let blob = read_shm_blob(shm_path)?;
@@ -131,15 +151,15 @@ impl LearnedIndex {
         // Re-use cross_validate with a synthetic path for error messages.
         let fake_paths = SidecarPaths::from_prefix(shm_path);
         cross_validate(&fake_paths, &meta, &sa, &l1, &l2)?;
-        // Always `None` here: suffix_key_cache (the only mode with a `.skc`) was
-        // rejected above, so the remaining modes carry no companion cache.
-        let skc = None;
+        // The .isa is not packed into the shm blob yet; backward extension
+        // requires a file-backed open.
+        let isa = None;
         Ok(Self {
             meta,
             sa,
             l1,
             l2,
-            skc,
+            isa,
         })
     }
 
@@ -154,6 +174,15 @@ impl LearnedIndex {
     /// Number of entries in the suffix array.
     pub fn sa_num(&self) -> u64 {
         self.sa.num_entries()
+    }
+
+    /// Number of forward reference bases (`l_pac`). The 2× SA has `2*l_pac + 1`
+    /// entries, so `l_pac = (sa_num - 1) / 2`. (Equals `meta.sa.l_pac` when set.)
+    pub fn l_pac(&self) -> u64 {
+        self.meta
+            .sa
+            .l_pac
+            .unwrap_or_else(|| (self.sa_num().saturating_sub(1)) / 2)
     }
 
     /// SA position stored at index `i`. `i` must be less than [`sa_num`](Self::sa_num).
@@ -176,7 +205,9 @@ impl LearnedIndex {
         self.meta.rmi.l2_leaf_count
     }
 
-    /// Format-version string (always `"PRMIv1"` for v0.1).
+    /// Returns the sidecar format magic string (the value of `META_MAGIC`,
+    /// currently `"PRMIv2"`). This reflects the format version written by the
+    /// trainer and is not guaranteed to be a fixed constant across releases.
     pub fn format_version(&self) -> &str {
         META_MAGIC
     }
@@ -184,11 +215,11 @@ impl LearnedIndex {
     /// Read `out.len()` packed SA positions starting at SA index `k` from
     /// the mmap'd `.sa` file into the caller-provided `out` slice.
     ///
-    /// Each output is a genome position (uint40 unpacked to u64) on the
-    /// forward strand (per the sidecar's `[sa] strand = "forward_only"`
-    /// convention). For reverse-strand support, callers tokenize the
-    /// reverse-complement of the query and call lookup/smem_range a
-    /// second time.
+    /// Each output is a raw doubled-coordinate SA position in `[0, 2*l_pac]`.
+    /// A position `p < l_pac` is a forward-strand hit at reference position
+    /// `p`; a position `p >= l_pac` is a reverse-strand hit. The consumer
+    /// (e.g. bwa-mem3) applies the `pos >= l_pac` strand demux via its own
+    /// `bns` structure — prmi does not perform strand demultiplexing.
     ///
     /// Returns `Err` if `k + out.len() > sa_num`. Returns `Ok(())` with
     /// no writes if `out.len() == 0`.
@@ -218,6 +249,46 @@ impl LearnedIndex {
         Ok(())
     }
 
+    /// Read `out.len()` SA positions starting at index `k`, sampling every
+    /// `step`-th entry: `out[j] = SA[k + j*step]`. With `step == 1` this is
+    /// `sa_positions`. The stride/subsampling policy (choosing `step`) is the
+    /// caller's. Returns `Err` if the last sampled index `k + (out.len()-1)*step`
+    /// is `>= sa_num`.
+    pub fn sa_positions_strided(&self, k: u64, step: u64, out: &mut [u64]) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        if step == 0 {
+            // A zero stride would fill `out` with the same `SA[k]` repeatedly,
+            // silently violating the documented "every `step`-th entry" contract
+            // and hiding caller bugs.
+            return Err(Error::Internal {
+                detail: "sa_positions_strided: step must be > 0".into(),
+            });
+        }
+        let last = k
+            .checked_add((out.len() as u64 - 1).checked_mul(step).ok_or_else(|| {
+                Error::Internal {
+                    detail: "sa_positions_strided: index overflow".into(),
+                }
+            })?)
+            .ok_or_else(|| Error::Internal {
+                detail: "sa_positions_strided: index overflow".into(),
+            })?;
+        if last >= self.sa_num() {
+            return Err(Error::Internal {
+                detail: format!(
+                    "sa_positions_strided: last index {last} >= sa_num {}",
+                    self.sa_num()
+                ),
+            });
+        }
+        for (j, slot) in out.iter_mut().enumerate() {
+            *slot = self.sa_position_for(k + j as u64 * step);
+        }
+        Ok(())
+    }
+
     /// Brief §4.4 lookup: predict the SA index for a 32-mer `key`. Returns
     /// `(predicted_sa_pos, err)`.
     #[inline]
@@ -242,35 +313,38 @@ impl LearnedIndex {
         &self.meta
     }
 
-    /// Memory mode string from `.meta [sa] mode` (e.g. `"1"`, `"2"`, `"3"`,
-    /// or `"suffix_key_cache"`).
+    /// Memory mode string from `.meta [sa] mode` (e.g. `"1"` or `"2"`).
     pub fn memory_mode(&self) -> &str {
         &self.meta.sa.mode
     }
 
     /// Return the stored 32-mer key at SA index `i`, if available.
     ///
-    /// Returns `Some(key)` for modes 2 and 3 (where the key is stored in the
-    /// `.sa` file alongside the position). Returns `None` for mode 1.
-    ///
-    /// For `suffix_key_cache` mode, queries the in-memory `.skc` hash map;
-    /// returns `None` on a cache miss.
+    /// Returns `Some(key)` for mode 2 (where the key is stored in the `.sa`
+    /// file alongside the position). Returns `None` for mode 1.
     #[inline]
     pub fn key_at(&self, i: u64) -> Option<u64> {
-        // First try the SA file (modes 2 and 3).
-        if let Some(key) = self.sa.key_at(i) {
-            return Some(key);
-        }
-        // Fall back to the SHC cache (suffix_key_cache mode).
-        self.skc.as_ref().and_then(|skc| skc.lookup_key(i))
+        self.sa.key_at(i)
     }
 
     /// Return the stored ISA value at SA index `i`, if available.
     ///
-    /// Returns `Some(isa)` only for mode 3. Returns `None` for all other modes.
+    /// Always `None` for the current memory modes (1 and 2), which do not
+    /// store an inline ISA column in the `.sa` file.
     #[inline]
     pub fn isa_at(&self, i: u64) -> Option<u64> {
         self.sa.isa_at(i)
+    }
+
+    /// SA index whose suffix starts at reference (doubled-coordinate) position
+    /// `p`. `None` if this sidecar has no `.isa` (e.g. shm-opened). Used by
+    /// backward extension (Plan 3).
+    pub fn isa_for_refpos(&self, p: u64) -> Option<u64> {
+        self.isa.as_ref().and_then(|r| {
+            // `sa_index_for_refpos` asserts on `p >= num_entries`; bound-check
+            // here so a stray caller input yields `None` instead of panicking.
+            (p < r.num_entries()).then(|| r.sa_index_for_refpos(p))
+        })
     }
 }
 

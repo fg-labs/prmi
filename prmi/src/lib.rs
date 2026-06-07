@@ -14,9 +14,11 @@ pub mod fasta;
 pub mod histogram;
 pub mod index;
 pub mod inspect;
+pub mod pac;
 pub mod sa;
 pub mod sidecar;
 pub mod train;
+pub mod verify_sa;
 pub use error::{Error, Result};
 
 // Upstream code carries its own (often minimal) docs from Marcus 2020.

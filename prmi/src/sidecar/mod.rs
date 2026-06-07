@@ -1,23 +1,20 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
-//! On-disk sidecar format: TOML meta + binary `.sa` / `.l1` / `.l2` (+ optional `.skc`).
+//! On-disk sidecar format: TOML meta + binary `.sa` / `.l1` / `.l2` / `.isa`.
 
+pub mod isa_file;
 pub mod magic;
 pub mod meta;
 pub mod model_file;
 pub mod sa_file;
-pub mod skc_file;
 
 use std::path::{Path, PathBuf};
 
 /// Resolve the sidecar file paths from a common prefix.
 ///
 /// `prefix = "/data/hg38.fa.prmi"` →
-///   `meta = "/data/hg38.fa.prmi.meta"`, `.sa`, `.l1`, `.l2`, `.skc`.
-///
-/// The `.skc` path is always computed but only written/read when the sidecar
-/// was built in `suffix_key_cache` mode.
+///   `meta = "/data/hg38.fa.prmi.meta"`, `.sa`, `.l1`, `.l2`, `.isa`.
 #[derive(Debug, Clone)]
 pub struct SidecarPaths {
     /// Path to the `.meta` TOML file.
@@ -28,9 +25,8 @@ pub struct SidecarPaths {
     pub l1: PathBuf,
     /// Path to the `.l2` model file (L2 routing layer).
     pub l2: PathBuf,
-    /// Path to the optional `.skc` suffix-key-cache companion file.
-    /// Only exists when `[sa] mode = "suffix_key_cache"`.
-    pub skc: PathBuf,
+    /// Path to the `.isa` inverse-SA (ref2sa) file.
+    pub isa: PathBuf,
 }
 
 impl SidecarPaths {
@@ -50,7 +46,7 @@ impl SidecarPaths {
             sa: with(".sa"),
             l1: with(".l1"),
             l2: with(".l2"),
-            skc: with(".skc"),
+            isa: with(".isa"),
         }
     }
 }

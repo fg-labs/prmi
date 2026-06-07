@@ -24,10 +24,21 @@ pub struct Cli {
 /// Subcommands available in the `prmi` binary.
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Build a prmi sidecar from a reference FASTA.
+    /// Build a prmi sidecar from a reference FASTA or a bwa `.pac`.
+    ///
+    /// Exactly one reference source must be given: either the positional
+    /// reference FASTA (`--ref`, NOT byte-identical to a bwa FM-index) or
+    /// `--pac` (byte-identical). The two are mutually exclusive.
     Build {
-        /// Path to the reference FASTA.
-        ref_fa: PathBuf,
+        /// Path to the reference FASTA (positional). NOT byte-identical to a
+        /// bwa FM-index (prmi maps N→A). Mutually exclusive with `--pac`.
+        #[arg(conflicts_with = "pac")]
+        ref_fa: Option<PathBuf>,
+        /// Path to bwa's forward `.pac`. Produces a sidecar byte-identical in
+        /// rank order to the bwa FM-index. Mutually exclusive with the
+        /// reference FASTA.
+        #[arg(long)]
+        pac: Option<PathBuf>,
         /// Output prefix; produces `<prefix>.{meta,sa,l1,l2}`.
         /// Defaults to <ref_fa>.prmi.
         #[arg(short = 'o', long)]
@@ -77,23 +88,23 @@ pub enum Cmd {
         /// typically all available CPUs). Default: 0.
         #[arg(long, short = 't', default_value_t = 0)]
         threads: usize,
-        /// Memory mode for the `.sa` sidecar file. Controls the per-entry layout
-        /// and what extra data is stored alongside each SA position.
+        /// Store a 32-mer key alongside each SA position (13 B/entry vs 5 B).
+        /// Speeds the compare loop by skipping re-tokenisation, at ~50 GB extra
+        /// for hg38. A pure speed A/B knob; correctness is identical either way.
         ///
-        /// - `1` (default): position only, 5 B/entry (~15 GB for human). Minimal memory.
-        /// - `2`: position + stored 32-mer key, 13 B/entry (~39 GB). Skips per-candidate
-        ///   pac reads in smem_range at the cost of 2.6x larger `.sa`.
-        /// - `3`: mode 2 + stored ISA entry, 21 B/entry (~63 GB). Adds forward-extension
-        ///   capability on top of mode 2.
-        /// - `suffix-key-cache`: mode-1 `.sa` + companion `.skc` caching keys for the
-        ///   top-N positions (see --suffix-key-cache-size). Lower memory than mode 2.
-        #[arg(long, value_name = "MODE", default_value = "1")]
-        memory_mode: String,
-        /// For --memory-mode suffix-key-cache: number of SA positions to cache keys for.
-        /// Caches the first N SA index entries (lexicographically smallest suffixes).
-        /// Ignored for other memory modes. Default: 1000000.
-        #[arg(long, value_name = "N", default_value_t = 1_000_000u64)]
-        suffix_key_cache_size: u64,
+        /// Defaults to on. Pass `--store-keys` (bare) to keep it on, or
+        /// `--store-keys=false` to select the position-only layout (mode 1). A
+        /// bare boolean flag cannot be negated under clap, so the explicit
+        /// `=<bool>` form is required to reach mode 1 from the CLI.
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+        )]
+        store_keys: bool,
     },
     /// Convert a KMC text-format dump to a prmi u64-key histogram TSV.
     ///
@@ -130,6 +141,19 @@ pub enum Cmd {
         #[allow(missing_docs)]
         cmd: ShmCmd,
     },
+    /// Certify that the 2× SA built from a reference equals the unique
+    /// lexicographic suffix ordering (byte-identity foundation gate).
+    SaVerify {
+        /// Reference FASTA.
+        #[arg(long)]
+        r#ref: std::path::PathBuf,
+        /// Run the exhaustive O(N²) oracle (small references only).
+        #[arg(long, default_value_t = false)]
+        exhaustive: bool,
+        /// Threads for SA construction.
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+    },
 }
 
 /// Subcommands for `prmi shm`.
@@ -164,32 +188,13 @@ pub enum ShmCmd {
     },
 }
 
-/// Parse the `--memory-mode` CLI string into a [`MemoryMode`].
-fn parse_memory_mode(
-    mode_str: &str,
-    suffix_key_cache_size: u64,
-) -> anyhow::Result<crate::train::config::MemoryMode> {
-    use crate::train::config::MemoryMode;
-    match mode_str {
-        "1" => Ok(MemoryMode::Mode1),
-        "2" => Ok(MemoryMode::Mode2),
-        "3" => Ok(MemoryMode::Mode3),
-        "suffix-key-cache" => Ok(MemoryMode::SuffixKeyCache {
-            cache_size: suffix_key_cache_size,
-        }),
-        other => anyhow::bail!(
-            "unrecognised --memory-mode {other:?}; \
-             must be one of: 1, 2, 3, suffix-key-cache"
-        ),
-    }
-}
-
 impl Cli {
     /// Execute the selected subcommand and return its result.
     pub fn run(self) -> anyhow::Result<()> {
         match self.cmd {
             Cmd::Build {
                 ref_fa,
+                pac,
                 out,
                 l2_leaf_count,
                 no_mask_n_runs,
@@ -200,11 +205,24 @@ impl Cli {
                 prior_fastq_histogram,
                 prior_fastq_base_weight,
                 threads,
-                memory_mode,
-                suffix_key_cache_size,
+                store_keys,
             } => {
+                // Resolve the reference source: exactly one of the positional
+                // FASTA or `--pac`. clap's `conflicts_with` rejects both; here
+                // we reject neither.
+                let source_path = match (ref_fa.as_ref(), pac.as_ref()) {
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("--pac and the reference FASTA are mutually exclusive")
+                    }
+                    (None, None) => anyhow::bail!(
+                        "no reference source given: provide a reference FASTA (positional) or --pac"
+                    ),
+                    (Some(fa), None) => fa.clone(),
+                    (None, Some(p)) => p.clone(),
+                };
+
                 let prefix = out.unwrap_or_else(|| {
-                    let mut p = ref_fa.clone().into_os_string();
+                    let mut p = source_path.clone().into_os_string();
                     p.push(".prmi");
                     PathBuf::from(p)
                 });
@@ -244,25 +262,43 @@ impl Cli {
                         .with_context(|| "parsing prior options")?
                 };
 
-                // Parse --memory-mode.
-                let mem_mode = parse_memory_mode(&memory_mode, suffix_key_cache_size)
-                    .with_context(|| format!("parsing --memory-mode {memory_mode:?}"))?;
-
+                let mem_mode = if store_keys {
+                    crate::train::config::MemoryMode::Mode2
+                } else {
+                    crate::train::config::MemoryMode::Mode1
+                };
                 let trainer_config = crate::train::config::TrainerConfig {
                     prior,
                     memory_mode: mem_mode,
                     ..Default::default()
                 };
 
-                crate::train::build_sidecar_with_config(
-                    &ref_fa,
-                    &prefix,
-                    l2_leaf_count,
-                    mask,
-                    threads,
-                    Some(trainer_config),
-                )
-                .with_context(|| format!("building sidecar at {}", prefix.display()))?;
+                if let Some(pac_path) = pac.as_ref() {
+                    // Byte-identical build straight from bwa's forward `.pac`.
+                    crate::train::build_sidecar_from_pac_with_config(
+                        pac_path,
+                        &prefix,
+                        l2_leaf_count,
+                        mask,
+                        threads,
+                        Some(trainer_config),
+                    )
+                    .with_context(|| format!("building sidecar at {}", prefix.display()))?;
+                } else {
+                    // FASTA build (warns: NOT byte-identical to a bwa FM-index).
+                    let fa = ref_fa
+                        .as_ref()
+                        .expect("source resolution guaranteed a FASTA");
+                    crate::train::build_sidecar_with_config(
+                        fa,
+                        &prefix,
+                        l2_leaf_count,
+                        mask,
+                        threads,
+                        Some(trainer_config),
+                    )
+                    .with_context(|| format!("building sidecar at {}", prefix.display()))?;
+                }
                 println!("wrote sidecar prefix: {}", prefix.display());
                 Ok(())
             }
@@ -280,6 +316,19 @@ impl Cli {
             }
             Cmd::Inspect { prefix } => crate::inspect::inspect(&prefix)
                 .with_context(|| format!("inspecting sidecar at {}", prefix.display())),
+            Cmd::SaVerify {
+                r#ref,
+                exhaustive,
+                threads,
+            } => {
+                anyhow::ensure!(
+                    exhaustive,
+                    "non-exhaustive sampling mode not yet implemented; pass --exhaustive for small references"
+                );
+                let n = crate::verify_sa::sa_verify_fasta(&r#ref, threads)?;
+                println!("OK: {n} SA entries certified against the lexicographic oracle");
+                Ok(())
+            }
             Cmd::Shm { cmd } => match cmd {
                 ShmCmd::Load {
                     sidecar_prefix,

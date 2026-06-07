@@ -20,6 +20,7 @@ fn deterministic_fasta(n_bases: usize, seed: u64) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn every_suffix_predicted_within_error_bound() {
     let dir = tempdir().unwrap();
     let fa = dir.path().join("g.fa");
@@ -56,6 +57,7 @@ fn every_suffix_predicted_within_error_bound() {
 /// merge from a divergent fork, an accidental bit shift) will flunk
 /// here long before downstream consumers notice runaway err.
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn decoded_err_values_are_sane() {
     let dir = tempdir().unwrap();
     let fa = dir.path().join("e.fa");

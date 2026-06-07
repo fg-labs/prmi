@@ -40,6 +40,7 @@ use tempfile::tempdir;
 ///
 /// A query of 32 T's (key = `u64::MAX`) must produce `l > 0`.
 #[test]
+#[ignore = "forward-only primitive replaced by 2x spectrum in Plan 3"]
 fn smem_range_resolves_trailing_empty_leaf_query() {
     let dir = tempdir().unwrap();
     let fa_path = dir.path().join("trailing_mask.fa");

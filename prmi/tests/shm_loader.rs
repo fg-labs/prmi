@@ -6,9 +6,6 @@
 use prmi::index::shm::{read_shm_blob, write_shm_blob};
 use prmi::index::LearnedIndex;
 use prmi::train::build_sidecar;
-use prmi::train::build_sidecar_with_config;
-use prmi::train::config::{MemoryMode, TrainerConfig};
-use prmi::train::mask::MaskConfig;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -25,32 +22,6 @@ fn build_test_sidecar() -> (tempfile::TempDir, PathBuf) {
     std::fs::write(&fa, content.as_bytes()).unwrap();
     let prefix = dir.path().join("t.fa.prmi");
     build_sidecar(&fa, &prefix, Some(16), Default::default(), 1).unwrap();
-    (dir, prefix)
-}
-
-/// Build a `suffix_key_cache`-mode sidecar (which is *not* representable in an
-/// SHM blob, since the companion `.skc` is not packed) and return its prefix.
-fn build_skc_sidecar() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempdir().unwrap();
-    let fa = dir.path().join("skc.fa");
-    let mut content = String::from(">chr1\n");
-    for _ in 0..64 {
-        content.push_str("ACGTACGT");
-    }
-    content.push('\n');
-    std::fs::write(&fa, content.as_bytes()).unwrap();
-    let prefix = dir.path().join("skc.fa.prmi");
-    let config =
-        TrainerConfig::default().with_memory_mode(MemoryMode::SuffixKeyCache { cache_size: 8 });
-    build_sidecar_with_config(
-        &fa,
-        &prefix,
-        Some(16),
-        MaskConfig::default(),
-        1,
-        Some(config),
-    )
-    .unwrap();
     (dir, prefix)
 }
 
@@ -188,21 +159,6 @@ fn open_shm_corrupt_magic_returns_error() {
 
     let result = LearnedIndex::open_shm(&shm_path);
     assert!(result.is_err(), "open_shm on corrupt magic should fail");
-}
-
-#[test]
-fn open_shm_rejects_suffix_key_cache_blob() {
-    // A suffix_key_cache sidecar can be packed (its four core files exist), but
-    // its `.skc` companion is not included in the blob — so `open_shm` must fail
-    // fast rather than silently loading with skc = None and changing key_at().
-    let (_dir, prefix) = build_skc_sidecar();
-    let shm_path = _dir.path().join("skc.shm");
-    write_shm_blob(&prefix, &shm_path).unwrap();
-    let result = LearnedIndex::open_shm(&shm_path);
-    assert!(
-        result.is_err(),
-        "open_shm on a suffix_key_cache blob must return Err, not silently drop .skc"
-    );
 }
 
 // ── read_shm_blob: wrapper-layout invariant enforcement ──────────────────────
