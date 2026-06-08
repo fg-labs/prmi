@@ -5,7 +5,7 @@
 //!
 //! Each test builds a small sidecar in a specific mode and verifies:
 //! - The on-disk layout matches the expected bytes_per_entry.
-//! - `key_at` / `isa_at` return expected values.
+//! - `key_at` returns expected values.
 
 use prmi::encoding::tokenize_32mer;
 use prmi::index::LearnedIndex;
@@ -70,14 +70,6 @@ fn mode1_key_at_returns_none() {
     let prefix = build_sidecar_mode(&dir, MemoryMode::Mode1);
     let idx = LearnedIndex::open(&prefix).unwrap();
     assert_eq!(idx.key_at(0), None, "mode 1 should not store keys");
-}
-
-#[test]
-fn mode1_isa_at_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let prefix = build_sidecar_mode(&dir, MemoryMode::Mode1);
-    let idx = LearnedIndex::open(&prefix).unwrap();
-    assert_eq!(idx.isa_at(0), None, "mode 1 should not store ISA");
 }
 
 #[test]
@@ -179,14 +171,6 @@ fn mode2_stored_key_matches_tokenized_pac_key() {
             "mode 2: stored key at SA[{i}] (pos={pos}) doesn't match tokenized pac key"
         );
     }
-}
-
-#[test]
-fn mode2_isa_at_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let prefix = build_sidecar_mode(&dir, MemoryMode::Mode2);
-    let idx = LearnedIndex::open(&prefix).unwrap();
-    assert_eq!(idx.isa_at(0), None, "mode 2 should not store ISA");
 }
 
 #[test]

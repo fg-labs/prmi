@@ -5,14 +5,22 @@
 //! The reference base at a doubled-coordinate position is reconstructed from the
 //! caller's FORWARD pac; the sentinel (position 2*l_pac) sorts smallest.
 
+use crate::encoding::{tokenize_32mer, KMER_LEN};
 use crate::index::smem::{pac_base_at, validate_packed_pac, PacEncoding};
 use crate::index::LearnedIndex;
+use crate::sidecar::kmt_file::KmerBounds;
+use rayon::prelude::*;
 
 /// Reference base (0..=3) at doubled-coordinate position `q` over the
 /// `[Fwd(l_pac) || RC(l_pac)]` text, reconstructed from the forward `pac`:
 /// - `q < l_pac`            -> `fwd(q)`
 /// - `l_pac <= q < 2*l_pac` -> `3 - fwd(2*l_pac - 1 - q)`  (reverse-complement)
 /// - `q >= 2*l_pac`         -> `None` (sentinel / end-of-text; sorts smallest)
+///
+/// Test-only since the vectorized [`compare_query_vs_suffix_2x`] reads the
+/// doubled text in bulk via `fill_doubled_chunk`; retained as the per-base
+/// oracle backing [`compare_query_vs_suffix_2x_scalar`] and the unit tests.
+#[cfg(test)]
 #[inline]
 pub(crate) fn doubled_base_at(pac: &[u8], enc: PacEncoding, l_pac: u64, q: u64) -> Option<u8> {
     if q >= 2 * l_pac {
@@ -35,8 +43,14 @@ pub(crate) fn doubled_base_at(pac: &[u8], enc: PacEncoding, l_pac: u64, q: u64) 
 /// mismatch, the reference is the smallest symbol, so `ref < query` (`ref_less =
 /// true`). This matches the GSA `0`-sentinel ordering the SA was built with.
 /// (Do NOT use the build-side `text_value_to_base` mapping here.)
+///
+/// Scalar one-base-at-a-time reference implementation. Retained as the source of
+/// truth for the vectorized [`compare_query_vs_suffix_2x`]; the two are asserted
+/// byte-identical by a proptest over both encodings. Test-only: the production
+/// path uses the vectorized version exclusively.
+#[cfg(test)]
 #[inline]
-pub(crate) fn compare_query_vs_suffix_2x(
+pub(crate) fn compare_query_vs_suffix_2x_scalar(
     query: &[u8],
     sa_pos: u64,
     pac: &[u8],
@@ -54,6 +68,298 @@ pub(crate) fn compare_query_vs_suffix_2x(
     (false, lcp) // full query matched a prefix of the (longer-or-equal) ref suffix
 }
 
+/// Number of unpacked reference bases buffered per fetch in
+/// [`compare_query_vs_suffix_2x`]. A multiple of 8 so the inner word-at-a-time
+/// loop consumes whole `u64` lanes with at most one short tail per chunk.
+const CHUNK_BASES: usize = 32;
+
+/// Fill up to `out.len()` unpacked reference bases (each `0..=3`) of the doubled
+/// `[Fwd || RC]` text starting at doubled position `q`, writing into `out[..n]`.
+/// Returns the count `n` actually filled. `n < out.len()` iff the fill stopped
+/// early because it reached a region boundary (forward→RC at `l_pac`) or the
+/// sentinel/end-of-text (`2*l_pac`); the caller re-invokes for the next region
+/// or treats a short fill at the sentinel as the reference being exhausted.
+///
+/// Vectorized common cases (`Unpacked` forward / RC) copy or mirror contiguous
+/// byte runs; `Packed` decodes per base. A single call never crosses the
+/// `l_pac` boundary — it fills only within the region containing `q`.
+fn fill_doubled_chunk(pac: &[u8], enc: PacEncoding, l_pac: u64, q: u64, out: &mut [u8]) -> usize {
+    if out.is_empty() || q >= 2 * l_pac {
+        return 0;
+    }
+    if q < l_pac {
+        // Forward region: bases are the reference at [q, l_pac).
+        let avail = (l_pac - q) as usize;
+        let n = avail.min(out.len());
+        match enc {
+            PacEncoding::Unpacked => {
+                let start = q as usize;
+                out[..n].copy_from_slice(&pac[start..start + n]);
+            }
+            PacEncoding::Packed { .. } => {
+                for (i, slot) in out[..n].iter_mut().enumerate() {
+                    // In-bounds by construction: q + i < l_pac <= num_bases.
+                    *slot = pac_base_at(pac, q + i as u64, enc).unwrap();
+                }
+            }
+        }
+        n
+    } else {
+        // RC region: base at doubled position p is `fwd(2*l_pac-1-p) ^ 3`.
+        // The forward positions descend as p ascends; stop at the sentinel.
+        let avail = (2 * l_pac - q) as usize;
+        let n = avail.min(out.len());
+        match enc {
+            PacEncoding::Unpacked => {
+                // Forward positions covered: mirror(q) down to mirror(q+n-1).
+                // mirror(q) = 2*l_pac-1-q (descending), so the slice is
+                // pac[hi-n+1 ..= hi] read in reverse, each XORed with 3.
+                let hi = (2 * l_pac - 1 - q) as usize; // mirror of q (highest fwd pos)
+                let lo = hi + 1 - n; // mirror of q+n-1
+                let src = &pac[lo..=hi];
+                for (i, slot) in out[..n].iter_mut().enumerate() {
+                    *slot = src[n - 1 - i] ^ 3;
+                }
+            }
+            PacEncoding::Packed { .. } => {
+                for (i, slot) in out[..n].iter_mut().enumerate() {
+                    let fwd_pos = 2 * l_pac - 1 - (q + i as u64);
+                    *slot = pac_base_at(pac, fwd_pos, enc).unwrap() ^ 3;
+                }
+            }
+        }
+        n
+    }
+}
+
+/// Vectorized (word-at-a-time) re-implementation of
+/// [`compare_query_vs_suffix_2x_scalar`]. Reads the doubled reference in
+/// [`CHUNK_BASES`]-base chunks via [`fill_doubled_chunk`] and compares each
+/// chunk against the query 8 bases (one `u64`) at a time, locating the first
+/// mismatching base within a word from the XOR's trailing-zero count. The
+/// observable contract — `(ref_less, lcp)` and the sentinel/exhaustion rule — is
+/// byte-identical to the scalar version (asserted by proptest over both
+/// encodings).
+#[inline]
+pub(crate) fn compare_query_vs_suffix_2x(
+    query: &[u8],
+    sa_pos: u64,
+    pac: &[u8],
+    enc: PacEncoding,
+    l_pac: u64,
+) -> (bool, u32) {
+    let mut lcp: u32 = 0;
+    let mut q_off: usize = 0; // bases of `query` already matched
+    let mut buf = [0u8; CHUNK_BASES];
+
+    while q_off < query.len() {
+        let want = (query.len() - q_off).min(CHUNK_BASES);
+        let n = fill_doubled_chunk(pac, enc, l_pac, sa_pos + q_off as u64, &mut buf[..want]);
+        if n == 0 {
+            // Ref exhausted (sentinel/end) with query bases remaining.
+            return (true, lcp);
+        }
+        let qchunk = &query[q_off..q_off + n];
+        let rchunk = &buf[..n];
+
+        // Word-at-a-time over the filled bases; final partial word handled below.
+        let mut k = 0usize;
+        while k + 8 <= n {
+            let qw = u64::from_le_bytes(qchunk[k..k + 8].try_into().unwrap());
+            let rw = u64::from_le_bytes(rchunk[k..k + 8].try_into().unwrap());
+            let xor = qw ^ rw;
+            if xor != 0 {
+                let byte = (xor.trailing_zeros() / 8) as usize;
+                let idx = k + byte;
+                return (rchunk[idx] < qchunk[idx], lcp + idx as u32);
+            }
+            k += 8;
+        }
+        // Tail (< 8 bases) of this chunk, one base at a time.
+        while k < n {
+            if rchunk[k] != qchunk[k] {
+                return (rchunk[k] < qchunk[k], lcp + k as u32);
+            }
+            k += 1;
+        }
+
+        lcp += n as u32;
+        q_off += n;
+        // If `n < want` the fill stopped at the forward→RC boundary; the next
+        // iteration fills the next region. A short fill that is actually the
+        // sentinel/end is detected next round (`fill_doubled_chunk` returns 0).
+    }
+    (false, lcp) // full query matched a prefix of the (longer-or-equal) ref suffix
+}
+
+/// Key-aware variant of [`compare_query_vs_suffix_2x`]. Uses a precomputed
+/// query 32-mer key (`query_key = tokenize_32mer(query, min(32, query.len()))`)
+/// and the stored suffix key (`stored_key`, from `LearnedIndex::key_at`) to
+/// resolve the first `min(32, query.len())` bases of the compare from two `u64`
+/// XORs — no per-base pac reads or forward/RC demux for that prefix. This is
+/// BWA-MEME's `suffixarray_uint64` trick.
+///
+/// MUST produce a `(ref_less, lcp)` byte-identical to
+/// [`compare_query_vs_suffix_2x_scalar`].
+///
+/// # Sentinel guard (correctness-critical)
+///
+/// The stored key was produced by `key_for_position_2x`, which **T-pads** a
+/// suffix shorter than 32 real doubled bases (sentinel `0` → T=3). T-pad sorts
+/// LARGE, but the compare's contract treats the sentinel / end-of-reference as
+/// SMALLEST. Those orderings are OPPOSITE, so the key gives the WRONG ordering
+/// for any suffix within 32 bases of the doubled-text end. The key path is
+/// therefore taken ONLY when the suffix has ≥32 real doubled bases —
+/// `sa_pos + 32 <= 2 * l_pac` — guaranteeing the stored key is a true 32-mer
+/// with no T-pad. Otherwise the safe vectorized pac compare is used (it handles
+/// the sentinel correctly).
+///
+/// `stored_key` is `None` for a mode-1 sidecar (no inline keys); that also
+/// routes to the vectorized fallback.
+#[inline]
+pub(crate) fn compare_query_vs_suffix_2x_keyed(
+    query: &[u8],
+    query_key: u64,
+    stored_key: Option<u64>,
+    sa_pos: u64,
+    pac: &[u8],
+    enc: PacEncoding,
+    l_pac: u64,
+) -> (bool, u32) {
+    // Key path is valid only with a stored key AND a full 32 real doubled bases
+    // at `sa_pos` (no T-pad / no sentinel within the first 32). Otherwise fall
+    // back to the safe vectorized compare, which honours the sentinel rule.
+    let stored_key = match stored_key {
+        Some(k) if sa_pos + KMER_LEN as u64 <= 2 * l_pac => k,
+        _ => return compare_query_vs_suffix_2x(query, sa_pos, pac, enc, l_pac),
+    };
+
+    // Number of query bases the keys can resolve (the high `nbases` 2-bit fields).
+    let nbases = query.len().min(KMER_LEN);
+    if nbases == 0 {
+        // Empty query matched (a prefix of) the ref suffix; scalar returns this.
+        return (false, 0);
+    }
+    // Mask off the low (T-pad) bits of both keys so only the active `nbases`
+    // 2-bit fields participate. `bits` is in 2..=64, so the shift is well-defined.
+    let bits = nbases * 2;
+    let mask: u64 = if bits >= 64 {
+        u64::MAX
+    } else {
+        !((1u64 << (64 - bits)) - 1)
+    };
+    let xor = (query_key ^ stored_key) & mask;
+
+    if xor != 0 {
+        // First differing 2-bit field (MSB-first): leading_zeros/2 is its index.
+        let idx = (xor.leading_zeros() / 2) as usize;
+        // Order by that base. Extract the 2-bit field from each key.
+        let shift = 2 * (KMER_LEN - 1 - idx) as u32;
+        let qb = (query_key >> shift) & 0x3;
+        let rb = (stored_key >> shift) & 0x3;
+        return (rb < qb, idx as u32);
+    }
+
+    // First `nbases` bases are equal.
+    if query.len() <= KMER_LEN {
+        // Query fully consumed within the first 32 bases and matched a prefix of
+        // the (longer-or-equal) ref suffix.
+        (false, query.len() as u32)
+    } else {
+        // Query is longer than 32 and the first 32 matched. Continue from base 32
+        // via the vectorized pac compare on the remaining query vs `sa_pos + 32`.
+        let (ref_less, tail_lcp) = compare_query_vs_suffix_2x(
+            &query[KMER_LEN..],
+            sa_pos + KMER_LEN as u64,
+            pac,
+            enc,
+            l_pac,
+        );
+        (ref_less, KMER_LEN as u32 + tail_lcp)
+    }
+}
+
+/// Test/profiling-only SA-probe counter (a cold `sa_position_for` read per probe).
+///
+/// Enabled by the `spectrum-probe-count` feature; OFF by default so the production
+/// hot path carries no counter. Used by `examples/profile_spectrum.rs` to report
+/// median/p99 probes per backward left step before vs after the model launch.
+#[cfg(feature = "spectrum-probe-count")]
+pub mod probe_count {
+    use std::cell::{Cell, RefCell};
+
+    /// Max prefix depth tracked in the per-depth histogram (queries are ≤ ~100 bp).
+    pub const MAX_DEPTH: usize = 256;
+
+    thread_local! {
+        static PROBES: Cell<u64> = const { Cell::new(0) };
+        /// Current prefix depth `m`, set by the forward search before each step.
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+        /// Per-depth probe counts (`DEPTH_PROBES[m]`), accumulated across resets.
+        static DEPTH_PROBES: RefCell<[u64; MAX_DEPTH]> = const { RefCell::new([0u64; MAX_DEPTH]) };
+    }
+
+    /// Reset the per-thread probe counter to zero.
+    pub fn reset() {
+        PROBES.with(|p| p.set(0));
+    }
+
+    /// Read the current per-thread probe count.
+    pub fn get() -> u64 {
+        PROBES.with(|p| p.get())
+    }
+
+    /// Set the current prefix depth `m` (clamped) for per-depth bucketing.
+    #[inline]
+    pub fn set_depth(m: usize) {
+        DEPTH.with(|d| d.set(m.min(MAX_DEPTH - 1)));
+    }
+
+    /// Zero the per-depth probe histogram (totals accumulate until reset).
+    pub fn reset_depth_probes() {
+        DEPTH_PROBES.with(|d| *d.borrow_mut() = [0u64; MAX_DEPTH]);
+    }
+
+    /// Snapshot the per-depth probe histogram (`[m] = probes at prefix depth m`).
+    pub fn depth_probes() -> Vec<u64> {
+        DEPTH_PROBES.with(|d| d.borrow().to_vec())
+    }
+
+    /// Increment the per-thread probe counter (one cold SA position read) and
+    /// the current depth's bucket.
+    #[inline]
+    pub(crate) fn bump() {
+        PROBES.with(|p| p.set(p.get() + 1));
+        let m = DEPTH.with(|d| d.get());
+        DEPTH_PROBES.with(|d| d.borrow_mut()[m] += 1);
+    }
+}
+
+/// No-op when the probe counter feature is disabled (production builds).
+#[cfg(not(feature = "spectrum-probe-count"))]
+#[inline(always)]
+fn bump_probe() {}
+
+/// Count one SA probe when the `spectrum-probe-count` feature is enabled.
+#[cfg(feature = "spectrum-probe-count")]
+#[inline]
+fn bump_probe() {
+    probe_count::bump();
+}
+
+/// Set the current prefix depth for per-depth probe bucketing (no-op in
+/// production builds).
+#[cfg(not(feature = "spectrum-probe-count"))]
+#[inline(always)]
+fn set_probe_depth(_m: usize) {}
+
+/// Set the current prefix depth for per-depth probe bucketing.
+#[cfg(feature = "spectrum-probe-count")]
+#[inline]
+fn set_probe_depth(m: usize) {
+    probe_count::set_depth(m);
+}
+
 /// One breakpoint of an SMEM spectrum: the SA interval `[sa_start, sa_start+occ_count)`
 /// matching the query to length `match_len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +372,353 @@ pub struct SmemStep {
     pub match_len: u64,
 }
 
+/// One backward-extension request (the lockstep analogue of the serial
+/// `backward_spectrum` arguments). `read` is borrowed for the driver's lifetime.
+pub struct BwdTask<'a> {
+    /// SA interval start (from the forward search that seeded this anchor).
+    pub sa_start: u64,
+    /// SA interval size (occurrence count).
+    pub occ_count: u64,
+    /// Length of the right-anchored match (`read[pivot..pivot+anchor_len)`).
+    pub anchor_len: u64,
+    /// The full read.
+    pub read: &'a [u8],
+    /// Pivot index: the backward search extends left from `read[pivot-1]`.
+    pub pivot: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FbSub {
+    GallopLeft,
+    GallopRight,
+    Binary,
+}
+
+/// `find_boundary` as a probe-driven state machine over `[dlo, dhi)`.
+struct FbState {
+    dlo: u64,
+    dhi: u64,
+    lo: u64,
+    hi: u64,
+    span: u64,
+    sub: FbSub,
+    done_val: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Which {
+    Lower,
+    Upper,
+}
+
+impl FbState {
+    fn new(dlo: u64, dhi: u64, seed_lo: u64, seed_hi: u64) -> Self {
+        let mut lo = seed_lo.clamp(dlo, dhi);
+        let mut hi = seed_hi.clamp(lo, dhi);
+        let mut done_val = None;
+        if lo == hi {
+            if hi < dhi {
+                hi += 1;
+            } else if lo > dlo {
+                lo -= 1;
+            } else {
+                done_val = Some(dlo);
+            }
+        }
+        let span = (hi - lo).max(1);
+        FbState {
+            dlo,
+            dhi,
+            lo,
+            hi,
+            span,
+            sub: FbSub::GallopLeft,
+            done_val,
+        }
+    }
+
+    /// The SA index this boundary wants to probe next, or `None` if the boundary
+    /// is resolved (then `result()` holds the answer).
+    fn next_probe(&mut self) -> Option<u64> {
+        if self.done_val.is_some() {
+            return None;
+        }
+        loop {
+            match self.sub {
+                FbSub::GallopLeft => {
+                    if self.lo > self.dlo {
+                        return Some(self.lo - 1);
+                    }
+                    self.sub = FbSub::GallopRight;
+                }
+                FbSub::GallopRight => {
+                    if self.hi < self.dhi {
+                        return Some(self.hi - 1);
+                    }
+                    self.sub = FbSub::Binary;
+                }
+                FbSub::Binary => {
+                    if self.lo < self.hi {
+                        return Some(self.lo + (self.hi - self.lo) / 2);
+                    }
+                    self.done_val = Some(self.lo);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Feed `go_right(probed_index)` back; updates state. `mid` is the index that
+    /// was probed (recomputed identically to `next_probe`).
+    fn feed(&mut self, r: bool) {
+        match self.sub {
+            FbSub::GallopLeft => {
+                if !r {
+                    self.lo = self.lo.saturating_sub(self.span).max(self.dlo);
+                    self.span = self.span.saturating_mul(2);
+                } else {
+                    self.sub = FbSub::GallopRight;
+                }
+            }
+            FbSub::GallopRight => {
+                if r {
+                    self.hi = self.hi.saturating_add(self.span).min(self.dhi);
+                    self.span = self.span.saturating_mul(2);
+                    self.sub = FbSub::GallopLeft;
+                } else {
+                    self.sub = FbSub::Binary;
+                }
+            }
+            FbSub::Binary => {
+                let mid = self.lo + (self.hi - self.lo) / 2;
+                if r {
+                    self.lo = mid + 1;
+                } else {
+                    self.hi = mid;
+                }
+            }
+        }
+    }
+
+    fn result(&self) -> Option<u64> {
+        self.done_val
+    }
+}
+
+struct BwdStepper<'a> {
+    read: &'a [u8],
+    pivot: usize,
+    anchor_len: u64,
+    sa_num: u64,
+    p_start: usize,
+    p_key: u64,
+    win_hi: u64,
+    which: Which,
+    lower: u64,
+    left_ext: u64,
+    fb: FbState,
+    steps: Vec<SmemStep>,
+    finished: bool,
+}
+
+impl<'a> BwdStepper<'a> {
+    fn p_len(&self) -> usize {
+        self.pivot + self.anchor_len as usize - self.p_start
+    }
+
+    /// Initialize the Lower search for the current `left_ext`; returns false if the
+    /// extension cannot continue (left_ext==pivot or ambiguous base). On true, `fb`
+    /// is primed (its `next_probe` gives the first probe, possibly None if the
+    /// window resolved degenerately — caller must then drive the boundary handoff).
+    fn begin_left_step(&mut self, idx: &LearnedIndex) -> bool {
+        if self.left_ext as usize >= self.pivot {
+            return false;
+        }
+        let c = self.read[self.pivot - 1 - self.left_ext as usize];
+        if c >= 4 {
+            return false;
+        }
+        self.p_start = self.pivot - 1 - self.left_ext as usize;
+        let p_slice = &self.read[self.p_start..self.pivot + self.anchor_len as usize];
+        self.p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+        let (pred, err) = idx.lookup(self.p_key);
+        let win_lo = pred.saturating_sub(err);
+        self.win_hi = pred.saturating_add(err).saturating_add(1).min(self.sa_num);
+        self.which = Which::Lower;
+        self.fb = FbState::new(0, self.sa_num, win_lo, self.win_hi);
+        true
+    }
+
+    /// The SA index to probe next, or None if the whole task is finished. Drives
+    /// across boundary/left-step handoffs that need no probe (degenerate windows).
+    fn next_probe(&mut self, idx: &LearnedIndex) -> Option<u64> {
+        loop {
+            if self.finished {
+                return None;
+            }
+            if let Some(mid) = self.fb.next_probe() {
+                return Some(mid);
+            }
+            // Current boundary resolved with no (further) probe -> handoff.
+            if !self.advance_boundary(idx) {
+                return None;
+            }
+        }
+    }
+
+    /// One probe result: compute (ref_less,lcp), feed the active boundary, and if
+    /// it just resolved, perform the boundary/left-step handoff.
+    #[allow(clippy::too_many_arguments)]
+    fn advance(
+        &mut self,
+        idx: &LearnedIndex,
+        pos: u64,
+        key: Option<u64>,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) {
+        let (ref_less, lcp) = idx.bwd_compare(self, pos, key, pac, enc, l_pac);
+        let r = match self.which {
+            Which::Lower => ref_less,
+            Which::Upper => (lcp as usize) >= self.p_len(),
+        };
+        self.fb.feed(r);
+    }
+
+    /// Move from a resolved boundary to the next state. Returns false when the
+    /// whole task is finished. Lower-resolved -> start Upper. Upper-resolved ->
+    /// emit the step (or stop), advance left_ext, begin the next left step.
+    fn advance_boundary(&mut self, idx: &LearnedIndex) -> bool {
+        let b = match self.fb.result() {
+            Some(b) => b,
+            None => return true, // not resolved; keep probing
+        };
+        match self.which {
+            Which::Lower => {
+                self.lower = b;
+                self.which = Which::Upper;
+                self.fb = FbState::new(self.lower, self.sa_num, self.win_hi, self.win_hi);
+                true
+            }
+            Which::Upper => {
+                let upper = b;
+                if upper <= self.lower {
+                    self.finished = true;
+                    return false;
+                }
+                self.left_ext += 1;
+                self.steps.push(SmemStep {
+                    sa_start: self.lower,
+                    occ_count: upper - self.lower,
+                    match_len: self.anchor_len + self.left_ext,
+                });
+                if !self.begin_left_step(idx) {
+                    self.finished = true;
+                    return false;
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Precomputed per-length SA lower-bound tables for accelerating the shallow
+/// (`m <= k`) bands of [`LearnedIndex::forward_spectrum`]. See
+/// [`LearnedIndex::build_kmer_table`].
+pub struct KmerTable {
+    /// Max prefix length covered.
+    pub k: u32,
+    /// `lo[m-1][w]` / `hi[m-1][w]` = SA lower/upper bound of the length-`m` mer
+    /// `w` (lex index), `4^m` entries each. Separate per-length tables (not a
+    /// single padded k-mer table) and an explicit upper bound (not `lo[w+1]`),
+    /// because short text-end suffixes are placed by the exact compare —
+    /// derivation mis-orders a bare length-`<m` suffix against `qm`·A…A.
+    lo: Vec<Vec<u64>>,
+    hi: Vec<Vec<u64>>,
+}
+
+impl KmerTable {
+    /// Borrow the table's components `(k, lo, hi)` for serialization to a
+    /// `.kmt` file. `lo[m-1]` / `hi[m-1]` are the length-`m` bound arrays.
+    pub(crate) fn parts(&self) -> (u32, &[Vec<u64>], &[Vec<u64>]) {
+        (self.k, &self.lo, &self.hi)
+    }
+}
+
+impl KmerBounds for KmerTable {
+    #[inline]
+    fn k(&self) -> u32 {
+        self.k
+    }
+    #[inline]
+    fn lo(&self, m: usize, w: u64) -> u64 {
+        self.lo[m - 1][w as usize]
+    }
+    #[inline]
+    fn hi(&self, m: usize, w: u64) -> u64 {
+        self.hi[m - 1][w as usize]
+    }
+}
+
+/// Emit/coalesce one forward breakpoint: push a new step when `occ` changes,
+/// else extend the previous step's `match_len`. Matches `forward_spectrum`'s
+/// inline coalescing so the tabled variant produces an identical trace.
+#[inline]
+fn push_step(
+    steps: &mut Vec<SmemStep>,
+    prev_occ: &mut u64,
+    sa_start: u64,
+    occ: u64,
+    match_len: u64,
+) {
+    if occ != *prev_occ {
+        steps.push(SmemStep {
+            sa_start,
+            occ_count: occ,
+            match_len,
+        });
+        *prev_occ = occ;
+    } else if let Some(last) = steps.last_mut() {
+        last.match_len = match_len;
+    }
+}
+
 impl LearnedIndex {
+    /// Emit the maximal forward match of a UNIQUE suffix as one coalesced step,
+    /// using a single SA probe. Precondition: the active narrowing interval is
+    /// exactly `[uniq, uniq + 1)` — `query`'s prefix-so-far matches the lone
+    /// suffix at `sa_position_for(uniq)`. Its full forward match is the LCP of
+    /// the WHOLE `query` against that one suffix (`compare_query_vs_suffix_2x_keyed`
+    /// returns it directly), so this replaces the two boundary binary searches
+    /// the narrowing loop spends per remaining depth re-confirming a 1-wide
+    /// interval. Byte-identical: the loop would emit exactly one `occ == 1` step
+    /// extended to the same LCP, which `push_step`'s same-`occ` coalescing
+    /// reproduces. `uniq` supplies `sa_start` only if this is the FIRST
+    /// `occ == 1` step (a fresh push); once an `occ == 1` step already exists
+    /// (`*prev_occ == 1`) `push_step` only extends its `match_len` and ignores
+    /// `uniq` — and in that case `uniq` equals the existing step's `sa_start`
+    /// anyway (the lone suffix's index does not change as the match deepens).
+    #[allow(clippy::too_many_arguments)]
+    fn push_unique_suffix_tail(
+        &self,
+        steps: &mut Vec<SmemStep>,
+        prev_occ: &mut u64,
+        uniq: u64,
+        query: &[u8],
+        query_key: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) {
+        let pos = self.sa_position_for(uniq);
+        bump_probe();
+        let key = self.key_at(uniq);
+        let (_, lcp) =
+            compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
+        push_step(steps, prev_occ, uniq, 1, u64::from(lcp));
+    }
+
     /// Forward spectrum from a pivot: the breakpoint trace of the narrowing SA
     /// interval, in ascending `match_len`, up to the maximal forward match.
     /// `query = read[pivot..]` (bases 0..=3). `pac` is the FORWARD pac; reference
@@ -86,8 +738,8 @@ impl LearnedIndex {
             return steps;
         }
         // A packed pac that cannot hold its declared base count must fail closed
-        // before any walker work: a truncated buffer would otherwise be misread
-        // as a sentinel and yield a wrong interval. (`pac_base_at` is hardened to
+        // before any walk: a truncated buffer would otherwise be misread as a
+        // sentinel and yield a wrong interval. (`pac_base_at` is hardened to
         // return `None`, but truncation must not silently extend.)
         if let PacEncoding::Packed { num_bases } = enc {
             if validate_packed_pac(pac, num_bases, "forward_spectrum").is_err() {
@@ -96,12 +748,35 @@ impl LearnedIndex {
         }
         let sa_num = self.sa_num();
         let l_pac = self.l_pac();
+        // Precompute the query's 32-mer key ONCE: the query is fixed across all
+        // prefix steps. The keyed compare masks this to the active prefix length
+        // `qm.len()`, so the high `qm.len()` 2-bit fields (which equal the first
+        // `qm.len()` bases) are reused for every `m` — no per-step recompute.
+        let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
         // Current interval = interval(m-1); starts as the whole SA (m=0).
         let mut lo = 0u64;
         let mut hi = sa_num;
         let mut prev_occ = u64::MAX;
 
         for m in 1..=query.len() {
+            // Bucket the probes of this prefix step under depth `m` (profiling
+            // only; no-op without the `spectrum-probe-count` feature).
+            set_probe_depth(m);
+            // occ==1 fast path: a unique suffix's remaining forward match is one
+            // direct compare, not a boundary search at every remaining depth.
+            if hi - lo == 1 {
+                self.push_unique_suffix_tail(
+                    &mut steps,
+                    &mut prev_occ,
+                    lo,
+                    query,
+                    query_key,
+                    pac,
+                    enc,
+                    l_pac,
+                );
+                return steps;
+            }
             let qm = &query[..m];
             // Lower bound of qm within [lo, hi): first index whose suffix is >= qm.
             let mut a = lo;
@@ -109,7 +784,10 @@ impl LearnedIndex {
             while a < b {
                 let mid = a + (b - a) / 2;
                 let pos = self.sa_position_for(mid);
-                let (ref_less, _) = compare_query_vs_suffix_2x(qm, pos, pac, enc, l_pac);
+                bump_probe();
+                let key = self.key_at(mid);
+                let (ref_less, _) =
+                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
                 if ref_less {
                     a = mid + 1;
                 } else {
@@ -123,7 +801,10 @@ impl LearnedIndex {
             while c < d {
                 let mid = c + (d - c) / 2;
                 let pos = self.sa_position_for(mid);
-                let (_, lcp) = compare_query_vs_suffix_2x(qm, pos, pac, enc, l_pac);
+                bump_probe();
+                let key = self.key_at(mid);
+                let (_, lcp) =
+                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
                 if (lcp as usize) >= qm.len() {
                     c = mid + 1;
                 } else {
@@ -151,11 +832,394 @@ impl LearnedIndex {
         steps
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// Lower bound of prefix `qm` within `[a, b)`: first SA index whose suffix
+    /// is `>= qm`. Mirrors `forward_spectrum`'s lower-bound search exactly (same
+    /// keyed compare), so a table built from it matches the search.
+    fn lower_bound_prefix(
+        &self,
+        qm: &[u8],
+        qm_key: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+        mut a: u64,
+        mut b: u64,
+    ) -> u64 {
+        while a < b {
+            let mid = a + (b - a) / 2;
+            let pos = self.sa_position_for(mid);
+            bump_probe();
+            let key = self.key_at(mid);
+            let (ref_less, _) =
+                compare_query_vs_suffix_2x_keyed(qm, qm_key, key, pos, pac, enc, l_pac);
+            if ref_less {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        a
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Upper bound of prefix `qm` within `[c, b)`: first SA index (>= the lower
+    /// bound) whose suffix does NOT have `qm` as a prefix. Mirrors
+    /// `forward_spectrum`'s upper-bound search (lcp-based), so it orders short
+    /// text-end suffixes identically — `lo[w+1]` cannot (a bare length-`<m`
+    /// suffix sorts below `(qm+1)`·A…A but is still the true upper bound).
+    fn upper_bound_prefix(
+        &self,
+        qm: &[u8],
+        qm_key: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+        mut c: u64,
+        mut d: u64,
+    ) -> u64 {
+        while c < d {
+            let mid = c + (d - c) / 2;
+            let pos = self.sa_position_for(mid);
+            bump_probe();
+            let key = self.key_at(mid);
+            let (_, lcp) = compare_query_vs_suffix_2x_keyed(qm, qm_key, key, pos, pac, enc, l_pac);
+            if (lcp as usize) >= qm.len() {
+                c = mid + 1;
+            } else {
+                d = mid;
+            }
+        }
+        c
+    }
+
+    /// Build the per-length SA lower/upper-bound tables (PROTOTYPE; `k <= 12`
+    /// recommended).
+    ///
+    /// For each length `m = 1..=k`, `lo[m-1][w]` and `hi[m-1][w]` are the SA
+    /// lower/upper bounds of the length-`m` mer `w` (`4^m` entries each),
+    /// computed by the same lower-/upper-bound search [`forward_spectrum`] uses
+    /// (so short text-end suffixes are ordered identically). The `m`-prefix
+    /// interval of a query is then `[lo[m-1][p], hi[m-1][p])` for `p` = the
+    /// query's `m`-mer index — pure index lookups, no SA probes. An explicit
+    /// `hi` is required (not `lo[p+1]`): a bare length-`<m` text-end suffix can
+    /// sort below `(qm+1)·A…A`, so the next mer's lower bound is not the upper
+    /// bound of `qm`.
+    ///
+    /// Memory: `sum_{m=1}^{k} 4^m` entries × 2 (lo+hi) ≈ `2.67 · 4^k`
+    /// (k=12 → ~44.7 M × 8 B ≈ 358 MB). A production version can collapse this
+    /// to a single k-mer table plus a small text-end short-suffix correction
+    /// (~134 MB).
+    pub fn build_kmer_table(&self, k: u32, pac: &[u8], enc: PacEncoding) -> KmerTable {
+        assert!((1..=16).contains(&k), "k-mer table k must be in 1..=16");
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        let mut lo: Vec<Vec<u64>> = Vec::with_capacity(k as usize);
+        let mut hi: Vec<Vec<u64>> = Vec::with_capacity(k as usize);
+        for m in 1..=k {
+            let nm: u64 = 1u64 << (2 * m);
+            let pairs: Vec<(u64, u64)> = (0..nm)
+                .into_par_iter()
+                .map(|w| {
+                    let mut bases = [0u8; 16];
+                    for (j, slot) in bases.iter_mut().enumerate().take(m as usize) {
+                        *slot = ((w >> (2 * (m as usize - 1 - j))) & 0b11) as u8;
+                    }
+                    let qm = &bases[..m as usize];
+                    let qm_key = tokenize_32mer(qm, m as usize);
+                    let l = self.lower_bound_prefix(qm, qm_key, pac, enc, l_pac, 0, sa_num);
+                    let h = self.upper_bound_prefix(qm, qm_key, pac, enc, l_pac, l, sa_num);
+                    (l, h)
+                })
+                .collect();
+            let (lm, hm): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
+            lo.push(lm);
+            hi.push(hm);
+        }
+        KmerTable { k, lo, hi }
+    }
+
+    /// Table-accelerated forward spectrum (PROTOTYPE): the shallow bands
+    /// (`m <= table.k`) come from the K-mer table with zero SA probes; the deep
+    /// bands (`m > table.k`) nested-narrow within the table's `m=k` interval,
+    /// exactly as [`forward_spectrum`] does. Produces a byte-identical
+    /// `SmemStep` trace.
+    pub fn forward_spectrum_tabled(
+        &self,
+        query: &[u8],
+        pac: &[u8],
+        enc: PacEncoding,
+        table: &impl KmerBounds,
+    ) -> Vec<SmemStep> {
+        let mut steps = Vec::new();
+        if query.is_empty() {
+            return steps;
+        }
+        // Mirror `forward_spectrum`/`forward_spectrum_auto`: a packed pac that
+        // cannot hold its declared base count must fail closed before any walk
+        // (this public entry point is reachable directly, not only via `_auto`).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "forward_spectrum_tabled").is_err() {
+                return steps;
+            }
+        }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        let k = table.k() as usize;
+        let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+        let mut prev_occ = u64::MAX;
+        let mut lo = 0u64;
+        let mut hi = sa_num;
+
+        // ── shallow bands m=1..=min(k, len): O(1) from the per-length tables ──
+        let shallow = k.min(query.len());
+        let mut prefix: u64 = 0; // running m-mer lex index
+        for m in 1..=shallow {
+            set_probe_depth(m);
+            prefix = (prefix << 2) | query[m - 1] as u64;
+            let kk = table.lo(m, prefix);
+            let cc = table.hi(m, prefix);
+            let occ = cc.saturating_sub(kk);
+            if occ == 0 {
+                return steps; // maximal match is m-1 (mirrors forward_spectrum)
+            }
+            push_step(&mut steps, &mut prev_occ, kk, occ, m as u64);
+            lo = kk;
+            hi = cc;
+        }
+
+        // ── deep bands m=k+1..=len: nested-narrow with SA probes ──────────────
+        for m in (shallow + 1)..=query.len() {
+            set_probe_depth(m);
+            // occ==1 fast path (mirrors `forward_spectrum`): once the shallow
+            // table bands or a prior deep step narrow to a single suffix, finish
+            // with one direct compare instead of per-depth boundary searches.
+            if hi - lo == 1 {
+                self.push_unique_suffix_tail(
+                    &mut steps,
+                    &mut prev_occ,
+                    lo,
+                    query,
+                    query_key,
+                    pac,
+                    enc,
+                    l_pac,
+                );
+                return steps;
+            }
+            let qm = &query[..m];
+            let mut a = lo;
+            let mut b = hi;
+            while a < b {
+                let mid = a + (b - a) / 2;
+                let pos = self.sa_position_for(mid);
+                bump_probe();
+                let key = self.key_at(mid);
+                let (ref_less, _) =
+                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
+                if ref_less {
+                    a = mid + 1;
+                } else {
+                    b = mid;
+                }
+            }
+            let kk = a;
+            let mut c = kk;
+            let mut d = hi;
+            while c < d {
+                let mid = c + (d - c) / 2;
+                let pos = self.sa_position_for(mid);
+                bump_probe();
+                let key = self.key_at(mid);
+                let (_, lcp) =
+                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
+                if (lcp as usize) >= qm.len() {
+                    c = mid + 1;
+                } else {
+                    d = mid;
+                }
+            }
+            let occ = c - kk;
+            if occ == 0 {
+                break;
+            }
+            push_step(&mut steps, &mut prev_occ, kk, occ, m as u64);
+            lo = kk;
+            hi = c;
+        }
+        steps
+    }
+
+    /// Forward spectrum using the loaded `.kmt` k-mer table when present
+    /// (shallow bands resolved with zero SA probes), else the full search.
+    /// Byte-identical to [`forward_spectrum`] either way; this is the
+    /// transparent entry point the FFI calls.
+    pub fn forward_spectrum_auto(
+        &self,
+        query: &[u8],
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<SmemStep> {
+        // Guard the packed pac before the `.kmt`-accelerated walk too (the
+        // non-kmt branch re-checks inside `forward_spectrum`; the check is a
+        // cheap no-op there).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "forward_spectrum").is_err() {
+                return Vec::new();
+            }
+        }
+        match &self.kmt {
+            Some(table) => self.forward_spectrum_tabled(query, pac, enc, table),
+            None => self.forward_spectrum(query, pac, enc),
+        }
+    }
+
+    /// Start a stepper; performs the first model lookup + Lower `FbState` init, or
+    /// finishes immediately (occ==0, or no left base, or a degenerate first window
+    /// that resolves with no probe).
+    fn bwd_stepper_new<'a>(&self, t: &BwdTask<'a>) -> BwdStepper<'a> {
+        let sa_num = self.sa_num();
+        let mut s = BwdStepper {
+            read: t.read,
+            pivot: t.pivot,
+            anchor_len: t.anchor_len,
+            sa_num,
+            p_start: 0,
+            p_key: 0,
+            win_hi: 0,
+            which: Which::Lower,
+            lower: 0,
+            left_ext: 0,
+            fb: FbState::new(0, 0, 0, 0),
+            steps: Vec::new(),
+            finished: false,
+        };
+        // Fail closed on an out-of-range anchor window, mirroring the serial
+        // `backward_spectrum_inner`'s `pivot + anchor_len <= read.len()` guard —
+        // otherwise a malformed lockstep task panics here while the serial path
+        // returns empty, breaking the byte-identical-strategy contract.
+        let valid_window = t
+            .pivot
+            .checked_add(t.anchor_len as usize)
+            .map(|end| end <= t.read.len())
+            .unwrap_or(false);
+        if t.occ_count == 0 || !valid_window || !s.begin_left_step(self) {
+            s.finished = true;
+        }
+        s
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bwd_compare(
+        &self,
+        s: &BwdStepper,
+        pos: u64,
+        key: Option<u64>,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) -> (bool, u32) {
+        // One SA probe per call, matching the serial `ref_less`/`shares_prefix`
+        // so probe-count profiling of the lockstep path is consistent (no-op in
+        // production builds).
+        bump_probe();
+        let p_slice = &s.read[s.p_start..s.pivot + s.anchor_len as usize];
+        compare_query_vs_suffix_2x_keyed(p_slice, s.p_key, key, pos, pac, enc, l_pac)
+    }
+
+    /// Drive ONE stepper to completion serially. Equivalent to `backward_spectrum`;
+    /// exists to prove the stepper is byte-identical before lockstepping.
+    #[allow(dead_code)]
+    fn backward_spectrum_via_stepper(
+        &self,
+        t: &BwdTask,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<SmemStep> {
+        let l_pac = self.l_pac();
+        let mut s = self.bwd_stepper_new(t);
+        while let Some(mid) = s.next_probe(self) {
+            let pos = self.sa_position_for(mid);
+            let key = self.key_at(mid);
+            s.advance(self, pos, key, pac, enc, l_pac);
+        }
+        s.steps
+    }
+
+    /// Drive N backward steppers in lockstep. Each round batch-loads every active
+    /// task's current probe (`sa_position_for` + `key_at` — independent loads the
+    /// CPU keeps in flight = MLP), then advances every task. Output[i] is byte-
+    /// identical to `backward_spectrum(tasks[i]…)`.
+    pub fn backward_spectrum_lockstep(
+        &self,
+        tasks: &[BwdTask],
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<Vec<SmemStep>> {
+        let l_pac = self.l_pac();
+        let mut steppers: Vec<BwdStepper> = tasks.iter().map(|t| self.bwd_stepper_new(t)).collect();
+        let mut mids: Vec<Option<u64>> = steppers.iter_mut().map(|s| s.next_probe(self)).collect();
+        // Per-round scratch buffers, allocated ONCE and reused (entries for
+        // inactive tasks hold stale values but are never read — the advance loop
+        // guards on `mids[i].is_some()`).
+        let mut posv: Vec<u64> = vec![0; steppers.len()];
+        let mut keyv: Vec<Option<u64>> = vec![None; steppers.len()];
+        loop {
+            // Phase 1: batch the cold loads (independent -> memory-level parallelism).
+            let mut any = false;
+            for i in 0..steppers.len() {
+                if let Some(mid) = mids[i] {
+                    any = true;
+                    posv[i] = self.sa_position_for(mid);
+                    keyv[i] = self.key_at(mid);
+                }
+            }
+            if !any {
+                break;
+            }
+            // Phase 2: advance every active task and fetch its next probe.
+            for i in 0..steppers.len() {
+                if mids[i].is_some() {
+                    steppers[i].advance(self, posv[i], keyv[i], pac, enc, l_pac);
+                    mids[i] = steppers[i].next_probe(self);
+                }
+            }
+        }
+        steppers.into_iter().map(|s| s.steps).collect()
+    }
+
     /// Backward spectrum: refine the right-anchored interval `[sa_start,
     /// sa_start+occ_count)` (matching `read[pivot..pivot+anchor_len)`) leftward.
     /// Each emitted step's `match_len` is the TOTAL span (`anchor_len + left_ext`).
-    /// `pac` is the FORWARD pac. Requires the sidecar to carry an `.isa` (returns
-    /// an empty trace if `isa_for_refpos` is unavailable).
+    /// `pac` is the FORWARD pac.
+    ///
+    /// Each step prepends one read base `c = read[pivot-1-left_ext]` to the current
+    /// matched span and re-derives the SA interval of the LEFT-EXTENDED query
+    /// `P = read[pivot-(left_ext+1) .. pivot+anchor_len)`. Prepending a base moves the
+    /// interval into the `c`-block, so — unlike forward narrowing — the `c·Q` interval
+    /// is NOT contained in the previous interval's SA range and cannot be bounded by it.
+    /// The suffixes sharing `P` are contiguous in the SA, so the interval is fully
+    /// described by its `[lower, upper)` boundaries — no member enumeration, making
+    /// each step `O(log N · |P|)` regardless of occupancy.
+    ///
+    /// # Model-accelerated launch (window as a HINT, never a clamp)
+    ///
+    /// Rather than binary-searching the full `[0, sa_num)` for each boundary, the
+    /// learned model seeds a small window: `key = tokenize_32mer(P, min(32, |P|))`
+    /// and `(pred, err) = lookup(key)` bracket where `P`'s 32-mer prefix sorts, so the
+    /// true `[lower, upper)` lies near `[pred - err, pred + err]`. We binary-search
+    /// WITHIN that window, then **expand on miss**: if a boundary search converges at
+    /// the window's edge (and that edge is not already 0 / `sa_num`), the true boundary
+    /// may lie outside the window, so the range is exponentially galloped outward and
+    /// re-searched until the boundary is strictly interior or the SA end is reached.
+    /// The window is therefore only a starting hint — a wrong `pred` or `err = 0` still
+    /// yields the TRUE interval via expansion (asserted oracle-identical by proptest,
+    /// including a deliberately-wrong-seed / `err = 0` test). On a real chromosome this
+    /// cuts the cold SA probes per left step from `~log2(sa_num)` to `~log2(2·err)`.
+    ///
+    /// The `sa_start`/`occ_count` inputs are only consulted for the empty/initial
+    /// early-out; the interval is re-derived from `read`/`pivot`/`anchor_len`. The ISA
+    /// sidecar is not needed.
     // The argument list mirrors the spec/FFI contract for the backward primitive
     // (the right-anchored interval, the anchor span, and the read/pivot/pac/enc the
     // 2× compare needs); grouping them into a struct would only obscure the FFI shape.
@@ -170,19 +1234,40 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
     ) -> Vec<SmemStep> {
+        self.backward_spectrum_inner(sa_start, occ_count, anchor_len, read, pivot, pac, enc, None)
+    }
+
+    /// Shared driver for [`backward_spectrum`] and its test-only reference. The
+    /// `seed_override` hook (test-only) forces a `(pred, err)` window in place of
+    /// the model's `lookup`, so the proptest can prove the expand-on-miss recovery
+    /// holds for a deliberately-wrong seed and for `err = 0`. In production
+    /// `seed_override` is always `None` and the real model launch is used.
+    #[allow(clippy::too_many_arguments)]
+    fn backward_spectrum_inner(
+        &self,
+        _sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        pac: &[u8],
+        enc: PacEncoding,
+        seed_override: Option<fn(u64) -> (u64, u64)>,
+    ) -> Vec<SmemStep> {
         let mut steps = Vec::new();
-        if self.isa_for_refpos(0).is_none() || occ_count == 0 {
+        if occ_count == 0 {
             return steps;
         }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        let anchor_len_usize = anchor_len as usize;
         // Fail closed on out-of-range inputs rather than panicking inside the
-        // walk: `read[pivot - 1 - ..]` requires `pivot <= read.len()`, and
-        // `sa_position_for(i)` requires the whole `[sa_start, sa_start+occ_count)`
-        // interval to lie within the SA.
-        if pivot > read.len() {
-            return steps;
-        }
-        match sa_start.checked_add(occ_count) {
-            Some(end) if end <= self.sa_num() => {}
+        // walk: the left-extension reads `read[pivot-1-..]` and the pattern slice
+        // spans `read[.. pivot + anchor_len)`, so the whole anchored window must
+        // lie within `read`. A packed pac must also hold its declared base count
+        // before any `pac_base_at` read.
+        match pivot.checked_add(anchor_len_usize) {
+            Some(end) if end <= read.len() => {}
             _ => return steps,
         }
         if let PacEncoding::Packed { num_bases } = enc {
@@ -190,9 +1275,6 @@ impl LearnedIndex {
                 return steps;
             }
         }
-        let l_pac = self.l_pac();
-        let mut cur_start = sa_start;
-        let mut cur_occ = occ_count;
         let mut left_ext: u64 = 0;
 
         while (left_ext as usize) < pivot {
@@ -200,43 +1282,281 @@ impl LearnedIndex {
             if c >= 4 {
                 break; // ambiguous read base
             }
-            // Map each interval position's left neighbor through the inverse SA;
-            // keep those whose left-neighbor base == c. They form a contiguous
-            // SA sub-run (the c·Q interval).
-            let mut new_min = u64::MAX;
-            let mut new_max = 0u64;
-            let mut count = 0u64;
-            for i in cur_start..cur_start + cur_occ {
-                let pos = self.sa_position_for(i);
-                if pos == 0 {
-                    continue; // no left neighbor
-                }
-                let q = pos - 1;
-                if doubled_base_at(pac, enc, l_pac, q) == Some(c) {
-                    let isa_idx = self.isa_for_refpos(q).expect("isa present");
-                    new_min = new_min.min(isa_idx);
-                    new_max = new_max.max(isa_idx);
-                    count += 1;
-                }
-            }
-            if count == 0 {
+            // Left-extended query P: prepend the new base to the matched span.
+            // Start index is `pivot - (left_ext + 1)` (>= 0 by the loop condition),
+            // end is `pivot + anchor_len` (exclusive); length = anchor_len+left_ext+1.
+            let p_start = pivot - 1 - left_ext as usize;
+            let p_end = pivot + anchor_len_usize;
+            let p_slice = &read[p_start..p_end];
+            // The pattern's first 32 bases CHANGE each left step (a base is
+            // prepended), so recompute its 32-mer key ONCE PER STEP (not per
+            // probe). The keyed compare masks it to `p_slice.len()`.
+            let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+
+            // Model launch: the 32-mer-prefix window `[pred - err, pred + err + 1)`
+            // brackets where `P` sorts in the SA. The window is a HINT only; the
+            // bounded searches below expand outward on a window-edge miss, so a
+            // wrong/loose `(pred, err)` still yields the TRUE interval.
+            let (pred, err) = match seed_override {
+                Some(f) => f(p_key),
+                None => self.lookup(p_key),
+            };
+            let win_lo = pred.saturating_sub(err);
+            let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
+
+            // Lower bound over [0, sa_num): first SA index whose suffix is >= P
+            // (the first index where `ref_less` is false). Seeded by the window's
+            // left edge; expand-on-miss recovers the true boundary on any seed.
+            let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
+                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+            });
+            // Upper bound over [lower, sa_num): first SA index NOT sharing the full
+            // P prefix (the first index where `shares_prefix` is false). Seeded by
+            // the window's right edge; expansion recovers the true boundary.
+            let upper = self.find_boundary(lower, sa_num, win_hi, win_hi, |mid| {
+                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+            });
+
+            if upper <= lower {
                 break; // cannot extend further left
             }
-            // Hard guard (not debug_assert): on the byte-identity-critical path, a
-            // contiguity violation means a corrupt SA/ISA — fail loudly rather than
-            // emit wrong seeds. O(1) on top of the O(occ) loop already run.
-            // (Plan 4's FFI wrapper must catch_unwind / convert to an error code.)
-            assert_eq!(
-                new_max - new_min + 1,
-                count,
-                "c·Q interval not contiguous (corrupt SA/ISA): min={new_min} max={new_max} count={count}"
+            // The binary search returns a structurally contiguous [lower, upper);
+            // a recorded step must therefore be non-empty. Keep this as an
+            // always-on guard on the byte-identity-critical path.
+            assert!(
+                upper > lower,
+                "c·Q interval empty after binary search: lower={lower} upper={upper}"
             );
-            cur_start = new_min;
-            cur_occ = count;
             left_ext += 1;
             steps.push(SmemStep {
-                sa_start: cur_start,
-                occ_count: cur_occ,
+                sa_start: lower,
+                occ_count: upper - lower,
+                match_len: anchor_len + left_ext,
+            });
+        }
+        steps
+    }
+
+    /// Find the boundary index in `[domain_lo, domain_hi)` — the first index `i`
+    /// where the monotone predicate `go_right(i)` is `false` — seeded from the model
+    /// window `[seed_lo, seed_hi)` with exponential expand-on-miss.
+    ///
+    /// `go_right` MUST be monotone over `[domain_lo, domain_hi)`: `true` on a (possibly
+    /// empty) prefix `[domain_lo, boundary)` and `false` on `[boundary, domain_hi)`.
+    /// The returned value equals what a plain binary search over the full
+    /// `[domain_lo, domain_hi)` would return; the seed window only changes the number
+    /// of probes, never the answer (the gallop always re-brackets the true boundary).
+    ///
+    /// Bracketing invariant on entry to the final binary search: `go_right(lo-1)` is
+    /// `true` (or `lo == domain_lo`) and `go_right(hi-1)` is `false` (or `hi ==
+    /// domain_hi`), so `[lo, hi)` straddles the boundary.
+    #[inline]
+    fn find_boundary(
+        &self,
+        domain_lo: u64,
+        domain_hi: u64,
+        seed_lo: u64,
+        seed_hi: u64,
+        mut go_right: impl FnMut(u64) -> bool,
+    ) -> u64 {
+        // Clamp the seed window into the domain; an empty/degenerate window collapses
+        // to a single point inside the domain so the gallop can still expand from it.
+        let mut lo = seed_lo.clamp(domain_lo, domain_hi);
+        let mut hi = seed_hi.clamp(lo, domain_hi);
+        if lo == hi {
+            // Degenerate window: nudge to a unit interval inside the domain so both
+            // edge probes below are well-defined (hi-1 == lo).
+            if hi < domain_hi {
+                hi += 1;
+            } else if lo > domain_lo {
+                lo -= 1;
+            } else {
+                return domain_lo; // domain is empty
+            }
+        }
+        let mut span = (hi - lo).max(1);
+        loop {
+            // Left edge too far right: `go_right(lo-1)` is false => boundary is at or
+            // left of `lo`. Gallop left so the bracket includes it.
+            if lo > domain_lo && !go_right(lo - 1) {
+                lo = lo.saturating_sub(span).max(domain_lo);
+                span = span.saturating_mul(2);
+                continue;
+            }
+            // Right edge too far left: `go_right(hi-1)` is true => boundary is at or
+            // right of `hi`. Gallop right.
+            if hi < domain_hi && go_right(hi - 1) {
+                hi = hi.saturating_add(span).min(domain_hi);
+                span = span.saturating_mul(2);
+                continue;
+            }
+            break;
+        }
+        // `[lo, hi)` now straddles the boundary; standard binary search.
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if go_right(mid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// One lower-bound probe: is the suffix at SA index `mid` lexicographically less
+    /// than `p_slice`? Reads `sa_position_for(mid)` (the cold DRAM hit) and the stored
+    /// key, then runs the keyed 2× compare.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn ref_less(
+        &self,
+        p_slice: &[u8],
+        p_key: u64,
+        mid: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) -> bool {
+        bump_probe();
+        let pos = self.sa_position_for(mid);
+        let key = self.key_at(mid);
+        let (ref_less, _) =
+            compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
+        ref_less
+    }
+
+    /// One upper-bound probe: does the suffix at SA index `mid` share the full
+    /// `|p_slice|`-length prefix with `p_slice` (lcp >= |P|)?
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn shares_prefix(
+        &self,
+        p_slice: &[u8],
+        p_key: u64,
+        mid: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) -> bool {
+        bump_probe();
+        let pos = self.sa_position_for(mid);
+        let key = self.key_at(mid);
+        let (_, lcp) = compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
+        (lcp as usize) >= p_slice.len()
+    }
+
+    /// Test-only: drive [`backward_spectrum`] with a forced `(pred, err)` window in
+    /// place of the model's `lookup`, so the equality proptest can prove the
+    /// expand-on-miss recovery holds for a deliberately-wrong seed and for `err = 0`.
+    /// Hidden from the public API; production callers use [`backward_spectrum`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_spectrum_with_seed(
+        &self,
+        sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        pac: &[u8],
+        enc: PacEncoding,
+        seed: fn(u64) -> (u64, u64),
+    ) -> Vec<SmemStep> {
+        self.backward_spectrum_inner(
+            sa_start,
+            occ_count,
+            anchor_len,
+            read,
+            pivot,
+            pac,
+            enc,
+            Some(seed),
+        )
+    }
+
+    /// Test-only reference: the model-free backward spectrum that binary-searches the
+    /// FULL SA `[0, sa_num)` for both interval boundaries on every left step. This is
+    /// the pre-model-launch implementation, retained as the source of truth the
+    /// equality proptest pins the model-launched [`backward_spectrum`] against. Hidden
+    /// from the public API; not used on the production hot path.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_spectrum_reference(
+        &self,
+        _sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<SmemStep> {
+        let mut steps = Vec::new();
+        if occ_count == 0 {
+            return steps;
+        }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        let anchor_len_usize = anchor_len as usize;
+        // Fail closed on out-of-range inputs rather than panicking inside the
+        // walk: the left-extension reads `read[pivot-1-..]` and the pattern slice
+        // spans `read[.. pivot + anchor_len)`, so the whole anchored window must
+        // lie within `read`. A packed pac must also hold its declared base count
+        // before any `pac_base_at` read.
+        match pivot.checked_add(anchor_len_usize) {
+            Some(end) if end <= read.len() => {}
+            _ => return steps,
+        }
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "backward_spectrum").is_err() {
+                return steps;
+            }
+        }
+        let mut left_ext: u64 = 0;
+
+        while (left_ext as usize) < pivot {
+            let c = read[pivot - 1 - left_ext as usize];
+            if c >= 4 {
+                break;
+            }
+            let p_start = pivot - 1 - left_ext as usize;
+            let p_end = pivot + anchor_len_usize;
+            let p_slice = &read[p_start..p_end];
+            let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+
+            // Lower bound over the FULL [0, sa_num).
+            let mut lo = 0u64;
+            let mut hi = sa_num;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.ref_less(p_slice, p_key, mid, pac, enc, l_pac) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let lower = lo;
+            // Upper bound over [lower, sa_num).
+            let mut c_lo = lower;
+            let mut c_hi = sa_num;
+            while c_lo < c_hi {
+                let mid = c_lo + (c_hi - c_lo) / 2;
+                if self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac) {
+                    c_lo = mid + 1;
+                } else {
+                    c_hi = mid;
+                }
+            }
+            let upper = c_lo;
+
+            if upper <= lower {
+                break;
+            }
+            left_ext += 1;
+            steps.push(SmemStep {
+                sa_start: lower,
+                occ_count: upper - lower,
                 match_len: anchor_len + left_ext,
             });
         }
@@ -247,10 +1567,50 @@ impl LearnedIndex {
 #[cfg(test)]
 mod compare_tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn pac() -> (Vec<u8>, PacEncoding, u64) {
         // forward ACGTAC = 0,1,2,3,0,1 ; l_pac = 6.
         (vec![0, 1, 2, 3, 0, 1], PacEncoding::Unpacked, 6)
+    }
+
+    /// Pack an unpacked base vector (each `0..=3`) into the BWA `bntpac`
+    /// MSB-first 2-bit form (4 bases/byte), returning `(packed, num_bases)`.
+    fn pack_bntpac(bases: &[u8]) -> (Vec<u8>, u64) {
+        let mut packed = vec![0u8; bases.len().div_ceil(4)];
+        for (i, &b) in bases.iter().enumerate() {
+            let shift = 6 - 2 * ((i % 4) as u32);
+            packed[i / 4] |= (b & 0x3) << shift;
+        }
+        (packed, bases.len() as u64)
+    }
+
+    /// Materialize the doubled `[Fwd || RC]` text as one base per byte, for
+    /// reading the reference suffix directly in a test oracle.
+    fn doubled_text(fwd: &[u8]) -> Vec<u8> {
+        let mut t = fwd.to_vec();
+        t.extend(fwd.iter().rev().map(|&b| b ^ 3));
+        t
+    }
+
+    /// Build a query of length `qlen` from the doubled text starting at
+    /// `sa_pos`, then mutate it so we exercise match / mismatch / overrun cases.
+    /// Returns the query bases.
+    fn query_from(
+        text: &[u8],
+        sa_pos: usize,
+        qlen: usize,
+        twist_at: Option<(usize, u8)>,
+    ) -> Vec<u8> {
+        let mut q: Vec<u8> = (0..qlen)
+            .map(|i| text.get(sa_pos + i).copied().unwrap_or(0))
+            .collect();
+        if let Some((pos, val)) = twist_at {
+            if pos < q.len() {
+                q[pos] = val % 4;
+            }
+        }
+        q
     }
 
     #[test]
@@ -280,6 +1640,152 @@ mod compare_tests {
         let (ref_less, lcp) = compare_query_vs_suffix_2x(&[b, b], last, &p, e, l);
         assert_eq!((ref_less, lcp), (true, 1));
     }
+
+    // ── Region / boundary unit tests for the vectorized compare ──────────────
+
+    /// Reference long enough to exercise multi-word (>= 16 base) matches, a
+    /// forward→RC mid-word crossing, and the sentinel mid-word. l_pac = 20.
+    fn long_ref() -> Vec<u8> {
+        // 20 forward bases (values cycle 0..=3), so the doubled text is 40 bases.
+        (0..20u8).map(|i| i % 4).collect()
+    }
+
+    /// Run the assertion against both encodings: vectorized == scalar, and (for
+    /// extra confidence) report the agreed value.
+    fn check_both_encodings(fwd: &[u8], query: &[u8], sa_pos: u64) -> (bool, u32) {
+        let l_pac = fwd.len() as u64;
+        let (vec_u, scal_u) = {
+            let e = PacEncoding::Unpacked;
+            (
+                compare_query_vs_suffix_2x(query, sa_pos, fwd, e, l_pac),
+                compare_query_vs_suffix_2x_scalar(query, sa_pos, fwd, e, l_pac),
+            )
+        };
+        assert_eq!(vec_u, scal_u, "Unpacked: vec != scalar (sa_pos={sa_pos})");
+        let (packed, num_bases) = pack_bntpac(fwd);
+        let e = PacEncoding::Packed { num_bases };
+        let vec_p = compare_query_vs_suffix_2x(query, sa_pos, &packed, e, l_pac);
+        let scal_p = compare_query_vs_suffix_2x_scalar(query, sa_pos, &packed, e, l_pac);
+        assert_eq!(vec_p, scal_p, "Packed: vec != scalar (sa_pos={sa_pos})");
+        assert_eq!(
+            vec_u, vec_p,
+            "Unpacked vs Packed disagree (sa_pos={sa_pos})"
+        );
+        vec_u
+    }
+
+    #[test]
+    fn forward_exact_match_full_query() {
+        let fwd = long_ref();
+        let text = doubled_text(&fwd);
+        // Query = first 17 bases of the forward text -> full query matched.
+        let q = query_from(&text, 0, 17, None);
+        let (ref_less, lcp) = check_both_encodings(&fwd, &q, 0);
+        assert_eq!((ref_less, lcp), (false, 17));
+    }
+
+    #[test]
+    fn forward_mismatch_at_each_byte_position() {
+        let fwd = long_ref();
+        let text = doubled_text(&fwd);
+        // Force a mismatch at byte positions 0..8 within the first word.
+        for pos in 0..8usize {
+            let twisted = (text[pos] + 1) % 4; // guaranteed != text[pos]
+            let q = query_from(&text, 0, 12, Some((pos, twisted)));
+            let (_, lcp) = check_both_encodings(&fwd, &q, 0);
+            assert_eq!(lcp, pos as u32, "mismatch should be located at byte {pos}");
+        }
+    }
+
+    #[test]
+    fn forward_multiword_match_spanning_16_plus() {
+        let fwd = long_ref();
+        let text = doubled_text(&fwd);
+        // 20-base query matching the whole forward half (spans >2 words),
+        // mismatch only at base 19 vs the RC region's first base afterwards.
+        let q = query_from(&text, 0, 20, None);
+        let (ref_less, lcp) = check_both_encodings(&fwd, &q, 0);
+        assert_eq!((ref_less, lcp), (false, 20));
+    }
+
+    #[test]
+    fn rc_region_suffix() {
+        let fwd = long_ref();
+        let text = doubled_text(&fwd);
+        let l_pac = fwd.len() as u64;
+        // sa_pos in the RC half; match several bases then mismatch.
+        let sa_pos = l_pac + 2; // RC region
+        let q = query_from(&text, sa_pos as usize, 10, Some((4, 9)));
+        check_both_encodings(&fwd, &q, sa_pos);
+    }
+
+    #[test]
+    fn window_crosses_l_pac_mid_word() {
+        let fwd = long_ref();
+        let text = doubled_text(&fwd);
+        let l_pac = fwd.len() as u64;
+        // Start a few bases before l_pac so the window straddles forward→RC.
+        let sa_pos = l_pac - 3;
+        let q = query_from(&text, sa_pos as usize, 12, None);
+        let (ref_less, lcp) = check_both_encodings(&fwd, &q, sa_pos);
+        // 3 forward + 9 RC bases all match the materialized text.
+        assert_eq!((ref_less, lcp), (false, 12));
+    }
+
+    #[test]
+    fn suffix_reaches_sentinel_mid_word() {
+        let fwd = long_ref();
+        let text = doubled_text(&fwd);
+        let l_pac = fwd.len() as u64;
+        // Start 5 bases before the end of the doubled text; query is longer,
+        // so the reference is exhausted mid-query -> ref_less = true.
+        let sa_pos = 2 * l_pac - 5;
+        let q = query_from(&text, sa_pos as usize, 12, None);
+        let (ref_less, lcp) = check_both_encodings(&fwd, &q, sa_pos);
+        assert_eq!((ref_less, lcp), (true, 5));
+    }
+
+    #[test]
+    fn query_longer_than_whole_text() {
+        let fwd = long_ref();
+        let text = doubled_text(&fwd);
+        // Query = entire doubled text + extra base -> ref exhausted at the end.
+        let mut q = text.clone();
+        q.push(0);
+        let (ref_less, lcp) = check_both_encodings(&fwd, &q, 0);
+        assert_eq!((ref_less, lcp), (true, text.len() as u32));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// Primary correctness gate: the vectorized compare must be byte-identical
+        /// to the scalar reference for both encodings, over random references,
+        /// random `sa_pos` spanning forward/RC/sentinel, and random queries.
+        #[test]
+        fn vectorized_equals_scalar(
+            fwd in prop::collection::vec(0u8..=3, 1..400),
+            // sa_pos spans [0, 2*l_pac] inclusive (the sentinel boundary).
+            sa_pos_frac in 0.0f64..=1.0,
+            query in prop::collection::vec(0u8..=3, 0..64),
+        ) {
+            let l_pac = fwd.len() as u64;
+            let sa_pos = ((2 * l_pac) as f64 * sa_pos_frac).round() as u64;
+
+            // Unpacked.
+            let e = PacEncoding::Unpacked;
+            let got = compare_query_vs_suffix_2x(&query, sa_pos, &fwd, e, l_pac);
+            let want = compare_query_vs_suffix_2x_scalar(&query, sa_pos, &fwd, e, l_pac);
+            prop_assert_eq!(got, want, "Unpacked mismatch: sa_pos={}", sa_pos);
+
+            // Packed (bntpac).
+            let (packed, num_bases) = pack_bntpac(&fwd);
+            let e = PacEncoding::Packed { num_bases };
+            let got = compare_query_vs_suffix_2x(&query, sa_pos, &packed, e, l_pac);
+            let want = compare_query_vs_suffix_2x_scalar(&query, sa_pos, &packed, e, l_pac);
+            prop_assert_eq!(got, want, "Packed mismatch: sa_pos={}", sa_pos);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -301,5 +1807,502 @@ mod tests {
         // sentinel:
         assert_eq!(doubled_base_at(&pac, enc, l, 8), None);
         assert_eq!(doubled_base_at(&pac, enc, l, 99), None);
+    }
+}
+
+/// Correctness gate for the stored-key fast path: drives a real mode-2 sidecar
+/// (so `key_at` is populated) and asserts the key-aware compare is byte-identical
+/// to the scalar reference for random `mid` SA indices — INCLUDING indices whose
+/// `sa_position_for(mid)` lands within 32 of `2*l_pac` (the near-sentinel
+/// fallback). Lives in its own module because it pulls in the trainer + temp-file
+/// machinery the lighter compare tests do not need.
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+    use crate::index::LearnedIndex;
+    use crate::train::config::{MemoryMode, TrainerConfig};
+    use crate::train::{build_sidecar_from_pac_with_config, mask::MaskConfig};
+    use proptest::prelude::*;
+    use std::io::Write;
+
+    /// Write an unpacked base vector (each `0..=3`) as a bwa-format `.pac`
+    /// (MSB-first, 4 bases/byte, trailing `l_pac % 4` byte) the trainer reads.
+    fn write_pac(path: &std::path::Path, bases: &[u8]) {
+        let l = bases.len();
+        let mut buf = vec![0u8; l / 4 + 1];
+        for (i, &b) in bases.iter().enumerate() {
+            buf[i >> 2] |= b << ((3 - (i & 3)) * 2);
+        }
+        buf.push((l % 4) as u8);
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+    }
+
+    /// Build a mode-2 sidecar from `fwd` and return the opened index + tempdir
+    /// (kept alive for the mmap lifetime).
+    fn build_mode2(fwd: &[u8]) -> (tempfile::TempDir, LearnedIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let pac = dir.path().join("r.pac");
+        write_pac(&pac, fwd);
+        let prefix = dir.path().join("r.prmi");
+        let cfg = TrainerConfig::default().with_memory_mode(MemoryMode::Mode2);
+        build_sidecar_from_pac_with_config(
+            &pac,
+            &prefix,
+            None,
+            MaskConfig::default(),
+            1,
+            Some(cfg),
+        )
+        .unwrap();
+        let idx = LearnedIndex::open(&prefix).unwrap();
+        (dir, idx)
+    }
+
+    /// Independent brute-force forward spectrum: for each prefix length `m`,
+    /// LINEAR-SCAN every SA entry and take the contiguous run whose suffix has
+    /// `query[..m]` as a prefix (scalar compare = ground truth), emitting a step
+    /// on each `occ` change. Shares no code with the binary-search / fast-path
+    /// logic under test, so it is a true oracle. `O(sa_num * query_len)` — small
+    /// references only. Relies on SA sortedness (matching suffixes are
+    /// contiguous), which is verified independently by `sa-verify`.
+    fn forward_spectrum_oracle(
+        idx: &LearnedIndex,
+        query: &[u8],
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<SmemStep> {
+        let sa_num = idx.sa_num();
+        let l_pac = idx.l_pac();
+        let mut steps = Vec::new();
+        let mut prev_occ = u64::MAX;
+        for m in 1..=query.len() {
+            let qm = &query[..m];
+            let mut lo = sa_num;
+            let mut hi = 0u64;
+            let mut found = false;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..sa_num {
+                let pos = idx.sa_position_for(i);
+                let (_, lcp) = compare_query_vs_suffix_2x_scalar(qm, pos, pac, enc, l_pac);
+                if lcp as usize >= m {
+                    if !found {
+                        lo = i;
+                        found = true;
+                    }
+                    hi = i + 1;
+                }
+            }
+            if !found {
+                break;
+            }
+            push_step(&mut steps, &mut prev_occ, lo, hi - lo, m as u64);
+        }
+        steps
+    }
+
+    #[test]
+    fn mode2_sidecar_populates_keys() {
+        // Sanity: a mode-2 build must expose stored keys via key_at.
+        let fwd: Vec<u8> = (0..80u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        assert_eq!(idx.memory_mode(), "2");
+        assert!(idx.key_at(0).is_some(), "mode-2 sidecar must store keys");
+    }
+
+    /// The k-mer table built from the in-memory unpacked `bases` must be
+    /// byte-identical to the table built from the packed `.pac` form of the
+    /// same reference. This is the invariant that lets `build_sidecar_core`
+    /// build the table against the in-memory `bases` (which it already holds)
+    /// instead of re-reading the entire `.pac` from disk.
+    #[test]
+    fn kmer_table_packed_pac_equals_unpacked_bases() {
+        let fwd: Vec<u8> = (0..200u32).map(|i| ((i * 7 + 3) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let k = 6;
+        let unpacked = idx.build_kmer_table(k, &fwd, PacEncoding::Unpacked);
+        // Pack `fwd` into the BWA bntpac MSB-first 2-bit form (4 bases/byte).
+        let mut packed = vec![0u8; fwd.len().div_ceil(4)];
+        for (i, &b) in fwd.iter().enumerate() {
+            packed[i / 4] |= (b & 0x3) << (6 - 2 * ((i % 4) as u32));
+        }
+        let num_bases = fwd.len() as u64;
+        let packed_tbl = idx.build_kmer_table(k, &packed, PacEncoding::Packed { num_bases });
+        // Guard against a vacuous pass: at least one band must hold a non-empty
+        // interval, so the equality below compares real bounds.
+        let (_, lo, hi) = unpacked.parts();
+        let any_non_empty = lo
+            .iter()
+            .zip(hi)
+            .any(|(lm, hm)| lm.iter().zip(hm).any(|(l, h)| h > l));
+        assert!(any_non_empty, "expected at least one non-empty k-mer band");
+        assert_eq!(
+            unpacked.parts(),
+            packed_tbl.parts(),
+            "packed-pac and unpacked-bases k-mer tables must be byte-identical"
+        );
+    }
+
+    proptest! {
+        // A sidecar build is costly, so keep the case count modest; each case
+        // exercises many random `mid` indices against the same sidecar.
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Key-aware compare == scalar reference over a real mode-2 sidecar, for
+        /// random queries and random SA indices (which include positions within
+        /// 32 of the doubled-text end -> the near-sentinel fallback path).
+        #[test]
+        fn keyed_equals_scalar_mode2(
+            fwd in prop::collection::vec(0u8..=3, 40..220),
+            query in prop::collection::vec(0u8..=3, 0..64),
+            mid_fracs in prop::collection::vec(0.0f64..=1.0, 24),
+        ) {
+            let l_pac = fwd.len() as u64;
+            let (_dir, idx) = build_mode2(&fwd);
+            let sa_num = idx.sa_num();
+            prop_assert_eq!(idx.l_pac(), l_pac);
+
+            let e = PacEncoding::Unpacked;
+            let query_key = tokenize_32mer(&query, query.len().min(KMER_LEN));
+
+            for frac in mid_fracs {
+                // mid in [0, sa_num); bias the sampling so near-sentinel SA
+                // positions are hit (we additionally scan deterministically below).
+                let mid = ((sa_num.saturating_sub(1)) as f64 * frac).round() as u64;
+                let pos = idx.sa_position_for(mid);
+                let key = idx.key_at(mid);
+
+                let got = compare_query_vs_suffix_2x_keyed(
+                    &query, query_key, key, pos, &fwd, e, l_pac,
+                );
+                let want = compare_query_vs_suffix_2x_scalar(&query, pos, &fwd, e, l_pac);
+                prop_assert_eq!(
+                    got, want,
+                    "keyed != scalar: mid={} pos={} (l_pac={}, 2*l_pac={})",
+                    mid, pos, l_pac, 2 * l_pac
+                );
+            }
+
+            // Deterministically sweep EVERY SA index to guarantee the
+            // near-sentinel positions (pos + 32 > 2*l_pac) are covered — these are
+            // exactly the entries where the stored (T-padded) key must NOT be used.
+            for mid in 0..sa_num {
+                let pos = idx.sa_position_for(mid);
+                let key = idx.key_at(mid);
+                let got = compare_query_vs_suffix_2x_keyed(
+                    &query, query_key, key, pos, &fwd, e, l_pac,
+                );
+                let want = compare_query_vs_suffix_2x_scalar(&query, pos, &fwd, e, l_pac);
+                prop_assert_eq!(
+                    got, want,
+                    "keyed != scalar (full sweep): mid={} pos={} near_sentinel={}",
+                    mid, pos, pos + KMER_LEN as u64 > 2 * l_pac
+                );
+            }
+        }
+
+        /// Table-accelerated `forward_spectrum_tabled` == reference
+        /// `forward_spectrum`, for random small references (so short text-end
+        /// suffixes are a large fraction of the SA) and a small `k`. This is the
+        /// hardest stress for the `m < k` short-suffix boundary edge.
+        #[test]
+        fn forward_tabled_equals_reference(
+            fwd in prop::collection::vec(0u8..=3, 40..220),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..40), 1..6),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let table = idx.build_kmer_table(6, &fwd, e);
+            for q in &queries {
+                prop_assert_eq!(
+                    idx.forward_spectrum_tabled(q, &fwd, e, &table),
+                    idx.forward_spectrum(q, &fwd, e),
+                    "tabled != reference, query={:?}",
+                    q
+                );
+            }
+        }
+
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// `forward_spectrum` (no table) == the independent brute-force oracle,
+        /// for random references and random queries. This is the correctness
+        /// anchor the fast path must preserve.
+        #[test]
+        fn forward_spectrum_equals_oracle(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..50), 1..5),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for q in &queries {
+                prop_assert_eq!(
+                    idx.forward_spectrum(q, &fwd, e),
+                    forward_spectrum_oracle(&idx, q, &fwd, e),
+                    "forward_spectrum != oracle, query={:?}", q
+                );
+            }
+        }
+
+        /// `forward_spectrum_tabled` == the independent oracle (k=5 table).
+        #[test]
+        fn forward_tabled_equals_oracle(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..50), 1..5),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let table = idx.build_kmer_table(5, &fwd, e);
+            for q in &queries {
+                prop_assert_eq!(
+                    idx.forward_spectrum_tabled(q, &fwd, e, &table),
+                    forward_spectrum_oracle(&idx, q, &fwd, e),
+                    "forward_spectrum_tabled != oracle, query={:?}", q
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Same as above but the table is written to a `.kmt` and read back via
+        /// the mmap `KmtFileReader` — covers the production (file-backed)
+        /// `KmerBounds` impl through `forward_spectrum_tabled`.
+        #[test]
+        fn forward_tabled_via_kmt_file_equals_reference(
+            fwd in prop::collection::vec(0u8..=3, 40..220),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..40), 1..6),
+        ) {
+            use crate::sidecar::kmt_file::{KmtFileReader, KmtFileWriter};
+            let (dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let table = idx.build_kmer_table(6, &fwd, e);
+            let (k, lo, hi) = table.parts();
+            let kpath = dir.path().join("t.kmt");
+            KmtFileWriter::write(&kpath, k, idx.sa_num(), &[0u8; 32], lo, hi).unwrap();
+            let reader = KmtFileReader::open(&kpath).unwrap();
+            for q in &queries {
+                prop_assert_eq!(
+                    idx.forward_spectrum_tabled(q, &fwd, e, &reader),
+                    idx.forward_spectrum(q, &fwd, e),
+                    "tabled-via-file != reference, query={:?}",
+                    q
+                );
+            }
+        }
+    }
+
+    /// End-to-end: a sidecar built with `--kmer-table-k` loads the `.kmt` on
+    /// open and `forward_spectrum_auto` dispatches through it byte-identically.
+    #[test]
+    fn build_with_kmt_dispatches_byte_identically() {
+        let fwd: Vec<u8> = (0..200u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let pac = dir.path().join("r.pac");
+        write_pac(&pac, &fwd);
+        let prefix = dir.path().join("r.prmi");
+        let cfg = TrainerConfig::default()
+            .with_memory_mode(MemoryMode::Mode2)
+            .with_kmer_table_k(6);
+        build_sidecar_from_pac_with_config(
+            &pac,
+            &prefix,
+            None,
+            MaskConfig::default(),
+            1,
+            Some(cfg),
+        )
+        .unwrap();
+        let idx = LearnedIndex::open(&prefix).unwrap();
+        assert!(idx.kmt.is_some(), ".kmt should be loaded on open");
+        let e = PacEncoding::Unpacked;
+        for q in [
+            vec![1u8, 2, 3, 0, 1, 2, 3],
+            vec![0u8, 0, 1],
+            vec![3u8, 3, 3, 3, 2, 1, 0, 2],
+        ] {
+            assert_eq!(
+                idx.forward_spectrum_auto(&q, &fwd, e),
+                idx.forward_spectrum(&q, &fwd, e),
+                "auto != reference for {q:?}"
+            );
+        }
+    }
+
+    /// With the occ==1 fast path, a deep UNIQUE forward match costs ONE SA probe
+    /// in the deep bands (m>k), not ~2 per depth. Pre-fast-path baseline for this
+    /// input is ~148 deep probes; this asserts the collapse. Gated on the probe
+    /// counter feature (run with `--features spectrum-probe-count`).
+    #[cfg(feature = "spectrum-probe-count")]
+    #[test]
+    fn occ1_fast_path_collapses_deep_probes() {
+        use crate::index::spectrum::probe_count;
+        // PCG-style LCG (seed 0xfeedface12345678): the 80-mer at position 500
+        // is unique in the doubled reference already at m==6, so the k==6 table
+        // hands the deep loop an interval of width 1. Without the fast path the
+        // deep band runs 74 iterations of two binary searches each (~148 probes);
+        // with the fast path the first deep iteration fires the occ==1 short-cut
+        // and the whole tail costs exactly 1 probe.
+        let mut state: u64 = 0xfeedface12345678;
+        let mut fwd = Vec::with_capacity(2000);
+        for _ in 0..2000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(0xda3e39cb94b95bdb);
+            fwd.push((state >> 62) as u8);
+        }
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let k = 6u32;
+        let table = idx.build_kmer_table(k, &fwd, e);
+        let q = &fwd[500..580]; // 80 bp, reference-lifted -> unique by m==6
+        probe_count::reset_depth_probes();
+        let _ = idx.forward_spectrum_tabled(q, &fwd, e, &table);
+        let hist = probe_count::depth_probes();
+        let deep: u64 = hist[(k as usize + 1)..].iter().sum();
+        assert!(
+            deep <= 6,
+            "deep-band (m>{k}) probes should collapse with the fast path, got {deep}"
+        );
+    }
+
+    /// A `.kmt` whose reference digest no longer matches the sidecar is ignored
+    /// (best-effort load) and the forward search falls back to the full,
+    /// always-correct path — never silently-wrong SMEMs.
+    #[test]
+    fn mismatched_kmt_is_ignored_and_falls_back() {
+        let fwd: Vec<u8> = (0..200u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let pac = dir.path().join("r.pac");
+        write_pac(&pac, &fwd);
+        let prefix = dir.path().join("r.prmi");
+        let cfg = TrainerConfig::default()
+            .with_memory_mode(MemoryMode::Mode2)
+            .with_kmer_table_k(6);
+        build_sidecar_from_pac_with_config(
+            &pac,
+            &prefix,
+            None,
+            MaskConfig::default(),
+            1,
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(LearnedIndex::open(&prefix).unwrap().kmt.is_some());
+
+        // Flip a byte in the `.kmt` ref_digest region (header[24..56]); same size,
+        // valid magic — so it opens, but the digest no longer matches `.meta`.
+        let kpath = crate::sidecar::SidecarPaths::from_prefix(&prefix).kmt;
+        let mut bytes = std::fs::read(&kpath).unwrap();
+        bytes[30] ^= 0xff;
+        std::fs::write(&kpath, &bytes).unwrap();
+
+        let idx = LearnedIndex::open(&prefix).unwrap();
+        assert!(idx.kmt.is_none(), "mismatched .kmt must be ignored");
+        let e = PacEncoding::Unpacked;
+        let q = vec![1u8, 2, 3, 0, 1, 2, 3];
+        assert_eq!(
+            idx.forward_spectrum_auto(&q, &fwd, e),
+            idx.forward_spectrum(&q, &fwd, e),
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        /// `backward_spectrum_via_stepper` == serial `backward_spectrum`, for
+        /// anchors derived from forward over random refs/reads.
+        #[test]
+        fn bwd_stepper_equals_serial(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+            read in prop::collection::vec(0u8..=3, 30..120),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            // pivots across the read; each forward step is an anchor.
+            for pivot in (5..read.len()).step_by(7) {
+                for a in idx.forward_spectrum(&read[pivot..], &fwd, e) {
+                    let t = BwdTask {
+                        sa_start: a.sa_start,
+                        occ_count: a.occ_count,
+                        anchor_len: a.match_len,
+                        read: &read,
+                        pivot,
+                    };
+                    prop_assert_eq!(
+                        idx.backward_spectrum_via_stepper(&t, &fwd, e),
+                        idx.backward_spectrum(t.sa_start, t.occ_count, t.anchor_len, &read, pivot, &fwd, e),
+                        "stepper != serial at pivot {}", pivot
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// `backward_spectrum_lockstep` over a batch of anchors == per-anchor
+        /// serial `backward_spectrum`, element for element.
+        #[test]
+        fn bwd_lockstep_equals_serial(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+            reads in prop::collection::vec(prop::collection::vec(0u8..=3, 30..120), 1..4),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            // Gather a batch of anchors across all reads/pivots.
+            let mut tasks = Vec::new();
+            let mut want = Vec::new();
+            for read in &reads {
+                for pivot in (5..read.len()).step_by(9) {
+                    for a in idx.forward_spectrum(&read[pivot..], &fwd, e) {
+                        tasks.push(BwdTask {
+                            sa_start: a.sa_start,
+                            occ_count: a.occ_count,
+                            anchor_len: a.match_len,
+                            read,
+                            pivot,
+                        });
+                        want.push(idx.backward_spectrum(
+                            a.sa_start, a.occ_count, a.match_len, read, pivot, &fwd, e,
+                        ));
+                    }
+                }
+            }
+            let got = idx.backward_spectrum_lockstep(&tasks, &fwd, e);
+            prop_assert_eq!(got, want, "lockstep batch != serial");
+        }
+    }
+
+    /// Reference-lifted queries extend to full depth and become unique, so they
+    /// drive the occ==1 fast path hard. Both forward paths must stay byte-
+    /// identical to the independent oracle across many lift offsets.
+    #[test]
+    fn forward_fast_path_deep_unique_matches_oracle() {
+        let fwd: Vec<u8> = (0..600u32)
+            .map(|i| ((i.wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 8) & 3) as u8)
+            .collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let table = idx.build_kmer_table(6, &fwd, e);
+        for start in (0..fwd.len() - 60).step_by(37) {
+            let q = &fwd[start..start + 60];
+            let oracle = forward_spectrum_oracle(&idx, q, &fwd, e);
+            assert_eq!(
+                idx.forward_spectrum(q, &fwd, e),
+                oracle,
+                "forward_spectrum != oracle at lift {start}"
+            );
+            assert_eq!(
+                idx.forward_spectrum_tabled(q, &fwd, e, &table),
+                oracle,
+                "forward_spectrum_tabled != oracle at lift {start}"
+            );
+        }
     }
 }

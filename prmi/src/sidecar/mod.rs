@@ -1,9 +1,10 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 
-//! On-disk sidecar format: TOML meta + binary `.sa` / `.l1` / `.l2` / `.isa`.
+//! On-disk sidecar format: TOML meta + binary `.sa` / `.l1` / `.l2`, plus an
+//! optional `.kmt` k-mer-table accelerator sidecar.
 
-pub mod isa_file;
+pub mod kmt_file;
 pub mod magic;
 pub mod meta;
 pub mod model_file;
@@ -14,7 +15,8 @@ use std::path::{Path, PathBuf};
 /// Resolve the sidecar file paths from a common prefix.
 ///
 /// `prefix = "/data/hg38.fa.prmi"` →
-///   `meta = "/data/hg38.fa.prmi.meta"`, `.sa`, `.l1`, `.l2`, `.isa`.
+///   `meta = "/data/hg38.fa.prmi.meta"`, `.sa`, `.l1`, `.l2`, and the optional
+///   `.kmt`.
 #[derive(Debug, Clone)]
 pub struct SidecarPaths {
     /// Path to the `.meta` TOML file.
@@ -25,8 +27,8 @@ pub struct SidecarPaths {
     pub l1: PathBuf,
     /// Path to the `.l2` model file (L2 routing layer).
     pub l2: PathBuf,
-    /// Path to the `.isa` inverse-SA (ref2sa) file.
-    pub isa: PathBuf,
+    /// Path to the optional `.kmt` k-mer table file (forward-shallow accelerator).
+    pub kmt: PathBuf,
 }
 
 impl SidecarPaths {
@@ -46,7 +48,7 @@ impl SidecarPaths {
             sa: with(".sa"),
             l1: with(".l1"),
             l2: with(".l2"),
-            isa: with(".isa"),
+            kmt: with(".kmt"),
         }
     }
 }

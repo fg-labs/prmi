@@ -4,11 +4,14 @@
 //! FFI tests for `prmi_forward_spectrum`, `prmi_backward_spectrum`,
 //! `prmi_smem_step_t`, `prmi_sa_positions_strided`, and the batch variants.
 
-use prmi::train::build_sidecar;
+use prmi::index::smem::PacEncoding;
+use prmi::index::LearnedIndex;
+use prmi::train::build_sidecar_with_config;
+use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
-    prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_bwd_task_t, prmi_close,
-    prmi_forward_spectrum, prmi_forward_spectrum_batch, prmi_fwd_task_t, prmi_open,
-    prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
+    prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
+    prmi_bwd_task_t, prmi_close, prmi_forward_spectrum, prmi_forward_spectrum_batch,
+    prmi_fwd_task_t, prmi_open, prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -42,9 +45,84 @@ fn build_test_sidecar() -> (tempfile::TempDir, String, Vec<u8>) {
     fa_bytes.push(b'\n');
     std::fs::write(&fa, &fa_bytes).unwrap();
     let prefix = dir.path().join("ref.fa.prmi");
-    build_sidecar(&fa, &prefix, Some(16), Default::default(), 1).unwrap();
+    // Build in mode 2 (stored 32-mer keys) so the FFI spectrum path exercises
+    // the stored-key compare fast path across the C boundary.
+    let cfg = TrainerConfig::default().with_memory_mode(MemoryMode::Mode2);
+    build_sidecar_with_config(&fa, &prefix, Some(16), Default::default(), 1, Some(cfg)).unwrap();
     let prefix_str = prefix.to_str().unwrap().to_owned();
     (dir, prefix_str, pac_unpacked)
+}
+
+/// End-to-end: a sidecar built WITH `--kmer-table-k` drives
+/// `prmi_forward_spectrum` through the loaded `.kmt` table (via
+/// `forward_spectrum_auto`), and the C-API output is byte-identical to the
+/// lib's full forward search on the same sidecar.
+#[test]
+fn forward_spectrum_ffi_table_path_is_byte_identical() {
+    let dir = tempdir().unwrap();
+    let fa = dir.path().join("ref.fa");
+    let pac_unpacked: Vec<u8> = (0u64..256).map(|i| ((i * 5 + 1) % 4) as u8).collect();
+    let mut fa_bytes = b">ref\n".to_vec();
+    for &b in &pac_unpacked {
+        fa_bytes.push(b"ACGT"[b as usize]);
+    }
+    fa_bytes.push(b'\n');
+    std::fs::write(&fa, &fa_bytes).unwrap();
+    let prefix = dir.path().join("ref.fa.prmi");
+    let cfg = TrainerConfig::default()
+        .with_memory_mode(MemoryMode::Mode2)
+        .with_kmer_table_k(6);
+    build_sidecar_with_config(&fa, &prefix, Some(16), Default::default(), 1, Some(cfg)).unwrap();
+
+    // Reference: the lib's full forward search (no table) on the same sidecar.
+    let idx = LearnedIndex::open(&prefix).unwrap();
+    assert!(idx.has_kmt(), ".kmt must load or this test is vacuous");
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+    let reference = idx.forward_spectrum(&query, &pac_unpacked, PacEncoding::Unpacked);
+    assert!(!reference.is_empty());
+
+    // C API: prmi_forward_spectrum -> forward_spectrum_auto -> the .kmt table.
+    let cprefix = CString::new(prefix.to_str().unwrap()).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let mut out_steps = vec![
+        prmi_smem_step_t {
+            sa_start: 0,
+            occ_count: 0,
+            match_len: 0
+        };
+        query.len()
+    ];
+    let mut nsteps: u64 = 0;
+    let rc = unsafe {
+        prmi_forward_spectrum(
+            handle,
+            query.as_ptr(),
+            query.len() as i32,
+            pac_packed.as_ptr(),
+            pac_unpacked.len() as u64,
+            out_steps.as_mut_ptr(),
+            out_steps.len() as u64,
+            &mut nsteps,
+        )
+    };
+    assert_eq!(rc, 0, "prmi_forward_spectrum rc={rc}");
+    assert_eq!(
+        nsteps as usize,
+        reference.len(),
+        "step count via table vs reference"
+    );
+    for (i, r) in reference.iter().enumerate() {
+        let a = &out_steps[i];
+        assert_eq!(
+            (a.sa_start, a.occ_count, a.match_len),
+            (r.sa_start, r.occ_count, r.match_len),
+            "step {i} (table FFI) != reference"
+        );
+    }
+    unsafe { prmi_close(handle) };
+    drop(dir);
 }
 
 /// Test that `prmi_forward_spectrum` returns 0 with at least one step and
@@ -749,6 +827,140 @@ fn backward_spectrum_batch_smoke() {
         }
     }
 
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// The lockstep batch entry point is byte-identical to the serial batch entry
+/// point: same `out_nsteps` and same written steps for every task. (They differ
+/// only in execution strategy/timing.)
+#[test]
+fn backward_spectrum_batch_lockstep_matches_serial() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases: u64 = pac_unpacked.len() as u64;
+
+    // Two anchors (same construction as the smoke test).
+    let anchors = [(20usize, 1usize), (24usize, 1usize)];
+    let anchor_query_len = 16usize;
+    let read_len = 1 + anchor_query_len;
+    let mut reads_arena: Vec<u8> = Vec::new();
+    let mut sa_start = [0u64; 2];
+    let mut occ = [0u64; 2];
+    let mut alen = [0u64; 2];
+    for (idx, &(anchor_off, pivot)) in anchors.iter().enumerate() {
+        let left_off = anchor_off - pivot;
+        let read: Vec<u8> = pac_unpacked[left_off..left_off + read_len].to_vec();
+        reads_arena.extend_from_slice(&read);
+        let q: Vec<u8> = read[pivot..].to_vec();
+        let mut fs = vec![
+            prmi_smem_step_t {
+                sa_start: 0,
+                occ_count: 0,
+                match_len: 0
+            };
+            q.len()
+        ];
+        let mut fn_: u64 = 0;
+        let rc_f = unsafe {
+            prmi_forward_spectrum(
+                handle,
+                q.as_ptr(),
+                q.len() as i32,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                fs.as_mut_ptr(),
+                fs.len() as u64,
+                &mut fn_,
+            )
+        };
+        assert_eq!(rc_f, 0);
+        assert!(fn_ >= 1);
+        sa_start[idx] = fs[0].sa_start;
+        occ[idx] = fs[0].occ_count;
+        alen[idx] = fs[0].match_len;
+    }
+
+    const MAX_STEPS: u32 = 32;
+    let tasks = [
+        prmi_bwd_task_t {
+            sa_start: sa_start[0],
+            occ_count: occ[0],
+            anchor_len: alen[0],
+            read_off: 0,
+            read_len: read_len as u32,
+            pivot: anchors[0].1 as u32,
+            steps_off: 0,
+            max_steps: MAX_STEPS,
+        },
+        prmi_bwd_task_t {
+            sa_start: sa_start[1],
+            occ_count: occ[1],
+            anchor_len: alen[1],
+            read_off: read_len as u64,
+            read_len: read_len as u32,
+            pivot: anchors[1].1 as u32,
+            steps_off: MAX_STEPS,
+            max_steps: MAX_STEPS,
+        },
+    ];
+
+    // Run both strategies into separate arenas and compare.
+    let run = |lockstep: bool| -> (Vec<prmi_smem_step_t>, [u64; 2]) {
+        let mut steps = vec![
+            prmi_smem_step_t {
+                sa_start: 0,
+                occ_count: 0,
+                match_len: 0
+            };
+            2 * MAX_STEPS as usize
+        ];
+        let mut ns = [0u64; 2];
+        let f = if lockstep {
+            prmi_backward_spectrum_batch_lockstep
+        } else {
+            prmi_backward_spectrum_batch
+        };
+        let rc = unsafe {
+            f(
+                handle,
+                reads_arena.as_ptr(),
+                reads_arena.len() as u64,
+                tasks.as_ptr(),
+                2,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                steps.as_mut_ptr(),
+                steps.len() as u64,
+                ns.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "rc={rc} lockstep={lockstep}");
+        (steps, ns)
+    };
+    let (serial_steps, serial_ns) = run(false);
+    let (lockstep_steps, lockstep_ns) = run(true);
+
+    assert_eq!(serial_ns, lockstep_ns, "out_nsteps differ");
+    assert!(
+        serial_ns[0] >= 1 && serial_ns[1] >= 1,
+        "expected non-trivial backward steps"
+    );
+    for idx in 0..2 {
+        let off = tasks[idx].steps_off as usize;
+        for k in 0..serial_ns[idx] as usize {
+            let a = &serial_steps[off + k];
+            let b = &lockstep_steps[off + k];
+            assert_eq!(
+                (a.sa_start, a.occ_count, a.match_len),
+                (b.sa_start, b.occ_count, b.match_len),
+                "task {idx} step {k}: lockstep != serial"
+            );
+        }
+    }
     unsafe { prmi_close(handle) };
     drop(dir);
 }

@@ -17,13 +17,57 @@ use crate::error::{Error, Result};
 use crate::sidecar::model_file::ModelEntry;
 use crate::train::config::TrainerConfig;
 use crate::train::prmi::PrmiModel;
-use crate::train::training_set::TrainingSet;
+use crate::train::training_set::{Keys, SaIndices, TrainingSet};
 use crate::upstream::train::lower_bound_correction::LowerBoundCorrection;
 use crate::upstream::{
-    weighted_slr, LinearModel, LinearSplineModel, Model, ModelParam, RMITrainingData,
+    weighted_slr, KeyType, LinearModel, LinearSplineModel, Model, ModelParam, RMITrainingData,
+    RMITrainingDataIteratorProvider,
 };
+use rayon::prelude::*;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Zero-copy [`RMITrainingDataIteratorProvider`] over a [`TrainingSet`]'s
+/// `Arc`-shared key/index vectors.
+///
+/// It exists only to feed [`LowerBoundCorrection::new`]'s single sequential
+/// pass. Sharing the `Arc`s avoids materialising a `Vec<(u64, usize)>` copy of
+/// the entire training set (≈16 B/pair → ~100 GB at hg38 scale, on top of the
+/// vectors it duplicates). The `(key, sa_index)` sequence it yields is identical
+/// to the `Vec<(u64, usize)>` provider it replaces, so every fitted model
+/// parameter — and thus the on-disk sidecar — is byte-for-byte unchanged.
+struct KeySaProvider {
+    keys: Keys,
+    sa_indices: SaIndices,
+}
+
+impl RMITrainingDataIteratorProvider for KeySaProvider {
+    type InpType = u64;
+
+    fn len(&self) -> usize {
+        self.sa_indices.len()
+    }
+
+    fn cdf_iter(&self) -> Box<dyn Iterator<Item = (u64, usize)> + '_> {
+        Box::new((0..self.sa_indices.len()).map(move |i| {
+            let rank = self.sa_indices.get(i);
+            (self.keys.at(i, rank), rank as usize)
+        }))
+    }
+
+    fn key_type(&self) -> KeyType {
+        KeyType::U64
+    }
+
+    fn get(&self, idx: usize) -> Option<(u64, usize)> {
+        if idx < self.sa_indices.len() {
+            let rank = self.sa_indices.get(idx);
+            Some((self.keys.at(idx, rank), rank as usize))
+        } else {
+            None
+        }
+    }
+}
 
 /// Compute a reasonable default `l2_leaf_count` from the SA size.
 ///
@@ -163,15 +207,16 @@ pub fn train_with_config(
     let sa_num = ts.sa_num;
 
     // ── step 3: build RMITrainingData ─────────────────────────────────────
-    // Build Vec<(u64, usize)> from the training set. The `RMITrainingData`
-    // scale machinery applies a scale factor to the `usize` coordinate.
-    let pairs: Vec<(u64, usize)> = ts
-        .keys
-        .iter()
-        .zip(ts.sa_indices.iter())
-        .map(|(&k, &s)| (k, s as usize))
-        .collect();
-    let data = RMITrainingData::<u64>::new(Box::new(pairs));
+    // `LowerBoundCorrection::new` (step 4) makes a single sequential pass over
+    // the (key, sa_index) pairs and is the only consumer of `data`. Feed it a
+    // zero-copy provider that shares the training set's `Arc`-backed vectors
+    // rather than materialising a `Vec<(u64, usize)>` (≈16 B/pair, ~100 GB at
+    // hg38 scale). The iteration order is identical to the old `Vec` provider,
+    // so every downstream model parameter — and the sidecar — is unchanged.
+    let data = RMITrainingData::<u64>::new(Box::new(KeySaProvider {
+        keys: ts.keys.clone(),
+        sa_indices: ts.sa_indices.clone(),
+    }));
 
     // Resolve the global weight vector. `None` means uniform (weight=1.0).
     // Stored as a reference to avoid cloning when not needed.
@@ -192,121 +237,36 @@ pub fn train_with_config(
         let mut i = 0usize;
         for (leaf_idx, range) in leaf_ranges.iter_mut().enumerate() {
             let start = i;
-            while i < n && (ts.keys[i] >> bit_shift) as usize == leaf_idx {
+            while i < n && (ts.key(i) >> bit_shift) as usize == leaf_idx {
                 i += 1;
             }
             *range = (start, i);
         }
     }
 
-    // ── step 6: build L1 and L2 arrays ───────────────────────────────────
-    let mut l1: Vec<ModelEntry> = Vec::new();
-    let mut l2: Vec<ModelEntry> = Vec::with_capacity(l2_leaf_count as usize);
-
-    for (leaf_idx, &(start, end)) in leaf_ranges.iter().enumerate() {
-        let leaf_len = end - start;
-
-        if leaf_len == 0 {
-            // ── case a: empty leaf ────────────────────────────────────────
-            // Emit a constant model returning the next non-empty leaf's first
-            // SA index. `lbc.next_real(leaf_idx)` is the SA position of the
-            // first key in the next non-empty leaf (or None if none exists).
-            //
-            // In the unmasked (dense) case no query routes to an empty leaf
-            // because every key in the reference has a training pair. Under
-            // masking, the masked region's keys are absent from training, so
-            // empty leaves CAN receive queries at runtime.
-            //
-            // For such queries the true SA position is somewhere in the SA
-            // range [prev_last_sa + 1, next_first_sa - 1]. The model predicts
-            // next_first_sa (= const_pred). To guarantee the search window
-            // covers the entire gap, set err = const_pred. This makes
-            // lo = 0 (conservative but correct) and hi = 2 * const_pred + 1.
-            if let Some((next_sa_idx, _)) = lbc.next_real(leaf_idx) {
-                // Normal empty leaf: a next non-empty leaf exists.
-                // err = next_sa_idx guarantees the window [0, 2*next_sa_idx+1)
-                // covers all masked SA positions in [prev_last_sa+1, next_sa_idx-1].
-                let const_pred = next_sa_idx as f64;
-                let err = next_sa_idx as u64;
-                l2.push(ModelEntry {
-                    alpha: const_pred,
-                    beta: 0.0,
-                    err,
-                });
-            } else {
-                // ── case a-trailing: no next non-empty leaf exists ────────
-                // This is the trailing-empty-leaf case: masked 32-mers whose
-                // keys lex-sort above every training key route here. Their true
-                // SA ranks lie in [prev_last_sa + 1, sa_num - 1].
-                //
-                // Setting err = 0 (as the old code did) produces a 1-slot
-                // window that misses the valid SA tail. Instead, emit a
-                // centred constant model that covers the entire valid range.
-                let (lo, hi) = if let Some((prev_sa_idx, _)) = lbc.prev_real(leaf_idx) {
-                    // A previous non-empty leaf gives us a tight lower bound.
-                    let lo = prev_sa_idx as u64 + 1;
-                    let hi = sa_num.saturating_sub(1);
-                    (lo, hi)
-                } else {
-                    // No preceding leaf either: cover the whole SA.
-                    (0u64, sa_num.saturating_sub(1))
-                };
-                let mid = (lo + hi) / 2;
-                let radius = hi.saturating_sub(lo).saturating_add(1).div_ceil(2);
-                l2.push(ModelEntry {
-                    alpha: mid as f64,
-                    beta: 0.0,
-                    err: radius,
-                });
-            }
-            continue;
-        }
-
-        if leaf_len <= config.fallback_threshold {
-            // ── case b: direct leaf (DIRECT path) ────────────────────────
-            l2.push(fit_direct_leaf(
+    // ── step 6: fit leaves in parallel, then assemble serially ────────────
+    // Each leaf fits independently from immutable state (`lbc`, `ts`,
+    // `global_weights`), so the fits run over rayon. The order-dependent L1
+    // concatenation and `partial_start` stamping happen afterward in
+    // `assemble_model`, reproducing the sequential L1 layout byte-for-byte.
+    let fits: Vec<LeafFit> = leaf_ranges
+        .par_iter()
+        .enumerate()
+        .map(|(leaf_idx, &(start, end))| {
+            fit_leaf(
                 &lbc,
                 ts,
+                leaf_idx,
                 start,
                 end,
-                leaf_idx,
                 bit_shift,
                 sa_num,
+                config,
                 global_weights,
-            )?);
-        } else {
-            // ── case c: large leaf — try fallback, downgrade if needed ───
-            let start_y = ts.sa_indices[start] as usize;
-            let end_y = ts.sa_indices[end - 1] as usize;
-
-            if end_y == start_y {
-                // DBZ guard: all keys in this leaf map to the same SA position.
-                // Downgrade to direct fit. [A] audit, §Issues "Division by zero".
-                l2.push(fit_direct_leaf(
-                    &lbc,
-                    ts,
-                    start,
-                    end,
-                    leaf_idx,
-                    bit_shift,
-                    sa_num,
-                    global_weights,
-                )?);
-            } else {
-                l2.push(fit_fallback_leaf(
-                    ts,
-                    start,
-                    end,
-                    start_y,
-                    end_y,
-                    &mut l1,
-                    config,
-                    sa_num,
-                    global_weights,
-                )?);
-            }
-        }
-    }
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (l1, l2) = assemble_model(fits)?;
 
     // ── step 8: assert shape ──────────────────────────────────────────────
     assert_eq!(l2.len(), l2_leaf_count as usize);
@@ -350,11 +310,15 @@ fn fit_direct_leaf(
     // Global per-pair weights. `None` means uniform (1.0).
     weights: Option<&Vec<f64>>,
 ) -> Result<ModelEntry> {
+    // Materialise this leaf's SA-index targets once (bounded by leaf size).
+    // Identical values to the former `ts.sa_indices[start..end]` slice.
+    let leaf_sa: Vec<u64> = (start..end).map(|i| ts.sa_indices.get(i)).collect();
+    let leaf_keys: Vec<u64> = (start..end).map(|i| ts.key(i)).collect();
     let (alpha, beta) = if let Some(ws) = weights {
         // Weighted fit using per-pair weights from the training set.
-        let leaf_pairs: Vec<(f64, f64)> = ts.keys[start..end]
+        let leaf_pairs: Vec<(f64, f64)> = leaf_keys
             .iter()
-            .zip(ts.sa_indices[start..end].iter())
+            .zip(leaf_sa.iter())
             .map(|(&k, &s)| (k as f64, s as f64))
             .collect();
         let leaf_weights: Vec<f64> = ws[start..end].to_vec();
@@ -362,9 +326,9 @@ fn fit_direct_leaf(
         (a, b)
     } else {
         // Unweighted fit (original path).
-        let leaf_pairs: Vec<(u64, usize)> = ts.keys[start..end]
+        let leaf_pairs: Vec<(u64, usize)> = leaf_keys
             .iter()
-            .zip(ts.sa_indices[start..end].iter())
+            .zip(leaf_sa.iter())
             .map(|(&k, &s)| (k, s as usize))
             .collect();
         let leaf_data = RMITrainingData::<u64>::new(Box::new(leaf_pairs));
@@ -384,10 +348,7 @@ fn fit_direct_leaf(
 
     // Compute in-leaf error: max |predict(k) - sa_idx| over all leaf keys.
     let mut err = 0u64;
-    for (k, sa_idx) in ts.keys[start..end]
-        .iter()
-        .zip(ts.sa_indices[start..end].iter())
-    {
+    for (k, sa_idx) in leaf_keys.iter().zip(leaf_sa.iter()) {
         let pred = predict_clamped(alpha, beta, *k, sa_num);
         let d = (pred - *sa_idx as i64).unsigned_abs();
         if d > err {
@@ -467,12 +428,15 @@ fn fit_fallback_leaf(
     end: usize,
     start_y: usize,
     end_y: usize,
-    l1: &mut Vec<ModelEntry>,
     config: &TrainerConfig,
     sa_num: u64,
     weights: Option<&Vec<f64>>,
-) -> Result<ModelEntry> {
+) -> Result<FallbackFit> {
     let leaf_len = end - start;
+    // This leaf's SA-index targets (bounded by leaf size); identical values to
+    // the former `ts.sa_indices[start..end]` slice.
+    let leaf_sa: Vec<u64> = (start..end).map(|i| ts.sa_indices.get(i)).collect();
+    let leaf_keys: Vec<u64> = (start..end).map(|i| ts.key(i)).collect();
 
     // partial_num = ceil(leaf_len / partial_target_size). [A] audit §"Algorithmic notes".
     let partial_num = (leaf_len as u64).div_ceil(config.partial_target_size) as usize;
@@ -484,9 +448,9 @@ fn fit_fallback_leaf(
     // since Marcus's reverted RMITrainingData has no set_offset API.
     // [A] audit §"Design decision #6 Scale/offset rescaling".
     let scale = (partial_num - 1) as f64 / (end_y - start_y) as f64;
-    let scaled_f64_pairs: Vec<(f64, f64)> = ts.keys[start..end]
+    let scaled_f64_pairs: Vec<(f64, f64)> = leaf_keys
         .iter()
-        .zip(ts.sa_indices[start..end].iter())
+        .zip(leaf_sa.iter())
         .map(|(&k, &s)| {
             let shifted = (s as usize).saturating_sub(start_y);
             let scaled = (shifted as f64 * scale).round();
@@ -522,11 +486,7 @@ fn fit_fallback_leaf(
     // Weight is always 1.0 when no prior is active; this keeps the sub-leaf
     // fitting path uniform regardless of whether weights are present.
     let mut sub_leaf_items: Vec<Vec<(u64, usize, f64)>> = vec![Vec::new(); partial_num];
-    for (i, (&k, &sa_idx)) in ts.keys[start..end]
-        .iter()
-        .zip(ts.sa_indices[start..end].iter())
-        .enumerate()
-    {
+    for (i, (&k, &sa_idx)) in leaf_keys.iter().zip(leaf_sa.iter()).enumerate() {
         let w = weights.map_or(1.0, |ws| ws[start + i]);
         let raw = routing_alpha + routing_beta * k as f64;
         let sub_idx = if raw.is_nan() {
@@ -552,18 +512,12 @@ fn fit_fallback_leaf(
         }
     }
 
-    // ── record where this leaf's L1 entries begin ─────────────────────────
-    let partial_start = l1.len() as u64;
-    // Runtime overflow check — encode_fallback_err will also catch this,
-    // but checking here gives a clearer error before we append any sub-leaf
-    // entries to l1.
-    if partial_start >= (1u64 << 31) {
-        return Err(Error::Internal {
-            detail: format!("partial_start={partial_start} exceeds 2^31 - 1 cap (brief §4.4)"),
-        });
-    }
-
-    // ── fit each sub-leaf and append to l1 ───────────────────────────────
+    // ── fit each sub-leaf into this leaf's own L1 buffer ──────────────────
+    // `partial_start` (the offset into the global L1 array) is NOT read here:
+    // it depends on every prior leaf's L1 count, which is only known in the
+    // serial assembly phase. Computing it here would force this fit to run in
+    // leaf order. Instead the entries are buffered and concatenated later.
+    let mut l1_entries: Vec<ModelEntry> = Vec::with_capacity(partial_num);
     for s in 0..partial_num {
         let items = &sub_leaf_items[s];
         let entry = match items.len() {
@@ -620,15 +574,142 @@ fn fit_fallback_leaf(
                 }
             }
         };
-        l1.push(entry);
+        l1_entries.push(entry);
     }
 
-    // L2 entry: routing model params + encoded fallback pointer.
-    Ok(ModelEntry {
-        alpha: routing_alpha,
-        beta: routing_beta,
-        err: encode_fallback_err(partial_start, partial_num as u64)?,
+    Ok(FallbackFit {
+        routing_alpha,
+        routing_beta,
+        partial_num,
+        l1_entries,
     })
+}
+
+/// A fitted fallback leaf, minus the global L1 offset (`partial_start`), which
+/// is assigned during serial assembly. See [`fit_fallback_leaf`].
+struct FallbackFit {
+    routing_alpha: f64,
+    routing_beta: f64,
+    partial_num: usize,
+    l1_entries: Vec<ModelEntry>,
+}
+
+/// Result of fitting one L2 leaf, ready for serial assembly into the model.
+enum LeafFit {
+    /// A final L2 entry (empty or direct leaf) with no L1 entries.
+    Entry(ModelEntry),
+    /// A fallback leaf whose L2 `err` (encoding `partial_start`) and L1 entries
+    /// are stitched in during serial assembly.
+    Fallback(FallbackFit),
+}
+
+/// Fit a single L2 leaf `[start, end)` — empty, direct, or fallback — into a
+/// [`LeafFit`].
+///
+/// Reads only immutable state (`lbc`, `ts`, `weights`), so leaves fit
+/// independently and in parallel. All per-leaf floating-point math runs on one
+/// thread, so the result is bit-identical to the serial fit regardless of
+/// scheduling; the order-dependent L1 assembly is deferred to
+/// [`assemble_model`].
+#[allow(clippy::too_many_arguments)]
+fn fit_leaf(
+    lbc: &LowerBoundCorrection<u64>,
+    ts: &TrainingSet,
+    leaf_idx: usize,
+    start: usize,
+    end: usize,
+    bit_shift: u32,
+    sa_num: u64,
+    config: &TrainerConfig,
+    weights: Option<&Vec<f64>>,
+) -> Result<LeafFit> {
+    let leaf_len = end - start;
+
+    // ── case a: empty leaf ────────────────────────────────────────────────
+    if leaf_len == 0 {
+        let entry = if let Some((next_sa_idx, _)) = lbc.next_real(leaf_idx) {
+            // Normal empty leaf: err = next_sa_idx makes the window
+            // [0, 2*next_sa_idx+1) cover all masked SA positions in the gap.
+            ModelEntry {
+                alpha: next_sa_idx as f64,
+                beta: 0.0,
+                err: next_sa_idx as u64,
+            }
+        } else {
+            // Trailing empty leaf: centre a constant model over the valid tail
+            // [prev_last_sa + 1, sa_num - 1] (or the whole SA if no predecessor).
+            let (lo, hi) = if let Some((prev_sa_idx, _)) = lbc.prev_real(leaf_idx) {
+                (prev_sa_idx as u64 + 1, sa_num.saturating_sub(1))
+            } else {
+                (0u64, sa_num.saturating_sub(1))
+            };
+            let mid = (lo + hi) / 2;
+            // `mid` is the floor midpoint, so the farthest valid position is
+            // `ceil((hi - lo) / 2)` away — no `+1` (that overstated the radius by
+            // one for odd-length tails, widening the search window needlessly).
+            let radius = hi.saturating_sub(lo).div_ceil(2);
+            ModelEntry {
+                alpha: mid as f64,
+                beta: 0.0,
+                err: radius,
+            }
+        };
+        return Ok(LeafFit::Entry(entry));
+    }
+
+    // ── case b: direct leaf ───────────────────────────────────────────────
+    if leaf_len <= config.fallback_threshold {
+        return Ok(LeafFit::Entry(fit_direct_leaf(
+            lbc, ts, start, end, leaf_idx, bit_shift, sa_num, weights,
+        )?));
+    }
+
+    // ── case c: large leaf — fallback, downgrading to direct on a DBZ ─────
+    let start_y = ts.sa_indices.get(start) as usize;
+    let end_y = ts.sa_indices.get(end - 1) as usize;
+    if end_y == start_y {
+        // All keys map to the same SA position; a fallback rescale would divide
+        // by zero, so fit a direct leaf instead. [A] audit §Issues "DBZ".
+        return Ok(LeafFit::Entry(fit_direct_leaf(
+            lbc, ts, start, end, leaf_idx, bit_shift, sa_num, weights,
+        )?));
+    }
+    Ok(LeafFit::Fallback(fit_fallback_leaf(
+        ts, start, end, start_y, end_y, config, sa_num, weights,
+    )?))
+}
+
+/// Serially assemble fitted leaves into the `(l1, l2)` model arrays in leaf
+/// order, stamping each fallback leaf's `partial_start` (its offset into the
+/// growing L1 array). This reproduces the exact L1 byte layout of the original
+/// sequential fit, so the model is byte-for-byte identical.
+fn assemble_model(fits: Vec<LeafFit>) -> Result<(Vec<ModelEntry>, Vec<ModelEntry>)> {
+    let mut l1: Vec<ModelEntry> = Vec::new();
+    let mut l2: Vec<ModelEntry> = Vec::with_capacity(fits.len());
+    for fit in fits {
+        match fit {
+            LeafFit::Entry(entry) => l2.push(entry),
+            LeafFit::Fallback(fb) => {
+                let partial_start = l1.len() as u64;
+                // Overflow check on the final offset (encode_fallback_err also
+                // catches this, but this gives a clearer error first).
+                if partial_start >= (1u64 << 31) {
+                    return Err(Error::Internal {
+                        detail: format!(
+                            "partial_start={partial_start} exceeds 2^31 - 1 cap (brief §4.4)"
+                        ),
+                    });
+                }
+                l1.extend(fb.l1_entries);
+                l2.push(ModelEntry {
+                    alpha: fb.routing_alpha,
+                    beta: fb.routing_beta,
+                    err: encode_fallback_err(partial_start, fb.partial_num as u64)?,
+                });
+            }
+        }
+    }
+    Ok((l1, l2))
 }
 
 // ── unit tests ────────────────────────────────────────────────────────────────
@@ -639,12 +720,13 @@ mod tests {
     use crate::index::lookup::lookup_with_components;
     use crate::train::config::TrainerConfig;
     use crate::train::training_set::TrainingSet;
+    use std::sync::Arc;
 
     fn make_ts(keys: Vec<u64>, sa_indices: Vec<u64>) -> TrainingSet {
         let sa_num = sa_indices.iter().copied().max().map(|m| m + 1).unwrap_or(0);
         TrainingSet {
-            keys,
-            sa_indices,
+            keys: Keys::Materialized(Arc::new(keys)),
+            sa_indices: SaIndices::Materialized(Arc::new(sa_indices)),
             sa_num,
             weights: None,
         }
@@ -744,7 +826,7 @@ mod tests {
         let ts = make_ts(keys, sa_indices);
 
         // Verify all keys route to leaf 0 with bit_shift = 60.
-        for &k in &ts.keys {
+        for k in ts.keys_iter() {
             assert_eq!(k >> 60, 0, "key should route to leaf 0");
         }
 

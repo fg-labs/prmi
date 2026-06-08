@@ -15,6 +15,9 @@ pub mod verify;
 use crate::encoding::{tokenize_32mer, BASE_T, KMER_LEN};
 use crate::error::{Error, Result};
 use crate::fasta::fasta_to_2bit_with_sha256;
+use crate::index::smem::PacEncoding;
+use crate::index::LearnedIndex;
+use crate::sidecar::kmt_file::KmtFileWriter;
 use crate::sidecar::magic::{FORMAT_VERSION, META_MAGIC};
 use crate::sidecar::meta::{Meta, Priors, Prmi, Ref, RmiSpec, Sa};
 use crate::sidecar::model_file::{ModelFileWriter, ModelLayer};
@@ -24,8 +27,8 @@ use crate::train::config::{MemoryMode, TrainerConfig};
 use crate::train::mask::MaskConfig;
 use crate::train::prior::Prior;
 use crate::train::trainer::default_l2_leaf_count;
-use crate::train::training_set::masked_training_set;
-use crate::train::verify::{compute_error_distribution, compute_max_error_bound};
+use crate::train::training_set::{masked_training_set, streamed_training_set};
+use crate::train::verify::compute_error_distribution;
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -182,42 +185,77 @@ fn build_sidecar_core(
     // Build the 2× generalized suffix array over [Fwd||RC]+sentinel. No
     // T-padding and no filtering: every entry is retained, including the
     // sentinel/empty-suffix row, so SA order is byte-identical to the FMI.
-    let text = crate::sa::build_doubled_2x_text(&bases);
-    let sa = crate::sa::build_gsa(&text, threads)?;
+    // `sa` and `text` are shared (Arc) so the streamed training set can borrow
+    // them zero-copy; both are also needed later for the `.sa` write.
+    let text = std::sync::Arc::new(crate::sa::build_doubled_2x_text(&bases));
+    let sa = std::sync::Arc::new(crate::sa::build_gsa(&text, threads)?);
 
     // Resolve the optional l2_leaf_count: use provided value or auto-scale.
     let l2_leaf_count = l2_leaf_count.unwrap_or_else(|| default_l2_leaf_count(sa.len()));
 
-    // The SA is in doubled coordinates over `text` (length 2*l_pac+1), so the
-    // training set must index bases/n_positions in those same coordinates. Build
-    // the 0..=3 base array from `text` (1..=4, sentinel 0 → T) and an N bitmap in
-    // doubled coordinates: the forward half carries the FASTA N flags, the RC
-    // half mirrors them (the RC of an ambiguous base is itself ambiguous — those
-    // RC suffixes must see the same `mask_n_runs` filtering as the forward half),
-    // and the sentinel row stays non-N.
-    let text_bases: Vec<u8> = text
-        .iter()
-        .map(|&v| crate::sa::text_value_to_base(v))
-        .collect();
-    let l_pac = bases.len();
-    let mut n_positions_2x = vec![false; text.len()];
-    // Forward half: positions 0..l_pac.
-    n_positions_2x[..l_pac].copy_from_slice(&n_positions);
-    // RC half: forward position i maps to doubled coordinate l_pac + (l_pac-1-i),
-    // matching `doubled_base_at`'s reverse-complement mapping.
-    for (i, &is_n) in n_positions.iter().enumerate() {
-        if is_n {
-            n_positions_2x[l_pac + (l_pac - 1 - i)] = true;
+    // Dense/streamed fast path (the byte-identical `.pac` build): a uniform
+    // prior with no homopolymer/BED mask and no effective N-mask. On this path
+    // the keys are streamed from `sa`+`text` and the SA-index targets are
+    // virtual, so neither the ~51.5 GB key vector, the ~51.5 GB target vector,
+    // nor the `text_bases` / `n_positions_2x` arrays are materialised. The
+    // resulting (key, sa_index) pairs — and the model — are byte-identical to
+    // the materialized path.
+    let no_n_effect = !mask.mask_n_runs || n_positions.iter().all(|&b| !b);
+    let virtualize = matches!(config.prior, Prior::Uniform)
+        && mask.mask_homopolymers.is_none()
+        && mask.mask_bed.is_none()
+        && no_n_effect;
+    let ts = if virtualize {
+        streamed_training_set(std::sync::Arc::clone(&sa), std::sync::Arc::clone(&text))
+    } else {
+        // Materialized path. The SA is in doubled coordinates over `text`
+        // (length 2*l_pac+1), so the training set indexes bases/n_positions in
+        // those same coordinates: the 0..=3 base array from `text` (1..=4,
+        // sentinel 0 → T) and an N bitmap whose forward half carries the FASTA N
+        // flags and whose RC half mirrors them (the RC of an ambiguous base is
+        // itself ambiguous — those RC suffixes must see the same `mask_n_runs`
+        // filtering as the forward half; the sentinel row stays non-N).
+        let text_bases: Vec<u8> = text
+            .iter()
+            .map(|&v| crate::sa::text_value_to_base(v))
+            .collect();
+        let l_pac = n_positions.len();
+        let mut n_positions_2x = vec![false; text.len()];
+        // Forward half: positions 0..l_pac.
+        n_positions_2x[..l_pac].copy_from_slice(&n_positions);
+        // RC half: forward position i maps to doubled coordinate l_pac+(l_pac-1-i),
+        // matching `doubled_base_at`'s reverse-complement mapping.
+        for (i, &is_n) in n_positions.iter().enumerate() {
+            if is_n {
+                n_positions_2x[l_pac + (l_pac - 1 - i)] = true;
+            }
         }
-    }
-
-    let ts = masked_training_set(&sa, &text_bases, &n_positions_2x, &mask, &config.prior);
+        masked_training_set(&sa, &text_bases, &n_positions_2x, &mask, &config.prior)
+    };
     let model = crate::train::trainer::train_with_config(&ts, l2_leaf_count, &config)?;
-    let max_err = compute_max_error_bound(&model, &ts);
-    let (p50, p90, p99, _dist_max) = compute_error_distribution(&model, &ts);
+    // Streaming histogram: returns the percentile distribution and the max in
+    // two passes, without materialising a ~51.5 GB per-key error vector. The
+    // returned `max` equals the former `compute_max_error_bound`.
+    let (p50, p90, p99, max_err) = compute_error_distribution(&model, &ts);
     log::info!("prmi model error bound: max={max_err} p50={p50} p90={p90} p99={p99}");
 
     let paths = SidecarPaths::from_prefix(prefix);
+
+    // Remove any pre-existing `.kmt` so a rebuild (especially one WITHOUT
+    // `--kmer-table-k`) can never inherit a stale table for the old reference.
+    // A fresh table is written at the end if requested. Propagate anything other
+    // than "already absent": a swallowed permission/I/O error would silently
+    // leave the stale table in place for the next open.
+    match std::fs::remove_file(&paths.kmt) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::Io {
+                path: paths.kmt.clone(),
+                source: e,
+            })
+        }
+    }
 
     // .sa — write all genome-region entries in the requested memory mode.
     let memory_mode = config.memory_mode;
@@ -225,7 +263,7 @@ fn build_sidecar_core(
         MemoryMode::Mode1 => {
             // Position-only, 5 B/entry. Original layout; unchanged.
             let mut w = SaFileWriter::create(&paths.sa, sa.len() as u64)?;
-            for &pos in &sa {
+            for &pos in sa.iter() {
                 w.write_position(pos)?;
             }
             w.finish()?;
@@ -233,27 +271,12 @@ fn build_sidecar_core(
         MemoryMode::Mode2 => {
             // Position + 32-mer key, 13 B/entry.
             let mut w = SaFileWriter::create_with_mode(&paths.sa, sa.len() as u64, BPE_MODE2)?;
-            for &pos in &sa {
+            for &pos in sa.iter() {
                 let key = key_for_position_2x(pos, &text);
                 w.write_entry_with_key(pos, key)?;
             }
             w.finish()?;
         }
-    }
-
-    // .isa — inverse SA (ref2sa): isa[sa[i]] = i. Length N+1 = sa.len(), covering
-    // all doubled-coordinate positions including the sentinel at 2*l_pac.
-    {
-        let n = sa.len();
-        let mut isa = vec![0u64; n];
-        for (i, &pos) in sa.iter().enumerate() {
-            isa[pos as usize] = i as u64;
-        }
-        let mut isa_w = crate::sidecar::isa_file::IsaFileWriter::create(&paths.isa, n as u64)?;
-        for &v in &isa {
-            isa_w.write_entry(v)?;
-        }
-        isa_w.finish()?;
     }
 
     // .l1 / .l2
@@ -319,6 +342,57 @@ fn build_sidecar_core(
         priors,
     };
     meta.write_file(&paths.meta)?;
+
+    // ── optional: build and persist the forward k-mer table ───────────────
+    if let Some(requested_k) = config.kmer_table_k {
+        // Reject a zero order rather than coercing it to a 1-mer table — the
+        // caller would silently get a different artifact than requested.
+        if requested_k == 0 {
+            return Err(Error::InvalidInput {
+                detail: "kmer_table_k must be >= 1".into(),
+            });
+        }
+        let sa_num = sa.len() as u64;
+        // Cap k so 4^k does not dwarf the SA (avoids a huge mostly-empty table
+        // on small references); the table is self-describing via its header.
+        let k_max = ((sa_num as f64).log2() / 2.0).floor().clamp(1.0, 16.0) as u32;
+        let k = requested_k.min(k_max);
+        if k < requested_k {
+            log::warn!(
+                "k-mer table k capped to {k} (requested {requested_k}) for this reference size"
+            );
+        }
+
+        // Reopen the just-written sidecar to drive the table search: it streams
+        // the SA positions (and, in key-storing modes, the inline 32-mer keys)
+        // from the `.sa` via the page cache, reusing the exact compare
+        // `forward_spectrum` uses. We deliberately do NOT rebuild positions/keys
+        // from the in-memory `sa` — that would either recompute every key per
+        // probe (slower) or re-materialize the ~51 GB key vector the streamed
+        // build avoids, defeating the memory budget.
+        //
+        // The reference bases, however, are taken from the in-memory `bases` we
+        // already hold (decoded from the `.pac` for a Pac build, or the FASTA
+        // 2-bit), instead of re-reading the entire `.pac` from disk. `bases` is
+        // byte-identical to the decoded `.pac`, so the unpacked compare yields a
+        // byte-identical table to a packed `.pac` compare — verified by
+        // `kmer_table_packed_pac_equals_unpacked_bases`.
+        let idx = LearnedIndex::open(prefix)?;
+        let table = idx.build_kmer_table(k, &bases, PacEncoding::Unpacked);
+        let (tk, tlo, thi) = table.parts();
+        // Bind the table to its reference: prefer `pac_sha256` (the byte-identical
+        // build), else the FASTA ref sha. A 0 digest (unparsable) just means the
+        // open path falls back to the full search.
+        let digest_hex = meta
+            .sa
+            .pac_sha256
+            .as_deref()
+            .unwrap_or(meta.ref_.sha256.as_str());
+        let ref_digest = crate::sidecar::kmt_file::hex32(digest_hex).unwrap_or([0u8; 32]);
+        KmtFileWriter::write(&paths.kmt, tk, sa_num, &ref_digest, tlo, thi)?;
+        log::info!("prmi forward k-mer table: k={tk}, sa_num={sa_num}");
+    }
+
     Ok(())
 }
 

@@ -101,7 +101,7 @@ fn mask_n_runs_default_on_excludes_n_window() {
 
     // No key in the masked set should come from an N-window position.
     // Recover the SA positions from the sa_indices in the masked training set.
-    for &sa_idx in &ts_masked.sa_indices {
+    for sa_idx in ts_masked.sa_indices.iter() {
         let sa_pos = sa[sa_idx as usize] as usize;
         let has_n = n_positions[sa_pos..(sa_pos + KMER_LEN).min(n_positions.len())].contains(&true);
         assert!(!has_n, "sa_pos={sa_pos} should not be in N-window");

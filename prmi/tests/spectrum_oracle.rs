@@ -3,9 +3,27 @@
 
 use prmi::index::spectrum::SmemStep;
 use prmi::index::LearnedIndex;
-use prmi::train::{build_sidecar_from_pac, mask::MaskConfig};
+use prmi::train::config::{MemoryMode, TrainerConfig};
+use prmi::train::{build_sidecar_from_pac_with_config, mask::MaskConfig};
+use proptest::prelude::*;
 use std::io::Write;
 use tempfile::tempdir;
+
+/// Build a sidecar in **mode 2** (position + stored 32-mer key), so the spectrum
+/// query path exercises the stored-key compare fast path end-to-end. Keys are
+/// asserted scalar-identical elsewhere, so the oracle results are unchanged; this
+/// just ensures the key path runs. Mirrors the arg shape of the upstream
+/// `build_sidecar_from_pac` so call sites are unchanged.
+fn build_sidecar_from_pac(
+    pac: &std::path::Path,
+    prefix: &std::path::Path,
+    l2_leaf_count: Option<u64>,
+    mask: MaskConfig,
+    threads: usize,
+) -> prmi::error::Result<()> {
+    let cfg = TrainerConfig::default().with_memory_mode(MemoryMode::Mode2);
+    build_sidecar_from_pac_with_config(pac, prefix, l2_leaf_count, mask, threads, Some(cfg))
+}
 
 fn write_pac(path: &std::path::Path, bases: &[u8]) {
     let l = bases.len();
@@ -368,6 +386,289 @@ fn backward_spectrum_crosses_fwd_rc_junction() {
                 extq.len()
             );
         }
+    }
+}
+
+/// Wide-interval stress: a SHORT anchor with LARGE occ (an A-biased reference, the
+/// same construction `forward_spectrum_occ_correct_for_wide_shallow_intervals` uses).
+/// The old member-enumeration backward extension was O(occ) per left base; here occ is
+/// in the hundreds–thousands, the regime the small-ref backward tests never exercised.
+/// Every backward step's `(sa_start, occ_count)` must still equal the brute-force oracle.
+#[test]
+fn backward_spectrum_wide_interval_matches_oracle() {
+    let dir = tempdir().unwrap();
+    // A-biased pseudo-random reference (~70% 'A'=0): a short anchor spanning the 'A'
+    // block has a very wide SA interval (occ in the hundreds–thousands).
+    let mut state = 0x0bad_f00d_dead_beefu64;
+    let bases: Vec<u8> = (0..4000)
+        .map(|_| {
+            let r = lcg_next(&mut state) % 10;
+            if r < 7 {
+                0
+            } else {
+                (r % 3 + 1) as u8
+            }
+        })
+        .collect();
+    let pac = dir.path().join("abias.pac");
+    write_pac(&pac, &bases);
+    let prefix = dir.path().join("abias.prmi");
+    build_sidecar_from_pac(&pac, &prefix, None, MaskConfig::default(), 1).unwrap();
+    let idx = LearnedIndex::open(&prefix).unwrap();
+    let enc = prmi::index::smem::PacEncoding::Unpacked;
+
+    // Pick a right-anchor whose interval is WIDE (occ in the hundreds–thousands) yet
+    // still extends leftward. Search forward steps for one with occ in that band; use
+    // its match_len as the anchor span, pivoting so there is room to extend left.
+    let read = bases.clone();
+    let pivot = 1000usize;
+    let q: Vec<u8> = read[pivot..].to_vec();
+    let fwd = idx.forward_spectrum(&q, &bases, enc);
+    let anchor = *fwd
+        .iter()
+        .find(|s| (100..=5000).contains(&s.occ_count))
+        .or_else(|| fwd.first())
+        .expect("at least one forward step");
+
+    // The anchor must be COMPLETE (unclamped) so the full-text oracle is the baseline.
+    let anchor_q: Vec<u8> = read[pivot..pivot + anchor.match_len as usize].to_vec();
+    assert_eq!(
+        anchor.occ_count,
+        oracle_occ(&bases, &anchor_q, anchor_q.len()),
+        "anchor interval must be complete (unclamped by the model window)"
+    );
+    assert!(
+        anchor.occ_count >= 100,
+        "wide-interval test needs a WIDE anchor; got occ={}",
+        anchor.occ_count
+    );
+
+    let steps = idx.backward_spectrum(
+        anchor.sa_start,
+        anchor.occ_count,
+        anchor.match_len,
+        &read,
+        pivot,
+        &bases,
+        enc,
+    );
+    assert!(!steps.is_empty(), "expected at least one backward step");
+    for s in &steps {
+        let total = s.match_len as usize;
+        let left_ext = total - anchor.match_len as usize;
+        let qstart = pivot - left_ext;
+        let extq: Vec<u8> = read[qstart..pivot + anchor.match_len as usize].to_vec();
+        assert_eq!(
+            (s.sa_start, s.occ_count),
+            (
+                oracle_lower(&bases, &extq, extq.len()),
+                oracle_occ(&bases, &extq, extq.len())
+            ),
+            "wide-interval backward step mismatch at total match_len={total}"
+        );
+    }
+}
+
+/// Brute-force lower bound: the SA index of the first suffix that is >= `query[..m]`
+/// over the doubled text. Computed by sorting suffix start positions by their (sentinel-
+/// terminated) doubled-text content, then finding the first whose first `m` bases match.
+/// Returns the count of strictly-smaller suffixes (i.e. the SA interval start). This is
+/// the oracle for `SmemStep::sa_start`.
+fn oracle_lower(bases: &[u8], query: &[u8], m: usize) -> u64 {
+    let n = 2 * bases.len() + 1;
+    // Number of suffixes strictly less than query[..m] under the GSA (sentinel-smallest)
+    // ordering. A suffix is < query[..m] iff at the first differing position its base is
+    // smaller, OR it runs out (hits the sentinel) before matching all m bases.
+    let mut less = 0u64;
+    for start in 0..n {
+        if suffix_lt_query(bases, start, query, m) {
+            less += 1;
+        }
+    }
+    less
+}
+
+/// True iff the doubled-text suffix at `start` is lexicographically < `query[..m]`
+/// under the sentinel-smallest ordering.
+fn suffix_lt_query(bases: &[u8], start: usize, query: &[u8], m: usize) -> bool {
+    for (j, &qb) in query.iter().enumerate().take(m) {
+        match doubled(bases, start + j) {
+            None => return true, // ref exhausted -> ref < query
+            Some(rb) if rb == qb => {}
+            Some(rb) => return rb < qb,
+        }
+    }
+    false // matched all m bases -> ref >= query
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    /// Random refs + random anchors: the new boundary-binary-search backward trace must
+    /// be byte-identical to the brute-force oracle trace (sa_start, occ_count, match_len).
+    #[test]
+    fn backward_spectrum_matches_oracle_proptest(
+        bases in prop::collection::vec(0u8..=3, 8..120),
+        pivot_frac in 0u64..1000,
+    ) {
+        let dir = tempdir().unwrap();
+        let pac = dir.path().join("r.pac");
+        write_pac(&pac, &bases);
+        let prefix = dir.path().join("r.prmi");
+        // Degenerate refs (too few distinct keys) can't train a model; skip those —
+        // they're not the regime this test targets (wide/diverse SA intervals).
+        prop_assume!(build_sidecar_from_pac(&pac, &prefix, None, MaskConfig::default(), 1).is_ok());
+        let idx = LearnedIndex::open(&prefix).unwrap();
+        let enc = prmi::index::smem::PacEncoding::Unpacked;
+
+        let read = bases.clone();
+        // Choose a pivot in [1, len) so there is at least one base to extend left into.
+        let pivot = 1 + (pivot_frac as usize % (read.len() - 1));
+        let q: Vec<u8> = read[pivot..].to_vec();
+        let fwd = idx.forward_spectrum(&q, &bases, enc);
+        // Use the shortest forward step (largest occ) as the right anchor, when present.
+        let Some(anchor) = fwd.first().copied() else { return Ok(()); };
+
+        let steps = idx.backward_spectrum(
+            anchor.sa_start,
+            anchor.occ_count,
+            anchor.match_len,
+            &read,
+            pivot,
+            &bases,
+            enc,
+        );
+
+        // (1) The model-launched trace must equal the model-free full-SA reference.
+        let reference = idx.backward_spectrum_reference(
+            anchor.sa_start,
+            anchor.occ_count,
+            anchor.match_len,
+            &read,
+            pivot,
+            &bases,
+            enc,
+        );
+        prop_assert_eq!(&steps, &reference, "model-launch != full-SA reference");
+
+        // (2) Wrong-seed / err=0 recovery: forcing a deliberately-wrong, zero-width
+        // window at each SA extreme must STILL reproduce the oracle trace, proving the
+        // expand-on-miss recovery (the window is a hint, never a clamp).
+        let sa_num = idx.sa_num();
+        for seed in [
+            (|_k: u64| (0u64, 0u64)) as fn(u64) -> (u64, u64),
+            (|_k: u64| (u64::MAX, 0u64)) as fn(u64) -> (u64, u64),
+            (|_k: u64| (1u64, 0u64)) as fn(u64) -> (u64, u64),
+        ] {
+            let forced = idx.backward_spectrum_with_seed(
+                anchor.sa_start,
+                anchor.occ_count,
+                anchor.match_len,
+                &read,
+                pivot,
+                &bases,
+                enc,
+                seed,
+            );
+            prop_assert_eq!(&forced, &steps, "wrong-seed (sa_num={}) diverged", sa_num);
+        }
+
+        // Independently compute the oracle backward trace: prepend bases left from the
+        // pivot, recomputing the full doubled-text interval each step until it empties or
+        // the read boundary is reached (mirrors backward_spectrum's loop/break contract).
+        let mut oracle_steps: Vec<SmemStep> = Vec::new();
+        let mut left_ext = 0usize;
+        while left_ext < pivot {
+            let c = read[pivot - 1 - left_ext];
+            if c >= 4 { break; }
+            let qstart = pivot - 1 - left_ext;
+            let qend = pivot + anchor.match_len as usize;
+            let extq: Vec<u8> = read[qstart..qend].to_vec();
+            let occ = oracle_occ(&bases, &extq, extq.len());
+            if occ == 0 { break; }
+            let lower = oracle_lower(&bases, &extq, extq.len());
+            left_ext += 1;
+            oracle_steps.push(SmemStep {
+                sa_start: lower,
+                occ_count: occ,
+                match_len: anchor.match_len + left_ext as u64,
+            });
+        }
+        prop_assert_eq!(steps, oracle_steps);
+    }
+}
+
+/// Wrong-seed / `err = 0` recovery (deterministic): a poorly-fit model window must
+/// not change the result. Force every left step to launch from a single wrong SA index
+/// with zero width and assert the trace stays identical to both the real model launch
+/// and the full-SA reference — proving expand-on-miss recovers the TRUE interval.
+#[test]
+fn backward_spectrum_wrong_seed_recovers_true_interval() {
+    let dir = tempdir().unwrap();
+    let bases: Vec<u8> = b"ACGTACGTTACGTAACGTACGTGACGTACGTACGTACGTT"
+        .iter()
+        .map(|&c| match c {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            _ => 3,
+        })
+        .collect();
+    let pac = dir.path().join("r.pac");
+    write_pac(&pac, &bases);
+    let prefix = dir.path().join("r.prmi");
+    build_sidecar_from_pac(&pac, &prefix, None, MaskConfig::default(), 1).unwrap();
+    let idx = LearnedIndex::open(&prefix).unwrap();
+    let enc = prmi::index::smem::PacEncoding::Unpacked;
+    let sa_num = idx.sa_num();
+
+    let read = bases.clone();
+    let pivot = 30usize;
+    let q: Vec<u8> = read[pivot..].to_vec();
+    let anchor = *idx
+        .forward_spectrum(&q, &bases, enc)
+        .first()
+        .expect("a forward anchor");
+
+    let truth = idx.backward_spectrum_reference(
+        anchor.sa_start,
+        anchor.occ_count,
+        anchor.match_len,
+        &read,
+        pivot,
+        &bases,
+        enc,
+    );
+    let model = idx.backward_spectrum(
+        anchor.sa_start,
+        anchor.occ_count,
+        anchor.match_len,
+        &read,
+        pivot,
+        &bases,
+        enc,
+    );
+    assert_eq!(model, truth, "real model launch != reference");
+
+    // Deliberately-wrong, zero-width windows at every SA extreme + an interior point.
+    let seeds: [fn(u64) -> (u64, u64); 4] =
+        [|_k| (0, 0), |_k| (u64::MAX, 0), |_k| (1, 0), |_k| (7, 0)];
+    for seed in seeds {
+        let forced = idx.backward_spectrum_with_seed(
+            anchor.sa_start,
+            anchor.occ_count,
+            anchor.match_len,
+            &read,
+            pivot,
+            &bases,
+            enc,
+            seed,
+        );
+        let (p0, _) = seed(0);
+        assert_eq!(
+            forced, truth,
+            "wrong seed pred={} (err=0, sa_num={}) did not recover true interval",
+            p0, sa_num
+        );
     }
 }
 

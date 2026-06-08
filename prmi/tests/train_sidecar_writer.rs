@@ -43,9 +43,6 @@ fn writes_all_sidecar_files_for_synthetic_fasta() {
     assert!(paths.sa.exists(), "sa missing");
     assert!(paths.l1.exists(), "l1 missing");
     assert!(paths.l2.exists(), "l2 missing");
-    // The v2 writer emits `.isa` (inverse SA) as part of the file-backed
-    // contract on the FASTA build path too, not just the `.pac` path.
-    assert!(paths.isa.exists(), "isa missing");
 
     // The .meta should round-trip parse cleanly.
     let meta = prmi::sidecar::meta::Meta::read_file(&paths.meta).unwrap();

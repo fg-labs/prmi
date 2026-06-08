@@ -6,8 +6,9 @@
 use prmi::index::lookup::lookup_with_components;
 use prmi::sidecar::model_file::ModelEntry;
 use prmi::train::prmi::train_prmi;
-use prmi::train::training_set::TrainingSet;
+use prmi::train::training_set::{Keys, SaIndices, TrainingSet};
 use proptest::prelude::*;
+use std::sync::Arc;
 
 proptest! {
     /// For any sorted unique u64 key vec ≥ 16 keys, the trainer either
@@ -23,9 +24,9 @@ proptest! {
 
         let sa_indices: Vec<u64> = (0..raw_keys.len() as u64).collect();
         let mut ts = TrainingSet::default();
-        ts.keys = raw_keys.clone();
+        ts.keys = Keys::Materialized(Arc::new(raw_keys.clone()));
         ts.sa_num = raw_keys.len() as u64;
-        ts.sa_indices = sa_indices;
+        ts.sa_indices = SaIndices::Materialized(Arc::new(sa_indices));
 
         let result = train_prmi(&ts, 16);
         prop_assume!(result.is_ok());

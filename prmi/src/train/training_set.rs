@@ -14,12 +14,196 @@ use crate::encoding::{tokenize_32mer, KMER_LEN};
 use crate::train::keys::sa_to_keys;
 use crate::train::mask::{covered_by_bed, homopolymer_in_window, n_in_window, MaskConfig};
 use crate::train::prior::Prior;
+use std::sync::Arc;
+
+/// SA-index targets for a training set — the `y` value the model learns to
+/// predict from each key.
+///
+/// Materialising one `u64` per training pair costs ~51.5 GB at hg38 scale. On
+/// the byte-identical `.pac` production path the targets are simply the SA ranks
+/// `0..sa_num` minus a tiny set of skipped ranks (the short-window suffixes that
+/// can't form a full 32-mer), so they are represented as a dense range plus a
+/// small sorted skip list instead. Heavier masking / non-uniform priors keep the
+/// explicit `Materialized` form.
+///
+/// `Dense` and `Materialized` yield bit-identical target sequences for the same
+/// input, so the trained model is unchanged by the representation.
+#[derive(Debug, Clone)]
+pub enum SaIndices {
+    /// Targets are `[0, len + skips.len())` with the sorted SA ranks in `skips`
+    /// removed. The `i`-th target is the `i`-th rank not present in `skips`.
+    Dense {
+        /// Number of kept targets (== number of training pairs).
+        len: usize,
+        /// Sorted, ascending SA ranks excluded from the training set.
+        skips: Arc<Vec<u64>>,
+    },
+    /// Explicit per-pair target list.
+    Materialized(Arc<Vec<u64>>),
+}
+
+impl Default for SaIndices {
+    fn default() -> Self {
+        SaIndices::Materialized(Arc::new(Vec::new()))
+    }
+}
+
+impl SaIndices {
+    /// Number of training pairs (targets).
+    pub fn len(&self) -> usize {
+        match self {
+            SaIndices::Dense { len, .. } => *len,
+            SaIndices::Materialized(v) => v.len(),
+        }
+    }
+
+    /// `true` if there are no targets.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The `i`-th SA-index target. For `Dense`, the `i`-th rank in `[0, sa_num)`
+    /// not present in `skips`, found by a fixed-point walk over the (tiny) skip
+    /// list: the answer `r` satisfies `r = i + |{s in skips : s <= r}|`.
+    pub fn get(&self, i: usize) -> u64 {
+        match self {
+            SaIndices::Materialized(v) => v[i],
+            SaIndices::Dense { skips, .. } => {
+                let i = i as u64;
+                let mut d = 0u64;
+                loop {
+                    let nd = skips.partition_point(|&s| s <= i + d) as u64;
+                    if nd == d {
+                        return i + d;
+                    }
+                    d = nd;
+                }
+            }
+        }
+    }
+
+    /// Sequential iterator over the targets in ascending order — identical to
+    /// the `Materialized` vector's order.
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        match self {
+            SaIndices::Materialized(v) => SaIndicesIter::Mat(v.iter()),
+            SaIndices::Dense { len, skips } => SaIndicesIter::Dense {
+                v: 0,
+                sa_num: (*len + skips.len()) as u64,
+                skips,
+                si: 0,
+            },
+        }
+    }
+}
+
+/// Concrete iterator backing [`SaIndices::iter`] (hidden behind `impl
+/// Iterator`). Static dispatch keeps the hot LBC/verify passes
+/// branch-predictable.
+enum SaIndicesIter<'a> {
+    // Walks `0..sa_num`, skipping ranks present in the sorted `skips`.
+    Dense {
+        v: u64,
+        sa_num: u64,
+        skips: &'a [u64],
+        si: usize,
+    },
+    // Wraps the materialized slice iterator.
+    Mat(std::slice::Iter<'a, u64>),
+}
+
+impl Iterator for SaIndicesIter<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        match self {
+            SaIndicesIter::Mat(it) => it.next().copied(),
+            SaIndicesIter::Dense {
+                v,
+                sa_num,
+                skips,
+                si,
+            } => {
+                while *v < *sa_num {
+                    if *si < skips.len() && skips[*si] == *v {
+                        *si += 1;
+                        *v += 1;
+                        continue;
+                    }
+                    let r = *v;
+                    *v += 1;
+                    return Some(r);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// 32-mer training keys — the `x` value fed to the model.
+///
+/// Materialising one `u64` per training pair costs ~51.5 GB at hg38 scale. On
+/// the dense build path the key for pair `i` is fully determined by the suffix
+/// array and the 2× text (`tokenize_32mer` of the base window at
+/// `sa[sa_index(i)]`), so it is recomputed on demand from shared `Arc`s instead
+/// — which also removes the need to materialise the separate `text_bases` array.
+/// Heavier masking / non-uniform priors keep the explicit `Materialized` form.
+///
+/// `Streamed` and `Materialized` yield bit-identical keys for the same input
+/// (the streamed map matches `text_value_to_base`), so the model is unchanged.
+#[derive(Debug, Clone)]
+pub enum Keys {
+    /// Explicit per-pair key list.
+    Materialized(Arc<Vec<u64>>),
+    /// Recomputed on demand: `key(i) = tokenize_32mer(base window at
+    /// sa[rank])`, where `rank` is the pair's SA rank and `text` is the
+    /// `b+1`-alphabet 2× text (mapped to `0..=3` bases inline).
+    Streamed {
+        /// The full 2× suffix array (doubled coordinates).
+        sa: Arc<Vec<u64>>,
+        /// The `b+1`-alphabet 2× text (`1..=4` + sentinel `0`).
+        text: Arc<Vec<u8>>,
+    },
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Keys::Materialized(Arc::new(Vec::new()))
+    }
+}
+
+impl Keys {
+    /// The key for training pair `i`, whose SA rank is `rank`. For `Streamed`,
+    /// tokenises the 32-base window of the 2× text starting at `sa[rank]`
+    /// (every kept pair has a full window). `Materialized` ignores `rank`.
+    #[inline]
+    pub fn at(&self, i: usize, rank: u64) -> u64 {
+        match self {
+            Keys::Materialized(v) => v[i],
+            Keys::Streamed { sa, text } => {
+                let pos = sa[rank as usize] as usize;
+                let mut window = [0u8; KMER_LEN];
+                for (slot, &v) in window.iter_mut().zip(&text[pos..pos + KMER_LEN]) {
+                    *slot = crate::sa::text_value_to_base(v);
+                }
+                tokenize_32mer(&window, KMER_LEN)
+            }
+        }
+    }
+}
 
 /// A sorted set of `(key, sa_index)` training pairs for the P-RMI trainer.
 ///
 /// `keys[i]` and `sa_indices[i]` together form the i-th training pair: the
 /// trainer learns to predict `sa_indices[i]` from `keys[i]`. The two vectors
 /// always have the same length, and `keys` is non-decreasing.
+///
+/// `keys` is wrapped in [`Arc`] so the trainer can share it (zero-copy) with the
+/// lower-bound-correction pass instead of materialising a `Vec<(u64, usize)>`
+/// duplicate of the entire set — a ~100 GB saving at hg38 scale. `sa_indices`
+/// uses [`SaIndices`], which on the `.pac` path avoids materialising a second
+/// ~51.5 GB vector. Both yield the same values per index, so the model is
+/// unchanged by the representation.
 ///
 /// `sa_num` is the total size of the **full** SA (not the number of training
 /// pairs). It may be larger than `keys.len()` when masking is active, and is
@@ -31,28 +215,42 @@ use crate::train::prior::Prior;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct TrainingSet {
-    /// 32-mer keys in non-decreasing order.
-    pub keys: Vec<u64>,
+    /// 32-mer keys in non-decreasing order (materialised or streamed).
+    pub keys: Keys,
     /// SA-index target for each key — what the model learns to predict.
-    pub sa_indices: Vec<u64>,
-    /// Total number of entries in the full SA (may exceed `keys.len()` when
+    pub sa_indices: SaIndices,
+    /// Total number of entries in the full SA (may exceed the pair count when
     /// masking is active). The trainer uses this as the prediction clamp bound.
     pub sa_num: u64,
     /// Optional per-pair training weights. `None` means uniform weight (1.0).
-    /// When `Some`, the length equals `keys.len()`.
+    /// When `Some`, the length equals the number of pairs.
     pub weights: Option<Vec<f64>>,
 }
 
 impl TrainingSet {
-    /// Number of training pairs.
+    /// Number of training pairs. The SA-index targets are authoritative;
+    /// materialised keys must match (checked in debug builds).
     pub fn len(&self) -> usize {
-        assert_eq!(self.keys.len(), self.sa_indices.len());
-        self.keys.len()
+        if let Keys::Materialized(v) = &self.keys {
+            debug_assert_eq!(v.len(), self.sa_indices.len());
+        }
+        self.sa_indices.len()
     }
 
     /// `true` if no training pairs.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.sa_indices.is_empty()
+    }
+
+    /// The 32-mer key of training pair `i`.
+    #[inline]
+    pub fn key(&self, i: usize) -> u64 {
+        self.keys.at(i, self.sa_indices.get(i))
+    }
+
+    /// Sequential iterator over all training keys in pair order.
+    pub fn keys_iter(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.len()).map(move |i| self.key(i))
     }
 }
 
@@ -64,10 +262,13 @@ impl TrainingSet {
 pub fn uniform_training_set(sa: &[u64], bases: &[u8]) -> TrainingSet {
     let keys = sa_to_keys(sa, bases);
     let sa_num = sa.len() as u64;
-    let sa_indices: Vec<u64> = (0..sa_num).collect();
+    // One pair per SA entry: targets are exactly 0..sa_num (no skips).
     TrainingSet {
-        keys,
-        sa_indices,
+        keys: Keys::Materialized(Arc::new(keys)),
+        sa_indices: SaIndices::Dense {
+            len: sa.len(),
+            skips: Arc::new(Vec::new()),
+        },
         sa_num,
         weights: None,
     }
@@ -102,6 +303,42 @@ pub fn masked_training_set(
     prior: &Prior,
 ) -> TrainingSet {
     let n = bases.len();
+    let sa_num = sa.len() as u64;
+
+    // Fast path (the `.pac` production build): a uniform prior with no
+    // homopolymer/BED mask and no effective N-mask means the ONLY excluded
+    // entries are the short-window suffixes (`p + 32 > n`). Their SA ranks are
+    // recorded as a small skip list and `sa_indices` is left virtual — avoiding
+    // a ~51.5 GB target vector. Keys are identical to the materialized path
+    // (every kept entry has `avail == KMER_LEN`, so the same tokenisation).
+    let no_n_effect = !mask.mask_n_runs || n_positions.iter().all(|&b| !b);
+    let virtualize = matches!(prior, Prior::Uniform)
+        && mask.mask_homopolymers.is_none()
+        && mask.mask_bed.is_none()
+        && no_n_effect;
+    if virtualize {
+        let mut keys: Vec<u64> = Vec::with_capacity(sa.len());
+        let mut skips: Vec<u64> = Vec::new();
+        for (sa_idx, &sa_pos) in sa.iter().enumerate() {
+            let p = sa_pos as usize;
+            if p + KMER_LEN > n {
+                skips.push(sa_idx as u64);
+                continue;
+            }
+            keys.push(tokenize_32mer(&bases[p..p + KMER_LEN], KMER_LEN));
+        }
+        let len = keys.len();
+        return TrainingSet {
+            keys: Keys::Materialized(Arc::new(keys)),
+            sa_indices: SaIndices::Dense {
+                len,
+                skips: Arc::new(skips),
+            },
+            sa_num,
+            weights: None,
+        };
+    }
+
     let mut keys: Vec<u64> = Vec::with_capacity(sa.len());
     let mut sa_indices: Vec<u64> = Vec::with_capacity(sa.len());
     let use_weights = !matches!(prior, Prior::Uniform);
@@ -148,9 +385,222 @@ pub fn masked_training_set(
     }
 
     TrainingSet {
-        keys,
-        sa_indices,
-        sa_num: sa.len() as u64,
+        keys: Keys::Materialized(Arc::new(keys)),
+        sa_indices: SaIndices::Materialized(Arc::new(sa_indices)),
+        sa_num,
         weights: if use_weights { Some(weights) } else { None },
+    }
+}
+
+/// Build a training set whose keys are STREAMED from the suffix array and 2×
+/// text rather than materialised, and whose SA-index targets are dense
+/// `0..sa_num` minus the short-window skips. Yields byte-identical
+/// `(key, sa_index)` pairs to [`masked_training_set`] on the uniform /
+/// no-mask / no-N path, at a fraction of the memory: no ~51.5 GB key vector and
+/// no `text_bases` array.
+///
+/// `text` is the `b+1`-alphabet 2× text (length `sa_num`); `sa` is its
+/// generalized suffix array. Only valid for the byte-identical path — the
+/// caller gates on a uniform prior with no homopolymer/BED mask and no N
+/// positions (see `build_sidecar_core`).
+pub fn streamed_training_set(sa: Arc<Vec<u64>>, text: Arc<Vec<u8>>) -> TrainingSet {
+    let n = text.len();
+    let sa_num = sa.len() as u64;
+    let mut skips: Vec<u64> = Vec::new();
+    for (sa_idx, &sa_pos) in sa.iter().enumerate() {
+        if sa_pos as usize + KMER_LEN > n {
+            skips.push(sa_idx as u64);
+        }
+    }
+    let len = sa.len() - skips.len();
+    TrainingSet {
+        keys: Keys::Streamed {
+            sa: Arc::clone(&sa),
+            text,
+        },
+        sa_indices: SaIndices::Dense {
+            len,
+            skips: Arc::new(skips),
+        },
+        sa_num,
+        weights: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::train::mask::MaskConfig;
+    use std::collections::HashSet;
+
+    /// Explicit kept ranks: `[0, sa_num)` with `skips` removed.
+    fn explicit_kept(sa_num: u64, skips: &[u64]) -> Vec<u64> {
+        let sk: HashSet<u64> = skips.iter().copied().collect();
+        (0..sa_num).filter(|v| !sk.contains(v)).collect()
+    }
+
+    #[test]
+    fn sa_indices_dense_get_and_iter_match_explicit() {
+        let cases: &[(u64, &[u64])] = &[
+            (10, &[]),
+            (10, &[0]),
+            (10, &[9]),
+            (10, &[2, 3, 7]),
+            (10, &[0, 1, 2, 3, 4, 5, 6, 7, 8]),
+            (1, &[]),
+        ];
+        for &(sa_num, skips) in cases {
+            let kept = explicit_kept(sa_num, skips);
+            let dense = SaIndices::Dense {
+                len: kept.len(),
+                skips: Arc::new(skips.to_vec()),
+            };
+            assert_eq!(dense.len(), kept.len(), "len skips={skips:?}");
+            assert_eq!(
+                dense.iter().collect::<Vec<_>>(),
+                kept,
+                "iter skips={skips:?}"
+            );
+            for (i, &k) in kept.iter().enumerate() {
+                assert_eq!(dense.get(i), k, "get({i}) skips={skips:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn sa_indices_dense_random_matches_materialized() {
+        let mut state = 0x00C0_FFEEu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for _ in 0..300 {
+            let sa_num = 1 + next() % 500;
+            let mut skips: Vec<u64> = (0..sa_num).filter(|_| next() % 5 == 0).collect();
+            skips.sort_unstable();
+            skips.dedup();
+            let kept = explicit_kept(sa_num, &skips);
+            if kept.is_empty() {
+                continue;
+            }
+            let dense = SaIndices::Dense {
+                len: kept.len(),
+                skips: Arc::new(skips),
+            };
+            assert_eq!(dense.iter().collect::<Vec<_>>(), kept);
+            for (i, &k) in kept.iter().enumerate() {
+                assert_eq!(dense.get(i), k);
+            }
+        }
+    }
+
+    /// The virtualized (Dense) build must yield BYTE-IDENTICAL (key, sa_index)
+    /// pairs to an explicit materialized computation over the same input. This
+    /// is the coverage the chr17 end-to-end gate cannot provide (chr17.fa has N
+    /// runs, so it takes the Materialized path).
+    #[test]
+    fn masked_uniform_virtualizes_byte_identically() {
+        // Synthetic no-N base array (values 0..=3).
+        let bases: Vec<u8> = (0..256u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let sa = crate::sa::build_suffix_array(&bases, 1).unwrap();
+        let n_positions = vec![false; bases.len()];
+
+        // Reference materialized (key, rank) pairs via the same short-window rule.
+        let mut ref_keys: Vec<u64> = Vec::new();
+        let mut ref_idx: Vec<u64> = Vec::new();
+        for (sa_idx, &sa_pos) in sa.iter().enumerate() {
+            let p = sa_pos as usize;
+            if p + KMER_LEN > bases.len() {
+                continue;
+            }
+            ref_keys.push(tokenize_32mer(&bases[p..p + KMER_LEN], KMER_LEN));
+            ref_idx.push(sa_idx as u64);
+        }
+        assert!(
+            !ref_idx.is_empty() && ref_idx.len() < sa.len(),
+            "test needs some skips"
+        );
+
+        // Both mask_n_runs=false and =true (with all-false n_positions) must virtualize.
+        for mask_n_runs in [false, true] {
+            let mask = MaskConfig {
+                mask_n_runs,
+                ..MaskConfig::default()
+            };
+            let ts = masked_training_set(&sa, &bases, &n_positions, &mask, &Prior::Uniform);
+            assert!(
+                matches!(ts.sa_indices, SaIndices::Dense { .. }),
+                "should virtualize (mask_n_runs={mask_n_runs})"
+            );
+            assert_eq!(
+                ts.keys_iter().collect::<Vec<_>>(),
+                ref_keys,
+                "keys must match reference"
+            );
+            assert_eq!(
+                ts.sa_indices.iter().collect::<Vec<_>>(),
+                ref_idx,
+                "sa_indices iter must match reference"
+            );
+            for (i, &r) in ref_idx.iter().enumerate() {
+                assert_eq!(ts.sa_indices.get(i), r, "get({i})");
+            }
+            assert!(ts.weights.is_none());
+        }
+    }
+
+    /// A homopolymer mask must NOT virtualize (it falls back to Materialized),
+    /// preserving the existing masked behaviour.
+    #[test]
+    fn masked_with_homopolymer_stays_materialized() {
+        let bases: Vec<u8> = (0..256u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let sa = crate::sa::build_suffix_array(&bases, 1).unwrap();
+        let n_positions = vec![false; bases.len()];
+        let mask = MaskConfig {
+            mask_n_runs: true,
+            mask_homopolymers: Some(5),
+            ..MaskConfig::default()
+        };
+        let ts = masked_training_set(&sa, &bases, &n_positions, &mask, &Prior::Uniform);
+        assert!(matches!(ts.sa_indices, SaIndices::Materialized(_)));
+        assert!(matches!(ts.keys, Keys::Materialized(_)));
+        assert_eq!(ts.len(), ts.sa_indices.len());
+    }
+
+    /// Streamed keys (recomputed from the 2× SA + text) must equal the keys a
+    /// materialized build would produce from `text_bases`.
+    #[test]
+    fn streamed_keys_match_materialized() {
+        let bases: Vec<u8> = (0..300u32).map(|i| ((i * 5 + 2) % 4) as u8).collect();
+        let text = crate::sa::build_doubled_2x_text(&bases);
+        let sa = crate::sa::build_gsa(&text, 1).unwrap();
+        let n = text.len();
+
+        // Reference keys via the materialized text_bases tokenisation.
+        let text_bases: Vec<u8> = text
+            .iter()
+            .map(|&v| crate::sa::text_value_to_base(v))
+            .collect();
+        let mut ref_keys: Vec<u64> = Vec::new();
+        let mut ref_idx: Vec<u64> = Vec::new();
+        for (sa_idx, &sa_pos) in sa.iter().enumerate() {
+            let p = sa_pos as usize;
+            if p + KMER_LEN > n {
+                continue;
+            }
+            ref_keys.push(tokenize_32mer(&text_bases[p..p + KMER_LEN], KMER_LEN));
+            ref_idx.push(sa_idx as u64);
+        }
+
+        let ts = streamed_training_set(Arc::new(sa), Arc::new(text));
+        assert!(matches!(ts.keys, Keys::Streamed { .. }));
+        assert_eq!(
+            ts.keys_iter().collect::<Vec<_>>(),
+            ref_keys,
+            "streamed keys must match materialized"
+        );
+        assert_eq!(ts.sa_indices.iter().collect::<Vec<_>>(), ref_idx);
     }
 }

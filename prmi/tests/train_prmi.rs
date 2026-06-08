@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 use prmi::train::prmi::train_prmi;
-use prmi::train::training_set::TrainingSet;
+use prmi::train::training_set::{Keys, SaIndices, TrainingSet};
+use std::sync::Arc;
 
 fn make_uniform_training_set(num_keys: usize) -> TrainingSet {
     // Start from 1 << 50 (not 0) so that minus_epsilon on the first key
@@ -10,9 +11,9 @@ fn make_uniform_training_set(num_keys: usize) -> TrainingSet {
     let keys: Vec<u64> = (1..=num_keys as u64).map(|i| i * (1u64 << 50)).collect();
     let sa_indices: Vec<u64> = (0..num_keys as u64).collect();
     let mut ts = TrainingSet::default();
-    ts.keys = keys;
+    ts.keys = Keys::Materialized(Arc::new(keys));
     ts.sa_num = num_keys as u64;
-    ts.sa_indices = sa_indices;
+    ts.sa_indices = SaIndices::Materialized(Arc::new(sa_indices));
     ts
 }
 
@@ -26,7 +27,7 @@ fn train_prmi_produces_expected_shape() {
     assert_eq!(model.bit_shift, 60); // 64 - log2(16) = 60
                                      // L1 length is implementation-defined; either 0 (no fallback) or some non-zero
                                      // count. Just assert it doesn't crash the shape invariants.
-    assert!(model.l1.len() <= ts.keys.len());
+    assert!(model.l1.len() <= ts.len());
 
     eprintln!(
         "train_prmi_produces_expected_shape: l1.len()={}, l2.len()={}",

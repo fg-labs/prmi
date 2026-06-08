@@ -13,8 +13,8 @@ pub mod spectrum;
 
 use crate::error::{Error, Result};
 use crate::index::lookup::lookup_core;
-use crate::index::shm::{read_shm_blob, write_shm_blob};
-use crate::sidecar::isa_file::IsaFileReader;
+use crate::index::shm::{read_shm_blob, write_shm_blob, ShmBlob};
+use crate::sidecar::kmt_file::KmtFileReader;
 use crate::sidecar::meta::Meta;
 use crate::sidecar::model_file::{ModelFileReader, ModelLayer};
 use crate::sidecar::sa_file::SaFileReader;
@@ -29,8 +29,11 @@ pub struct LearnedIndex {
     sa: SaFileReader,
     l1: ModelFileReader,
     l2: ModelFileReader,
-    /// Optional inverse SA (ref2sa), present when a `.isa` file exists beside the sidecar.
-    isa: Option<IsaFileReader>,
+    /// Optional forward k-mer table (shallow-band accelerator). `None` when the
+    /// sidecar was built without `--kmer-table-k`, or when best-effort loading
+    /// rejects an absent, corrupt, or reference-mismatched `.kmt` (both the
+    /// file-backed `open` and the shm `open_shm` paths can populate it).
+    kmt: Option<KmtFileReader>,
 }
 
 const _ASSERT_SEND_SYNC: fn() = || {
@@ -48,34 +51,18 @@ impl LearnedIndex {
         let l1 = ModelFileReader::open(&paths.l1, ModelLayer::L1)?;
         let l2 = ModelFileReader::open(&paths.l2, ModelLayer::L2)?;
         cross_validate(&paths, &meta, &sa, &l1, &l2)?;
-        // An `.isa` is optional, but if one is present beside the sidecar it must
-        // describe the SAME suffix array — a stale/mismatched `.isa` would make
-        // `isa_for_refpos()` return garbage (or panic) during backward extension.
-        // Validate the entry count against the `.sa` here, and only treat a true
-        // `NotFound` as "no `.isa`" rather than swallowing every open failure.
-        let isa = match IsaFileReader::open(&paths.isa) {
-            Ok(reader) => {
-                if reader.num_entries() != sa.num_entries() {
-                    return Err(Error::SidecarMismatch {
-                        file: paths.isa.clone(),
-                        detail: format!(
-                            ".isa num_entries={} but .sa has {}",
-                            reader.num_entries(),
-                            sa.num_entries()
-                        ),
-                    });
-                }
-                Some(reader)
-            }
-            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
+        // Optional `.kmt` k-mer table. It is a pure forward-search accelerator,
+        // so loading is best-effort: a corrupt table, or one bound to a
+        // different `.sa`/reference (checked via `sa_num` AND the reference
+        // digest, since equal-length references share `sa_num`), is ignored
+        // with a warning and the always-correct full search is used instead.
+        let kmt = load_kmt_best_effort(&paths.kmt, &meta, &sa);
         Ok(Self {
             meta,
             sa,
             l1,
             l2,
-            isa,
+            kmt,
         })
     }
 
@@ -107,9 +94,6 @@ impl LearnedIndex {
     /// - Crash safety is not provided: a partially written blob produces an
     ///   error rather than silently corrupt data (the component headers are
     ///   validated before any lookup).
-    /// - Backward extension ([`isa_for_refpos`](Self::isa_for_refpos)) requires
-    ///   a file-backed [`open`](Self::open); the shm blob does not yet carry the
-    ///   `.isa` (added in a later milestone).
     pub fn open_shm(shm_path: impl AsRef<Path>) -> Result<Self> {
         let shm_path = shm_path.as_ref();
         let blob = read_shm_blob(shm_path)?;
@@ -149,15 +133,18 @@ impl LearnedIndex {
         // Re-use cross_validate with a synthetic path for error messages.
         let fake_paths = SidecarPaths::from_prefix(shm_path);
         cross_validate(&fake_paths, &meta, &sa, &l1, &l2)?;
-        // The .isa is not packed into the shm blob yet; backward extension
-        // requires a file-backed open.
-        let isa = None;
+        // Optional `.kmt` carried as a 5th blob component (`kmt_len == 0` for
+        // blobs written before the table existed, or from sidecars built
+        // without `--kmer-table-k`). Loading is best-effort, exactly as in
+        // `open`: any problem (corrupt slice or a `sa_num`/reference mismatch)
+        // is ignored with a warning and the full forward search is used.
+        let kmt = load_kmt_from_shm_best_effort(&blob, &meta, &sa);
         Ok(Self {
             meta,
             sa,
             l1,
             l2,
-            isa,
+            kmt,
         })
     }
 
@@ -172,6 +159,12 @@ impl LearnedIndex {
     /// Number of entries in the suffix array.
     pub fn sa_num(&self) -> u64 {
         self.sa.num_entries()
+    }
+
+    /// `true` if a valid `.kmt` forward k-mer table is loaded (so
+    /// `forward_spectrum_auto` resolves shallow bands without SA probes).
+    pub fn has_kmt(&self) -> bool {
+        self.kmt.is_some()
     }
 
     /// Number of forward reference bases (`l_pac`). The 2× SA has `2*l_pac + 1`
@@ -321,26 +314,79 @@ impl LearnedIndex {
     pub fn key_at(&self, i: u64) -> Option<u64> {
         self.sa.key_at(i)
     }
+}
 
-    /// Return the stored ISA value at SA index `i`, if available.
-    ///
-    /// Always `None` for the current memory modes (1 and 2), which do not
-    /// store an inline ISA column in the `.sa` file.
-    #[inline]
-    pub fn isa_at(&self, i: u64) -> Option<u64> {
-        self.sa.isa_at(i)
+/// Load the optional `.kmt` k-mer table, returning `None` (with a warning) if
+/// it is absent, corrupt, or bound to a different reference (`sa_num` or the
+/// reference digest mismatched). The table only accelerates the forward search,
+/// so an invalid one is always safe to ignore.
+fn load_kmt_best_effort(kmt_path: &Path, meta: &Meta, sa: &SaFileReader) -> Option<KmtFileReader> {
+    let r = match KmtFileReader::open(kmt_path) {
+        Ok(r) => r,
+        // A genuinely absent `.kmt` is the common case (no accelerator) — silent.
+        // Any other error (corrupt, unreadable, permission/IO) is surfaced and
+        // we fall back to the always-correct full forward search; do NOT use
+        // `Path::exists()`, which also reports `false` when metadata is
+        // inaccessible and would silently skip a real failure.
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return None;
+        }
+        Err(e) => {
+            log::warn!("prmi: ignoring .kmt ({e}); using the full forward search");
+            return None;
+        }
+    };
+    if kmt_matches(&r, meta, sa) {
+        Some(r)
+    } else {
+        log::warn!(
+            "prmi: .kmt does not match this sidecar (sa_num/reference); using the full forward search"
+        );
+        None
     }
+}
 
-    /// SA index whose suffix starts at reference (doubled-coordinate) position
-    /// `p`. `None` if this sidecar has no `.isa` (e.g. shm-opened). Used by
-    /// backward extension (Plan 3).
-    pub fn isa_for_refpos(&self, p: u64) -> Option<u64> {
-        self.isa.as_ref().and_then(|r| {
-            // `sa_index_for_refpos` asserts on `p >= num_entries`; bound-check
-            // here so a stray caller input yields `None` instead of panicking.
-            (p < r.num_entries()).then(|| r.sa_index_for_refpos(p))
-        })
+/// Load the optional `.kmt` carried inside an shm blob, returning `None` (with a
+/// warning on any problem) when it is absent, corrupt, or bound to a different
+/// reference. Mirrors [`load_kmt_best_effort`] for the file-backed open path.
+fn load_kmt_from_shm_best_effort(
+    blob: &ShmBlob,
+    meta: &Meta,
+    sa: &SaFileReader,
+) -> Option<KmtFileReader> {
+    if blob.kmt_len == 0 {
+        return None;
     }
+    let r = match KmtFileReader::from_shm_slice(blob.mmap.clone(), blob.kmt_offset, blob.kmt_len) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("prmi: ignoring shm .kmt ({e}); using the full forward search");
+            return None;
+        }
+    };
+    if kmt_matches(&r, meta, sa) {
+        Some(r)
+    } else {
+        log::warn!(
+            "prmi: shm .kmt does not match this sidecar (sa_num/reference); using the full forward search"
+        );
+        None
+    }
+}
+
+/// `true` if the k-mer table `r` is bound to this sidecar: its `sa_num` matches
+/// the `.sa` and its reference digest matches the `.meta` (preferring the packed
+/// reference SHA `sa.pac_sha256`, falling back to the reference SHA `ref.sha256`).
+/// Both checks are required — equal-length references share `sa_num`, so the
+/// digest is what actually distinguishes them.
+fn kmt_matches(r: &KmtFileReader, meta: &Meta, sa: &SaFileReader) -> bool {
+    let meta_hex = meta
+        .sa
+        .pac_sha256
+        .as_deref()
+        .unwrap_or(meta.ref_.sha256.as_str());
+    let meta_digest = crate::sidecar::kmt_file::hex32(meta_hex);
+    r.sa_num() == sa.num_entries() && meta_digest.as_ref() == Some(r.ref_digest())
 }
 
 fn cross_validate(
