@@ -403,7 +403,7 @@ fn fit_direct_leaf(
     // route to this leaf (k >> bit_shift == leaf_idx). For masked references the
     // SA is complete but the training set is sparse, so that key gap can contain
     // 32-mers whose underlying genome positions were excluded from training. Those
-    // positions still exist in the SA and must be found by `smem_range`.
+    // positions still exist in the SA and must be findable by the query path.
     //
     // The correct upper bound for the correction is the SA index just BELOW the
     // next leaf's first training pair: `next_sa_idx - 1`. Using the current
@@ -430,9 +430,9 @@ fn fit_direct_leaf(
             // is `next_sa_idx - 1` (the position just below). Use that as the
             // reference point for the distance calculation.
             //
-            // See the `smem_range_resolves_masked_region_query` regression test
-            // (opus-pass2 finding #1) for the end-to-end proof that this bound
-            // is necessary.
+            // This masked-region correction (opus-pass2 finding #1) ensures the
+            // per-leaf `err` bound covers masked SA positions in the inter-leaf
+            // key gap, so the query path can still resolve them.
             let last_routable_sa_idx = next_sa_idx.saturating_sub(1) as i64;
             let pred_next = predict_clamped(alpha, beta, next_key, sa_num);
             let d = (pred_next - last_routable_sa_idx).unsigned_abs();

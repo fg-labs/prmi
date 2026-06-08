@@ -1,11 +1,8 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 //
-// C++ driver that exercises the prmi C ABI surface — open, lookup, smem_range
-// (packed/unpacked), sa_positions, batch, long-read, and minimizer.  Its only
-// job is to catch FFI shape regressions — it is NOT a usage example for real
-// workloads, and it does not call every helper (e.g. tokenize / reverse-
-// complement are covered by the Rust-side FFI tests).
+// C++ driver that exercises the full prmi C ABI.  Its only job is to catch FFI
+// shape regressions — it is NOT a usage example for real workloads.
 //
 // Usage:
 //   cpp_caller <sidecar_prefix> <32mer_hex_key> <query_2bit_file> \
@@ -19,6 +16,7 @@
 
 #include <prmi.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -82,227 +80,232 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(pos),
         static_cast<unsigned long long>(err));
 
-    // --- prmi_smem_range (unpacked) ------------------------------------------
-    std::vector<uint8_t> query       = read_binary_file(query_file);
+    // Read the query and pac inputs. `query` and the unpacked pac are consumed
+    // by callers wiring up their own pipelines; the spectrum smoke below uses
+    // the packed pac.
+    std::vector<uint8_t> query        = read_binary_file(query_file);
     std::vector<uint8_t> pac_unpacked = read_binary_file(pac_unpacked_f);
+    std::vector<uint8_t> pac_packed   = read_binary_file(pac_packed_f);
+    (void)query;
+    (void)pac_unpacked;
 
-    // The C API requires exactly 32 bases per query (see prmi.h / README).
-    // Validate once here: the query buffer is reused below for the batch and
-    // long-read calls, where a short read would become an out-of-bounds
-    // std::copy in this example rather than a clean FFI error.
-    if (query.size() != 32) {
-        std::fprintf(stderr, "query must contain exactly 32 bases, got %zu\n",
-                     query.size());
-        prmi_close(idx);
-        return 1;
-    }
-
-    uint64_t k = 0, l = 0, s = 0;
-    int rc = prmi_smem_range(idx,
-                             query.data(),
-                             static_cast<int>(query.size()),
-                             pac_unpacked.data(),
-                             pac_unpacked.size(),
-                             &k, &l, &s);
-    std::printf("smem_range(unpacked): rc=%d k=%llu l=%llu s=%llu\n",
-        rc,
-        static_cast<unsigned long long>(k),
-        static_cast<unsigned long long>(l),
-        static_cast<unsigned long long>(s));
-    if (rc < 0) {
-        std::fprintf(stderr, "prmi_smem_range failed: %s\n",
-                     prmi_last_error_message());
-        prmi_close(idx);
-        return 1;
-    }
-
-    // --- prmi_smem_range_packed ----------------------------------------------
-    std::vector<uint8_t> pac_packed = read_binary_file(pac_packed_f);
-
-    uint64_t kp = 0, lp = 0, sp = 0;
-    int rcp = prmi_smem_range_packed(idx,
-                                     query.data(),
-                                     static_cast<int>(query.size()),
-                                     pac_packed.data(),
-                                     pac_num_bases,
-                                     &kp, &lp, &sp);
-    std::printf("smem_range(packed):   rc=%d k=%llu l=%llu s=%llu\n",
-        rcp,
-        static_cast<unsigned long long>(kp),
-        static_cast<unsigned long long>(lp),
-        static_cast<unsigned long long>(sp));
-    if (rcp < 0) {
-        std::fprintf(stderr, "prmi_smem_range_packed failed: %s\n",
-                     prmi_last_error_message());
-        prmi_close(idx);
-        return 1;
-    }
-
-    // --- Verify packed == unpacked -------------------------------------------
-    if (k != kp || l != lp || s != sp) {
-        std::fprintf(stderr,
-            "MISMATCH: unpacked=(%llu,%llu,%llu) packed=(%llu,%llu,%llu)\n",
-            static_cast<unsigned long long>(k),
-            static_cast<unsigned long long>(l),
-            static_cast<unsigned long long>(s),
-            static_cast<unsigned long long>(kp),
-            static_cast<unsigned long long>(lp),
-            static_cast<unsigned long long>(sp));
-        prmi_close(idx);
-        return 1;
-    }
-    std::printf("smem_range: packed matches unpacked — OK\n");
-
-    // --- prmi_sa_positions ---------------------------------------------------
-    // Resolve the SA interval (kp, lp) from smem_range_packed to genome
-    // positions. Print up to 8 positions.
-    if (lp > 0) {
-        uint64_t n_print = lp < 8 ? lp : 8;
-        std::vector<uint64_t> positions(lp);
-        int rcs = prmi_sa_positions(idx, kp, lp, positions.data());
-        if (rcs != 0) {
-            std::fprintf(stderr, "prmi_sa_positions failed: %s\n",
-                         prmi_last_error_message());
-            prmi_close(idx);
-            return 1;
-        }
-        std::printf("prmi_sa_positions: rc=0 count=%llu first_%llu_positions=",
-            static_cast<unsigned long long>(lp),
-            static_cast<unsigned long long>(n_print));
-        for (uint64_t i = 0; i < n_print; ++i) {
-            std::printf("%s%llu", (i > 0 ? "," : ""),
-                        static_cast<unsigned long long>(positions[i]));
-        }
-        std::printf("\n");
-    } else {
-        // No match: call with count=0 to verify it returns 0 with a NULL buffer.
-        int rcs = prmi_sa_positions(idx, 0, 0, nullptr);
-        if (rcs != 0) {
-            std::fprintf(stderr,
-                "prmi_sa_positions(count=0) failed with rc=%d: %s\n",
-                rcs, prmi_last_error_message());
-            prmi_close(idx);
-            return 1;
-        }
-        std::printf("prmi_sa_positions: rc=0 count=0 (no match)\n");
-    }
-
-    // --- prmi_smem_range_batch_packed ----------------------------------------
-    // Build a batch of 4 queries: the same 32-base packed query repeated 4x.
-    // Expected: all 4 slots produce the same (k, l, s) as the single-key call.
+    // --- spectrum smoke -------------------------------------------------------
+    // Build a 45-base read from packed reference positions 0..45.  The forward
+    // spectrum query = read[5..45] (40 bases, starting at pivot=5), so there
+    // are 5 bases of left context available for backward extension.
+    // smoke.fa is ACGT×1024, so every base is guaranteed to match.
     {
-        const int BATCH = 4;
-        std::vector<uint8_t> batch_queries(BATCH * 32);
-        for (int i = 0; i < BATCH; ++i) {
-            std::copy(query.begin(), query.begin() + 32,
-                      batch_queries.begin() + i * 32);
-        }
-        std::vector<uint64_t> bk(BATCH, 0), bl(BATCH, 0), bs(BATCH, 0);
-        int rcb = prmi_smem_range_batch_packed(idx,
-                                              batch_queries.data(),
-                                              static_cast<uint64_t>(BATCH),
-                                              pac_packed.data(),
-                                              pac_num_bases,
-                                              bk.data(), bl.data(), bs.data());
-        std::printf("prmi_smem_range_batch_packed: rc=%d", rcb);
-        for (int i = 0; i < BATCH; ++i) {
-            std::printf(" [%d]k=%llu,l=%llu,s=%llu", i,
-                static_cast<unsigned long long>(bk[i]),
-                static_cast<unsigned long long>(bl[i]),
-                static_cast<unsigned long long>(bs[i]));
-        }
-        std::printf("\n");
-        if (rcb < 0) {
-            std::fprintf(stderr, "prmi_smem_range_batch_packed failed: %s\n",
-                         prmi_last_error_message());
+        const int READ_LEN = 45;
+        const int PIVOT    = 5;
+        const int QLEN     = READ_LEN - PIVOT;  // 40
+
+        // Reject a packed buffer too small for the declared base count before
+        // indexing pac_packed[i / 4]: a mismatched <pac_num_bases> argument
+        // would otherwise read out of bounds.
+        const uint64_t packed_capacity_bases =
+            static_cast<uint64_t>(pac_packed.size()) * 4ULL;
+        if (pac_num_bases > packed_capacity_bases) {
+            std::fprintf(stderr,
+                "invalid input: pac_num_bases=%llu exceeds packed capacity=%llu bases\n",
+                static_cast<unsigned long long>(pac_num_bases),
+                static_cast<unsigned long long>(packed_capacity_bases));
             prmi_close(idx);
             return 1;
         }
-        // All 4 slots must be identical and match the single-key packed result.
-        for (int i = 0; i < BATCH; ++i) {
-            if (bk[i] != kp || bl[i] != lp || bs[i] != sp) {
-                std::fprintf(stderr,
-                    "MISMATCH batch[%d]: batch=(%llu,%llu,%llu) "
-                    "single=(%llu,%llu,%llu)\n",
-                    i,
-                    static_cast<unsigned long long>(bk[i]),
-                    static_cast<unsigned long long>(bl[i]),
-                    static_cast<unsigned long long>(bs[i]),
-                    static_cast<unsigned long long>(kp),
-                    static_cast<unsigned long long>(lp),
-                    static_cast<unsigned long long>(sp));
+
+        std::vector<uint8_t> read45(READ_LEN);
+        for (int i = 0; i < READ_LEN && static_cast<uint64_t>(i) < pac_num_bases; ++i) {
+            uint8_t byte  = pac_packed[i / 4];
+            int     shift = 6 - 2 * (i % 4);
+            read45[i] = (byte >> shift) & 0x3;
+        }
+        // query = read45[PIVOT..] = read45[5..45]
+        const uint8_t* q_ptr = read45.data() + PIVOT;
+
+        // ---- prmi_forward_spectrum -------------------------------------------
+        uint64_t fwd_nsteps = 0;
+        std::vector<prmi_smem_step_t> fwd_steps(static_cast<std::size_t>(QLEN));
+        int rc_fwd = prmi_forward_spectrum(idx,
+                                           q_ptr,
+                                           QLEN,
+                                           pac_packed.data(),
+                                           pac_num_bases,
+                                           fwd_steps.data(),
+                                           static_cast<uint64_t>(QLEN),
+                                           &fwd_nsteps);
+        std::printf("forward_spectrum nsteps=%llu rc=%d",
+            static_cast<unsigned long long>(fwd_nsteps), rc_fwd);
+        if (fwd_nsteps > 0) {
+            const prmi_smem_step_t& deep = fwd_steps[fwd_nsteps - 1];
+            std::printf(" deepest_match_len=%llu deepest_occ=%llu",
+                static_cast<unsigned long long>(deep.match_len),
+                static_cast<unsigned long long>(deep.occ_count));
+        }
+        std::printf("\n");
+        if (rc_fwd != 0) {
+            std::fprintf(stderr, "prmi_forward_spectrum failed rc=%d: %s\n",
+                         rc_fwd, prmi_last_error_message());
+            prmi_close(idx);
+            return 1;
+        }
+        if (fwd_nsteps < 1) {
+            std::fprintf(stderr,
+                "prmi_forward_spectrum: expected >=1 steps for reference query\n");
+            prmi_close(idx);
+            return 1;
+        }
+
+        // ---- prmi_backward_spectrum -----------------------------------------
+        // Anchor = deepest forward step (max match_len).  read=read45, pivot=5;
+        // backward extension can walk up to 5 bases left from the anchor.
+        {
+            const prmi_smem_step_t& deep = fwd_steps[fwd_nsteps - 1];
+            uint64_t bwd_nsteps = 0;
+            std::vector<prmi_smem_step_t> bwd_steps(static_cast<std::size_t>(PIVOT + 1));
+            int rc_bwd = prmi_backward_spectrum(idx,
+                                                deep.sa_start,
+                                                deep.occ_count,
+                                                deep.match_len,
+                                                read45.data(),
+                                                READ_LEN,
+                                                PIVOT,
+                                                pac_packed.data(),
+                                                pac_num_bases,
+                                                bwd_steps.data(),
+                                                static_cast<uint64_t>(PIVOT + 1),
+                                                &bwd_nsteps);
+            std::printf("backward_spectrum nsteps=%llu rc=%d\n",
+                static_cast<unsigned long long>(bwd_nsteps), rc_bwd);
+            if (rc_bwd != 0) {
+                std::fprintf(stderr, "prmi_backward_spectrum failed rc=%d: %s\n",
+                             rc_bwd, prmi_last_error_message());
                 prmi_close(idx);
                 return 1;
             }
         }
-        std::printf("prmi_smem_range_batch_packed: all %d slots match single-key — OK\n",
-                    BATCH);
+
+        // ---- prmi_sa_positions ----------------------------------------------
+        // Resolve the deepest forward step's SA interval to genome positions.
+        // Print up to 8 positions.
+        {
+            const prmi_smem_step_t& deep = fwd_steps[fwd_nsteps - 1];
+            if (deep.occ_count > 0) {
+                uint64_t n_print = deep.occ_count < 8 ? deep.occ_count : 8;
+                std::vector<uint64_t> positions(deep.occ_count);
+                int rcs = prmi_sa_positions(idx, deep.sa_start, deep.occ_count,
+                                            positions.data());
+                if (rcs != 0) {
+                    std::fprintf(stderr, "prmi_sa_positions failed: %s\n",
+                                 prmi_last_error_message());
+                    prmi_close(idx);
+                    return 1;
+                }
+                std::printf("prmi_sa_positions: rc=0 count=%llu first_%llu_positions=",
+                    static_cast<unsigned long long>(deep.occ_count),
+                    static_cast<unsigned long long>(n_print));
+                for (uint64_t i = 0; i < n_print; ++i) {
+                    std::printf("%s%llu", (i > 0 ? "," : ""),
+                                static_cast<unsigned long long>(positions[i]));
+                }
+                std::printf("\n");
+            } else {
+                // No match: call with count=0 to verify it returns 0 with NULL.
+                int rcs = prmi_sa_positions(idx, 0, 0, nullptr);
+                if (rcs != 0) {
+                    std::fprintf(stderr,
+                        "prmi_sa_positions(count=0) failed with rc=%d: %s\n",
+                        rcs, prmi_last_error_message());
+                    prmi_close(idx);
+                    return 1;
+                }
+                std::printf("prmi_sa_positions: rc=0 count=0 (no match)\n");
+            }
+        }
+
+        // ---- prmi_sa_positions_strided --------------------------------------
+        // Fetch up to 4 positions from the deepest forward step, stride=1.
+        {
+            const prmi_smem_step_t& deep = fwd_steps[fwd_nsteps - 1];
+            uint64_t n_fetch = deep.occ_count < 4 ? deep.occ_count : 4;
+            std::vector<uint64_t> strided_pos(static_cast<std::size_t>(n_fetch));
+            int rc_str = prmi_sa_positions_strided(idx,
+                                                   deep.sa_start,
+                                                   1,
+                                                   n_fetch,
+                                                   strided_pos.data());
+            std::printf("sa_positions_strided rc=%d n_out=%llu",
+                rc_str, static_cast<unsigned long long>(n_fetch));
+            for (uint64_t i = 0; i < n_fetch; ++i) {
+                std::printf(" pos[%llu]=%llu",
+                    static_cast<unsigned long long>(i),
+                    static_cast<unsigned long long>(strided_pos[i]));
+            }
+            std::printf("\n");
+            if (rc_str != 0) {
+                std::fprintf(stderr,
+                    "prmi_sa_positions_strided failed rc=%d: %s\n",
+                    rc_str, prmi_last_error_message());
+                prmi_close(idx);
+                return 1;
+            }
+        }
+
+        // ---- prmi_forward_spectrum_batch ------------------------------------
+        // 2-task batch over an arena: two copies of the same QLEN-base query.
+        {
+            const int NTASKS = 2;
+            std::vector<uint8_t> q_arena(NTASKS * QLEN);
+            for (int t = 0; t < NTASKS; ++t) {
+                std::copy(q_ptr, q_ptr + QLEN, q_arena.begin() + t * QLEN);
+            }
+            prmi_fwd_task_t tasks[NTASKS];
+            for (int t = 0; t < NTASKS; ++t) {
+                tasks[t].query_off  = static_cast<uint64_t>(t * QLEN);
+                tasks[t].query_len  = static_cast<uint32_t>(QLEN);
+                tasks[t].steps_off  = static_cast<uint32_t>(t * QLEN);
+                tasks[t].max_steps  = static_cast<uint32_t>(QLEN);
+            }
+            std::vector<prmi_smem_step_t> batch_steps(NTASKS * QLEN);
+            std::vector<uint64_t>         batch_nsteps(NTASKS, 0);
+            int rc_batch = prmi_forward_spectrum_batch(idx,
+                                                       q_arena.data(),
+                                                       static_cast<uint64_t>(q_arena.size()),
+                                                       tasks,
+                                                       static_cast<uint64_t>(NTASKS),
+                                                       pac_packed.data(),
+                                                       pac_num_bases,
+                                                       batch_steps.data(),
+                                                       static_cast<uint64_t>(batch_steps.size()),
+                                                       batch_nsteps.data());
+            std::printf("forward_spectrum_batch rc=%d", rc_batch);
+            for (int t = 0; t < NTASKS; ++t) {
+                std::printf(" [%d]nsteps=%llu", t,
+                    static_cast<unsigned long long>(batch_nsteps[t]));
+            }
+            std::printf("\n");
+            if (rc_batch != 0) {
+                std::fprintf(stderr,
+                    "prmi_forward_spectrum_batch failed rc=%d: %s\n",
+                    rc_batch, prmi_last_error_message());
+                prmi_close(idx);
+                return 1;
+            }
+            // Both tasks must produce the same nsteps as the single call.
+            for (int t = 0; t < NTASKS; ++t) {
+                if (batch_nsteps[t] != fwd_nsteps) {
+                    std::fprintf(stderr,
+                        "forward_spectrum_batch task[%d] nsteps=%llu vs single=%llu\n",
+                        t,
+                        static_cast<unsigned long long>(batch_nsteps[t]),
+                        static_cast<unsigned long long>(fwd_nsteps));
+                    prmi_close(idx);
+                    return 1;
+                }
+            }
+            std::printf("forward_spectrum_batch: both tasks match single — OK\n");
+        }
     }
-
-    // --- prmi_smem_range_long_read_packed ------------------------------------
-    // Demonstrate long-read seeding on a synthetic 200-base read built from the
-    // first 200 bases of the packed reference. Seed at 5 pivot offsets.
-    {
-        const uint64_t READ_LEN   = 200;
-        const int      NPIVOTS    = 5;
-
-        // Unpack READ_LEN bases from pac_packed into a 1-base-per-byte buffer.
-        std::vector<uint8_t> lr_read(READ_LEN);
-        for (uint64_t i = 0; i < READ_LEN && i < pac_num_bases; ++i) {
-            uint8_t byte  = pac_packed[i / 4];
-            int     shift = 6 - 2 * static_cast<int>(i % 4);
-            lr_read[i] = (byte >> shift) & 0x3;
-        }
-
-        // Five pivot offsets spread evenly: 0, 40, 80, 120, 160.
-        uint64_t pivots[NPIVOTS] = {0, 40, 80, 120, 160};
-        uint64_t lr_k[NPIVOTS] = {}, lr_l[NPIVOTS] = {}, lr_s[NPIVOTS] = {};
-
-        int rc_lr = prmi_smem_range_long_read_packed(
-            idx,
-            lr_read.data(),
-            READ_LEN,
-            pivots,
-            static_cast<uint64_t>(NPIVOTS),
-            pac_packed.data(),
-            pac_num_bases,
-            lr_k, lr_l, lr_s);
-
-        std::printf("prmi_smem_range_long_read_packed: rc=%d", rc_lr);
-        for (int i = 0; i < NPIVOTS; ++i) {
-            std::printf(" [%d]pivot=%llu,k=%llu,l=%llu,s=%llu",
-                i,
-                static_cast<unsigned long long>(pivots[i]),
-                static_cast<unsigned long long>(lr_k[i]),
-                static_cast<unsigned long long>(lr_l[i]),
-                static_cast<unsigned long long>(lr_s[i]));
-        }
-        std::printf("\n");
-        if (rc_lr < 0) {
-            std::fprintf(stderr, "prmi_smem_range_long_read_packed failed: %s\n",
-                         prmi_last_error_message());
-            prmi_close(idx);
-            return 1;
-        }
-    }
-
-    // --- prmi_minimizer_32mer ------------------------------------------------
-    // Extract the lex-min 32-mer from the first 100 bases of the packed reference.
-    {
-        const uint64_t WIN = 100;
-        std::vector<uint8_t> win_bases(WIN);
-        for (uint64_t i = 0; i < WIN && i < pac_num_bases; ++i) {
-            uint8_t byte  = pac_packed[i / 4];
-            int     shift = 6 - 2 * static_cast<int>(i % 4);
-            win_bases[i] = (byte >> shift) & 0x3;
-        }
-        uint64_t min_key = 0, min_off = 0;
-        int rc_min = prmi_minimizer_32mer(win_bases.data(), WIN, &min_key, &min_off);
-        std::printf("prmi_minimizer_32mer: rc=%d key=0x%016llx offset=%llu\n",
-            rc_min,
-            static_cast<unsigned long long>(min_key),
-            static_cast<unsigned long long>(min_off));
-    }
+    // --- end spectrum smoke ---------------------------------------------------
 
     // --- prmi_close ----------------------------------------------------------
     prmi_close(idx);

@@ -29,7 +29,7 @@ fn introspection_returns_sane_values() {
     let ver_ptr = unsafe { prmi_format_version(handle) };
     assert!(!ver_ptr.is_null());
     let ver = unsafe { CStr::from_ptr(ver_ptr) }.to_str().unwrap();
-    assert_eq!(ver, "PRMIv1");
+    assert_eq!(ver, "PRMIv2");
 
     unsafe {
         prmi_close(handle);

@@ -9,14 +9,12 @@
 pub mod lookup;
 pub mod shm;
 pub mod smem;
-pub mod smem_simd;
 pub mod spectrum;
 
 use crate::error::{Error, Result};
 use crate::index::lookup::lookup_core;
 use crate::index::shm::{read_shm_blob, write_shm_blob};
 use crate::sidecar::isa_file::IsaFileReader;
-use crate::sidecar::magic::META_MAGIC;
 use crate::sidecar::meta::Meta;
 use crate::sidecar::model_file::{ModelFileReader, ModelLayer};
 use crate::sidecar::sa_file::SaFileReader;
@@ -205,11 +203,11 @@ impl LearnedIndex {
         self.meta.rmi.l2_leaf_count
     }
 
-    /// Returns the sidecar format magic string (the value of `META_MAGIC`,
-    /// currently `"PRMIv2"`). This reflects the format version written by the
-    /// trainer and is not guaranteed to be a fixed constant across releases.
+    /// Returns the sidecar format magic string as recorded in the loaded
+    /// `.meta` file (e.g. `"PRMIv2"`). Reflects what was actually written by
+    /// the trainer; not a hardcoded constant.
     pub fn format_version(&self) -> &str {
-        META_MAGIC
+        &self.meta.prmi.magic
     }
 
     /// Read `out.len()` packed SA positions starting at SA index `k` from
@@ -296,11 +294,8 @@ impl LearnedIndex {
         lookup_core(key, &self.l1, &self.l2, self.bit_shift(), self.sa_num())
     }
 
-    // Accessors used by Task 22+ (smem_range), the C FFI layer, and inspect.
-    pub(crate) fn sa(&self) -> &SaFileReader {
-        &self.sa
-    }
-    /// L1 fallback layer reader. Used by inspect and smem_range.
+    // Accessors used by the spectrum query path, the C FFI layer, and inspect.
+    /// L1 fallback layer reader. Used by inspect and the spectrum query path.
     pub fn l1(&self) -> &ModelFileReader {
         &self.l1
     }

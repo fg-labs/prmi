@@ -9,7 +9,8 @@
 #      PAC file (BWA-MEME bntpac convention: 4 bases/byte, MSB-first).
 #   4. Writes a binary 32-base query file.
 #   5. Computes the expected 32-mer hex key.
-#   6. Runs cpp_caller and checks the exit code; verifies packed == unpacked.
+#   6. Runs cpp_caller and checks the exit code; verifies the spectrum,
+#      sa_positions, and batch FFI smoke output.
 #
 # Run from anywhere; all paths are relative to this script's directory.
 
@@ -17,13 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "${SCRIPT_DIR}/.." && pwd)"
-# Locate the `prmi` CLI. Honor an explicit $PRMI override, else prefer a release
-# build, else fall back to a debug build so a plain `cargo build --workspace`
-# (which produces target/debug/prmi) is enough to run the smoke test.
-PRMI="${PRMI:-${WORKSPACE}/target/release/prmi}"
-if [[ ! -x "${PRMI}" && -x "${WORKSPACE}/target/debug/prmi" ]]; then
-  PRMI="${WORKSPACE}/target/debug/prmi"
-fi
+PRMI="${WORKSPACE}/target/release/prmi"
 CPP_CALLER="${SCRIPT_DIR}/cpp_caller"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT
@@ -126,53 +121,54 @@ if ! echo "${OUTPUT}" | grep "prmi_sa_positions:" | grep -q "rc=0"; then
     echo "FAIL: prmi_sa_positions did not return rc=0" >&2
     exit 1
 fi
-# Extract the position count from the smem_range packed result line.
-# Line is: smem_range(packed):   rc=... k=... l=<count> s=...
-# `|| true` guards against a grep no-match (exit 1) aborting the script under
-# `set -o pipefail`; the emptiness check below handles a missing value.
-L_VAL="$(echo "${OUTPUT}" | grep "smem_range(packed):" | grep -o 'l=[0-9]*' | cut -d= -f2 || true)"
-# And the count from the sa_positions line: count=<N>
-SA_COUNT="$(echo "${OUTPUT}" | grep "prmi_sa_positions:" | grep -o 'count=[0-9]*' | head -1 | cut -d= -f2 || true)"
-if [ -n "${L_VAL}" ] && [ -n "${SA_COUNT}" ]; then
-    if [ "${L_VAL}" != "${SA_COUNT}" ]; then
-        echo "FAIL: smem_range l=${L_VAL} does not match prmi_sa_positions count=${SA_COUNT}" >&2
-        exit 1
-    fi
-    echo "=== prmi_sa_positions count=${SA_COUNT} matches smem_range l=${L_VAL} — OK"
-fi
-# Verify prmi_smem_range_batch_packed appeared in output and returned rc=0
-if ! echo "${OUTPUT}" | grep -q "prmi_smem_range_batch_packed:"; then
-    echo "FAIL: prmi_smem_range_batch_packed line missing from cpp_caller output" >&2
-    exit 1
-fi
-if ! echo "${OUTPUT}" | grep "prmi_smem_range_batch_packed:" | grep -q "rc=0"; then
-    echo "FAIL: prmi_smem_range_batch_packed did not return rc=0" >&2
-    exit 1
-fi
-if ! echo "${OUTPUT}" | grep "prmi_smem_range_batch_packed:" | grep -q "all.*slots match single-key"; then
-    echo "FAIL: prmi_smem_range_batch_packed batch/single-key mismatch check did not pass" >&2
-    exit 1
-fi
-# Verify prmi_smem_range_long_read_packed appeared in output and returned rc=0
-if ! echo "${OUTPUT}" | grep -q "prmi_smem_range_long_read_packed:"; then
-    echo "FAIL: prmi_smem_range_long_read_packed line missing from cpp_caller output" >&2
-    exit 1
-fi
-if ! echo "${OUTPUT}" | grep "prmi_smem_range_long_read_packed:" | grep -q "rc=0"; then
-    echo "FAIL: prmi_smem_range_long_read_packed did not return rc=0" >&2
-    exit 1
-fi
-echo "=== prmi_smem_range_long_read_packed rc=0 — OK"
+echo "=== prmi_sa_positions rc=0 — OK"
 
-# Verify prmi_minimizer_32mer appeared in output and returned rc=0
-if ! echo "${OUTPUT}" | grep -q "prmi_minimizer_32mer:"; then
-    echo "FAIL: prmi_minimizer_32mer line missing from cpp_caller output" >&2
+# Verify spectrum smoke section: forward_spectrum appeared and returned rc=0
+if ! echo "${OUTPUT}" | grep -q "forward_spectrum nsteps="; then
+    echo "FAIL: forward_spectrum line missing from cpp_caller output" >&2
     exit 1
 fi
-if ! echo "${OUTPUT}" | grep "prmi_minimizer_32mer:" | grep -q "rc=0"; then
-    echo "FAIL: prmi_minimizer_32mer did not return rc=0" >&2
+if ! echo "${OUTPUT}" | grep "forward_spectrum nsteps=" | grep -q "rc=0"; then
+    echo "FAIL: forward_spectrum did not return rc=0" >&2
     exit 1
 fi
-echo "=== prmi_minimizer_32mer rc=0 — OK"
+echo "=== forward_spectrum rc=0 — OK"
+
+# Verify backward_spectrum appeared and returned rc=0
+if ! echo "${OUTPUT}" | grep -q "backward_spectrum nsteps="; then
+    echo "FAIL: backward_spectrum line missing from cpp_caller output" >&2
+    exit 1
+fi
+if ! echo "${OUTPUT}" | grep "backward_spectrum nsteps=" | grep -q "rc=0"; then
+    echo "FAIL: backward_spectrum did not return rc=0" >&2
+    exit 1
+fi
+echo "=== backward_spectrum rc=0 — OK"
+
+# Verify sa_positions_strided appeared and returned rc=0
+if ! echo "${OUTPUT}" | grep -q "sa_positions_strided"; then
+    echo "FAIL: sa_positions_strided line missing from cpp_caller output" >&2
+    exit 1
+fi
+if ! echo "${OUTPUT}" | grep "sa_positions_strided" | grep -q "rc=0"; then
+    echo "FAIL: sa_positions_strided did not return rc=0" >&2
+    exit 1
+fi
+echo "=== sa_positions_strided rc=0 — OK"
+
+# Verify forward_spectrum_batch appeared, returned rc=0, and tasks matched
+if ! echo "${OUTPUT}" | grep -q "forward_spectrum_batch rc="; then
+    echo "FAIL: forward_spectrum_batch line missing from cpp_caller output" >&2
+    exit 1
+fi
+if ! echo "${OUTPUT}" | grep "forward_spectrum_batch rc=" | grep -q "rc=0"; then
+    echo "FAIL: forward_spectrum_batch did not return rc=0" >&2
+    exit 1
+fi
+if ! echo "${OUTPUT}" | grep "forward_spectrum_batch:" | grep -q "both tasks match single"; then
+    echo "FAIL: forward_spectrum_batch tasks did not match single-call result" >&2
+    exit 1
+fi
+echo "=== forward_spectrum_batch rc=0, tasks match single — OK"
 
 echo "=== cpp_caller exited 0 — smoke PASSED"
