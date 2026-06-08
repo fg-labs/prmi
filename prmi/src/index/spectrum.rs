@@ -360,6 +360,17 @@ fn set_probe_depth(m: usize) {
     probe_count::set_depth(m);
 }
 
+/// Result of [`LearnedIndex::mem_search`]: the maximal exact forward match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemMatch {
+    /// Maximal exact-match length (0 if `query[0]` does not occur).
+    pub match_len: u64,
+    /// SA-interval start at `match_len` (0 when `match_len == 0`).
+    pub sa_start: u64,
+    /// Occurrence count at `match_len` (0 when `match_len == 0`).
+    pub occ: u64,
+}
+
 /// One breakpoint of an SMEM spectrum: the SA interval `[sa_start, sa_start+occ_count)`
 /// matching the query to length `match_len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1071,6 +1082,75 @@ impl LearnedIndex {
         match &self.kmt {
             Some(table) => self.forward_spectrum_tabled(query, pac, enc, table),
             None => self.forward_spectrum(query, pac, enc),
+        }
+    }
+
+    /// One-shot maximal exact forward match: the longest prefix of `query` that
+    /// occurs in the reference, with its SA interval. Equals the MAXIMAL (deepest)
+    /// step of [`forward_spectrum_auto`] — byte-identical by construction; reuses
+    /// the k-mer table + occ==1 fast path. `match_len == 0` (and `sa_start/occ ==
+    /// 0`) when `query` is empty or `query[0]` does not occur.
+    pub fn mem_search(&self, query: &[u8], pac: &[u8], enc: PacEncoding) -> MemMatch {
+        match self.forward_spectrum_auto(query, pac, enc).last() {
+            Some(s) => MemMatch {
+                match_len: s.match_len,
+                sa_start: s.sa_start,
+                occ: s.occ_count,
+            },
+            None => MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0,
+            },
+        }
+    }
+
+    /// One-shot maximal exact BACKWARD (leftward) match: the deepest left
+    /// extension of the right anchor `[sa_start, sa_start+occ_count)` (matching
+    /// `read[pivot..pivot+anchor_len)`), with its SA interval. The backward twin
+    /// of [`mem_search`]. `match_len` is the TOTAL matched span
+    /// (`anchor_len + left_ext`).
+    ///
+    /// - When [`backward_spectrum`](Self::backward_spectrum) produces ≥1 left
+    ///   step, the result equals its MAXIMAL (deepest) step — byte-identical by
+    ///   construction.
+    /// - When no left extension is possible (`pivot == 0`, an ambiguous left
+    ///   base, or the anchor cannot extend), the maximal match is the anchor
+    ///   itself: `(sa_start, occ_count, anchor_len)`.
+    /// - When `occ_count == 0` (the anchor does not occur), all-zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mem_search_backward(
+        &self,
+        sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        if occ_count == 0 {
+            return MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        match self
+            .backward_spectrum(sa_start, occ_count, anchor_len, read, pivot, pac, enc)
+            .last()
+        {
+            Some(s) => MemMatch {
+                match_len: s.match_len,
+                sa_start: s.sa_start,
+                occ: s.occ_count,
+            },
+            // No left extension: the anchor itself is the maximal backward match.
+            None => MemMatch {
+                match_len: anchor_len,
+                sa_start,
+                occ: occ_count,
+            },
         }
     }
 
@@ -2244,6 +2324,98 @@ mod keyed_tests {
         }
     }
 
+    /// Map a backward spectrum's maximal step to a `MemMatch`, with the anchor as
+    /// the result when there is no left extension and zero when `occ == 0` — the
+    /// exact contract `mem_search_backward` implements.
+    fn maximal_backward(steps: &[SmemStep], sa_start: u64, occ: u64, anchor_len: u64) -> MemMatch {
+        if occ == 0 {
+            return MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        match steps.last() {
+            Some(s) => MemMatch {
+                match_len: s.match_len,
+                sa_start: s.sa_start,
+                occ: s.occ_count,
+            },
+            None => MemMatch {
+                match_len: anchor_len,
+                sa_start,
+                occ,
+            },
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        /// `mem_search_backward` == the maximal step of the INDEPENDENT model-free
+        /// backward reference (and of production `backward_spectrum`), mapped via
+        /// the anchor/zero contract — for anchors derived from forward.
+        #[test]
+        fn mem_search_backward_equals_maximal_backward_step(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+            read in prop::collection::vec(0u8..=3, 30..120),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for pivot in (5..read.len()).step_by(7) {
+                for a in idx.forward_spectrum(&read[pivot..], &fwd, e) {
+                    let (s, o, al) = (a.sa_start, a.occ_count, a.match_len);
+                    let got = idx.mem_search_backward(s, o, al, &read, pivot, &fwd, e);
+                    // Independent oracle: the model-free backward reference.
+                    let ref_steps =
+                        idx.backward_spectrum_reference(s, o, al, &read, pivot, &fwd, e);
+                    prop_assert_eq!(
+                        got,
+                        maximal_backward(&ref_steps, s, o, al),
+                        "mem_search_backward != independent backward oracle at pivot {}", pivot
+                    );
+                    // And the production spectrum's maximal step.
+                    let prod_steps = idx.backward_spectrum(s, o, al, &read, pivot, &fwd, e);
+                    prop_assert_eq!(
+                        got,
+                        maximal_backward(&prod_steps, s, o, al),
+                        "mem_search_backward != backward_spectrum maximal at pivot {}", pivot
+                    );
+                }
+            }
+        }
+    }
+
+    /// `mem_search_backward` edge cases: `occ_count == 0` → all-zero; `pivot == 0`
+    /// (no left base) → the anchor itself (`match_len == anchor_len`).
+    #[test]
+    fn mem_search_backward_zero_and_anchor_cases() {
+        let fwd: Vec<u8> = (0..200u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 9) & 3) as u8)
+            .collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        // occ_count == 0 -> all zero.
+        assert_eq!(
+            idx.mem_search_backward(0, 0, 5, &fwd, 10, &fwd, e),
+            MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0
+            }
+        );
+        // pivot == 0: no left extension -> the anchor is returned unchanged.
+        let a = idx.forward_spectrum(&fwd, &fwd, e).last().copied().unwrap();
+        let m = idx.mem_search_backward(a.sa_start, a.occ_count, a.match_len, &fwd, 0, &fwd, e);
+        assert_eq!(
+            m,
+            MemMatch {
+                match_len: a.match_len,
+                sa_start: a.sa_start,
+                occ: a.occ_count
+            }
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
         /// `backward_spectrum_lockstep` over a batch of anchors == per-anchor
@@ -2277,6 +2449,64 @@ mod keyed_tests {
             let got = idx.backward_spectrum_lockstep(&tasks, &fwd, e);
             prop_assert_eq!(got, want, "lockstep batch != serial");
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        /// `mem_search` == the maximal step of the independent brute-force forward
+        /// oracle (and of `forward_spectrum_auto`), for random refs/queries.
+        #[test]
+        fn mem_search_equals_maximal_forward_step(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 0..50), 1..6),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let table = idx.build_kmer_table(5, &fwd, e);
+            for q in &queries {
+                let got = idx.mem_search(q, &fwd, e);
+                // Oracle: maximal step (or zero match).
+                let oracle = forward_spectrum_oracle(&idx, q, &fwd, e);
+                let want = match oracle.last() {
+                    Some(s) => MemMatch { match_len: s.match_len, sa_start: s.sa_start, occ: s.occ_count },
+                    None => MemMatch { match_len: 0, sa_start: 0, occ: 0 },
+                };
+                prop_assert_eq!(got, want, "mem_search != oracle maximal, query={:?}", q);
+                // Also equals forward_spectrum_auto's last step (table path).
+                let auto = idx.forward_spectrum_tabled(q, &fwd, e, &table);
+                let want_auto = match auto.last() {
+                    Some(s) => MemMatch { match_len: s.match_len, sa_start: s.sa_start, occ: s.occ_count },
+                    None => MemMatch { match_len: 0, sa_start: 0, occ: 0 },
+                };
+                prop_assert_eq!(got, want_auto, "mem_search != forward_spectrum_tabled last, query={:?}", q);
+            }
+        }
+    }
+
+    #[test]
+    fn mem_search_deep_unique_and_empty() {
+        let fwd: Vec<u8> = (0..400u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 11) & 3) as u8)
+            .collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        // Reference-lifted 60-mer => matches to full length (unique deep).
+        // fwd[116..176] is unique in the doubled (fwd||RC) text for this LCG seed.
+        let q = &fwd[116..176];
+        let m = idx.mem_search(q, &fwd, e);
+        assert_eq!(m.match_len, 60, "reference-lifted query must match fully");
+        assert_eq!(m.occ, 1, "a 60-mer is unique in this 400-base ref");
+        // Empty query => zero match.
+        assert_eq!(
+            idx.mem_search(&[], &fwd, e),
+            MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0
+            }
+        );
+        // A single base that does occur => match_len >= 1.
+        assert!(idx.mem_search(&[fwd[0]], &fwd, e).match_len >= 1);
     }
 
     /// Reference-lifted queries extend to full depth and become unique, so they

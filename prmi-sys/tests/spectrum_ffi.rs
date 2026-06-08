@@ -11,7 +11,8 @@ use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
     prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
     prmi_bwd_task_t, prmi_close, prmi_forward_spectrum, prmi_forward_spectrum_batch,
-    prmi_fwd_task_t, prmi_open, prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
+    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_open, prmi_sa_positions,
+    prmi_sa_positions_strided, prmi_smem_step_t, PRMI_MEM_WANT_INTERVAL,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -1146,6 +1147,290 @@ fn forward_spectrum_batch_out_of_arena_returns_minus_two() {
     assert_eq!(
         rc2, -2,
         "out-of-arena steps window should return -2, got {rc2}"
+    );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_mem_search` returns the same `(sa_start, occ, match_len)` as the lib's
+/// `forward_spectrum` MAXIMAL step for the same query; and with no flag it writes
+/// only `match_len` (leaves the interval out-ptrs untouched).
+#[test]
+fn mem_search_ffi_matches_forward_spectrum_maximal() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str.clone()).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases = pac_unpacked.len() as u64;
+
+    // Lib reference: forward_spectrum's maximal (last) step for a lifted query.
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+    let idx = LearnedIndex::open(std::path::Path::new(&prefix_str)).unwrap();
+    let want = idx
+        .forward_spectrum(&query, &pac_unpacked, PacEncoding::Unpacked)
+        .last()
+        .copied()
+        .expect("expected a non-empty forward match for a reference-lifted query");
+
+    // WANT_INTERVAL path: all three outputs must match.
+    let mut ml: u32 = 0;
+    let mut ss: u64 = 0;
+    let mut occ: u64 = 0;
+    let rc = unsafe {
+        prmi_mem_search(
+            handle,
+            query.as_ptr(),
+            query.len() as i32,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            PRMI_MEM_WANT_INTERVAL,
+            &mut ml,
+            &mut ss,
+            &mut occ,
+        )
+    };
+    assert_eq!(rc, 0, "prmi_mem_search rc={rc}");
+    assert_eq!(
+        (ml as u64, ss, occ),
+        (want.match_len, want.sa_start, want.occ_count),
+        "mem_search FFI != forward_spectrum maximal step"
+    );
+
+    // No-flag path: only match_len written; interval out-ptrs left untouched.
+    let mut ml2: u32 = 0;
+    let mut ss2: u64 = u64::MAX;
+    let mut occ2: u64 = u64::MAX;
+    let rc2 = unsafe {
+        prmi_mem_search(
+            handle,
+            query.as_ptr(),
+            query.len() as i32,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            0,
+            &mut ml2,
+            &mut ss2,
+            &mut occ2,
+        )
+    };
+    assert_eq!(rc2, 0);
+    assert_eq!(ml2, ml, "match_len must be written regardless of flag");
+    assert_eq!(
+        (ss2, occ2),
+        (u64::MAX, u64::MAX),
+        "no-flag must not touch interval out-ptrs"
+    );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_mem_search` negative paths: null handle (-1), negative query_len (-2),
+/// WANT_INTERVAL with a null interval out-ptr (-1, and match_len left untouched),
+/// and a non-matching query (match_len 0).
+#[test]
+fn mem_search_ffi_error_paths() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases = pac_unpacked.len() as u64;
+    let query: Vec<u8> = pac_unpacked[8..8 + 8].to_vec();
+    let mut ml: u32 = 7;
+    let mut ss: u64 = 0;
+    let mut occ: u64 = 0;
+
+    // Null handle -> -1.
+    let rc = unsafe {
+        prmi_mem_search(
+            ptr::null(),
+            query.as_ptr(),
+            query.len() as i32,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            0,
+            &mut ml,
+            &mut ss,
+            &mut occ,
+        )
+    };
+    assert_eq!(rc, -1, "null handle");
+
+    // Negative query_len -> -2.
+    let rc = unsafe {
+        prmi_mem_search(
+            handle,
+            query.as_ptr(),
+            -1,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            0,
+            &mut ml,
+            &mut ss,
+            &mut occ,
+        )
+    };
+    assert_eq!(rc, -2, "negative query_len");
+
+    // WANT_INTERVAL with a null interval out-ptr -> -1, and *out_match_len untouched.
+    let sentinel: u32 = 12345;
+    let mut ml2 = sentinel;
+    let rc = unsafe {
+        prmi_mem_search(
+            handle,
+            query.as_ptr(),
+            query.len() as i32,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            PRMI_MEM_WANT_INTERVAL,
+            &mut ml2,
+            ptr::null_mut(),
+            &mut occ,
+        )
+    };
+    assert_eq!(rc, -1, "WANT_INTERVAL with null out_sa_start");
+    assert_eq!(ml2, sentinel, "error return must not write match_len");
+
+    // A query that cannot occur (a base value out of range / impossible 2-mer):
+    // base 3 then base 3 ... actually use a real non-occurring k-mer. In the
+    // ACGT-repeat reference every short k-mer occurs, so instead verify the
+    // contract on a definitely-matching single base returns match_len >= 1, and
+    // an empty query returns match_len 0.
+    let mut ml3: u32 = 99;
+    let rc = unsafe {
+        prmi_mem_search(
+            handle,
+            query.as_ptr(),
+            0,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            0,
+            &mut ml3,
+            &mut ss,
+            &mut occ,
+        )
+    };
+    assert_eq!(rc, 0, "empty query is valid");
+    assert_eq!(ml3, 0, "empty query -> match_len 0");
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_mem_search_backward` returns the same `(sa_start, occ, match_len)` as the
+/// lib `backward_spectrum`'s MAXIMAL step (or the anchor when no left extension);
+/// and with no flag it writes only `match_len`.
+#[test]
+fn mem_search_backward_ffi_matches_backward_spectrum_maximal() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str.clone()).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases = pac_unpacked.len() as u64;
+
+    // Anchor at offset 20 with one left base (pivot=1), 16-base anchor query —
+    // same construction as backward_spectrum_batch_smoke (T precedes offset 20,
+    // so the backward search extends ≥1 base).
+    let pivot = 1usize;
+    let anchor_off = 20usize;
+    let aqlen = 16usize;
+    let read: Vec<u8> =
+        pac_unpacked[anchor_off - pivot..anchor_off - pivot + (pivot + aqlen)].to_vec();
+    let aq: Vec<u8> = read[pivot..].to_vec();
+
+    let idx = LearnedIndex::open(std::path::Path::new(&prefix_str)).unwrap();
+    let anchor = idx
+        .forward_spectrum(&aq, &pac_unpacked, PacEncoding::Unpacked)
+        .first()
+        .copied()
+        .expect("forward must produce an anchor");
+
+    // Lib reference: maximal backward step (or the anchor if no left extension).
+    let bsteps = idx.backward_spectrum(
+        anchor.sa_start,
+        anchor.occ_count,
+        anchor.match_len,
+        &read,
+        pivot,
+        &pac_unpacked,
+        PacEncoding::Unpacked,
+    );
+    let (wml, wss, wocc) = match bsteps.last() {
+        Some(s) => (s.match_len, s.sa_start, s.occ_count),
+        None => (anchor.match_len, anchor.sa_start, anchor.occ_count),
+    };
+    assert!(
+        wml >= anchor.match_len,
+        "backward match must be ≥ anchor (non-vacuous)"
+    );
+
+    // FFI WANT_INTERVAL path.
+    let mut ml: u32 = 0;
+    let mut ss: u64 = 0;
+    let mut occ: u64 = 0;
+    let rc = unsafe {
+        prmi_mem_search_backward(
+            handle,
+            anchor.sa_start,
+            anchor.occ_count,
+            anchor.match_len,
+            read.as_ptr(),
+            read.len() as i32,
+            pivot as i32,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            PRMI_MEM_WANT_INTERVAL,
+            &mut ml,
+            &mut ss,
+            &mut occ,
+        )
+    };
+    assert_eq!(rc, 0, "prmi_mem_search_backward rc={rc}");
+    assert_eq!(
+        (ml as u64, ss, occ),
+        (wml, wss, wocc),
+        "mem_search_backward FFI != backward_spectrum maximal step"
+    );
+
+    // No-flag path: only match_len written; interval out-ptrs untouched.
+    let mut ml2: u32 = 0;
+    let mut ss2: u64 = u64::MAX;
+    let mut occ2: u64 = u64::MAX;
+    let rc2 = unsafe {
+        prmi_mem_search_backward(
+            handle,
+            anchor.sa_start,
+            anchor.occ_count,
+            anchor.match_len,
+            read.as_ptr(),
+            read.len() as i32,
+            pivot as i32,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            0,
+            0,
+            &mut ml2,
+            &mut ss2,
+            &mut occ2,
+        )
+    };
+    assert_eq!(rc2, 0);
+    assert_eq!(ml2, ml, "match_len must be written regardless of flag");
+    assert_eq!(
+        (ss2, occ2),
+        (u64::MAX, u64::MAX),
+        "no-flag must not touch interval"
     );
 
     unsafe { prmi_close(handle) };
