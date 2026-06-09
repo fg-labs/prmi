@@ -48,6 +48,7 @@ fn mask_n_runs_default_on_excludes_n_window() {
     use prmi::encoding::KMER_LEN;
     use prmi::fasta::fasta_to_2bit_with_n_positions;
     use prmi::sa::build_suffix_array;
+    use prmi::train::mask::NBitmap;
     use prmi::train::training_set::masked_training_set;
 
     // 200 ACGT bases + 100 N's + 200 ACGT bases.
@@ -64,6 +65,18 @@ fn mask_n_runs_default_on_excludes_n_window() {
     bases.extend(std::iter::repeat_n(3u8, KMER_LEN - 1)); // BASE_T = 3
     n_positions.extend(std::iter::repeat_n(false, KMER_LEN - 1));
 
+    // Bit-packed view of the same N positions for the masked_training_set API;
+    // the Vec<bool> `n_positions` stays as the verification oracle below.
+    let n_bitmap = {
+        let mut b = NBitmap::zeros(n_positions.len());
+        for (i, &is_n) in n_positions.iter().enumerate() {
+            if is_n {
+                b.set(i);
+            }
+        }
+        b
+    };
+
     let full_sa = build_suffix_array(&bases, 1).unwrap();
     let sa: Vec<u64> = full_sa
         .into_iter()
@@ -74,7 +87,7 @@ fn mask_n_runs_default_on_excludes_n_window() {
     let ts_full = masked_training_set(
         &sa,
         &bases,
-        &n_positions,
+        &n_bitmap,
         &MaskConfig::default(),
         &prmi::train::prior::Prior::Uniform,
     );
@@ -86,7 +99,7 @@ fn mask_n_runs_default_on_excludes_n_window() {
     let ts_masked = masked_training_set(
         &sa,
         &bases,
-        &n_positions,
+        &n_bitmap,
         &mask_on,
         &prmi::train::prior::Prior::Uniform,
     );

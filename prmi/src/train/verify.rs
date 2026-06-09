@@ -17,17 +17,13 @@ use rayon::prelude::*;
 /// tens of GB on a pathologically ill-fit model — reintroducing the very array
 /// this function exists to remove. We therefore cap the dense region at
 /// `HIST_DENSE_CAP` and spill the rare `err > cap` into a small overflow list.
-/// Real builds have a tiny `max_err` (hg38: ~3.4e5), so the dense array is a
-/// few MB and the overflow is empty.
-const HIST_DENSE_CAP: u64 = 256 << 20;
-
-/// Above this dense-histogram length the per-worker buffers of the parallel
-/// fold (`dense_len * rayon_threads * 8` bytes) would dwarf a single buffer, so
-/// the histogram falls back to a serial single-buffer pass. `1 << 20` entries =
-/// 8 MiB per buffer; below it the parallel path's `× threads` is cheap, above it
-/// memory — not CPU — is the bottleneck and one buffer is the safe choice.
-/// Real builds (hg38 `max_err` ~3.4e5) stay well under this and run parallel.
-const HIST_PARALLEL_DENSE_LIMIT: usize = 1 << 20;
+/// Grown on demand, the dense array reaches at most `(HIST_DENSE_CAP + 1) * 8`
+/// bytes ≈ 128 MiB **per Rayon fold**, bounding the worst case even when many
+/// folds run concurrently. Real builds have a tiny `max_err` (hg38: ~3.4e5), so
+/// the dense array stays a few MB (~49× margin under the cap) and the overflow is
+/// empty. The cap only shifts the dense/overflow split — the returned
+/// percentiles and `max` are identical for any cap (see [`select_rank`]).
+const HIST_DENSE_CAP: u64 = 16 << 20;
 
 /// Absolute prediction error of training pair `i`.
 ///
@@ -64,37 +60,67 @@ pub fn compute_max_error_bound(model: &PrmiModel, ts: &TrainingSet) -> u64 {
 /// speed. Uses the SAME per-key error as [`compute_max_error_bound`].
 ///
 /// Computed by a streaming histogram rather than by sorting a per-key error
-/// vector: two streaming passes (max+count, then bucket counts) over a dense
-/// count array capped at [`HIST_DENSE_CAP`] plus a small overflow list. This
-/// avoids both the ~51.5 GB error vector and its sort at hg38 scale.
+/// vector: a **single** streaming pass that, per thread, tracks the running max,
+/// counts errors into a dense histogram (grown on demand, capped at
+/// [`HIST_DENSE_CAP`]), and spills the rare `err > cap` into an overflow list.
+/// This avoids the second key-recompute pass as well as the ~51.5 GB error
+/// vector and its sort at hg38 scale.
 ///
 /// The returned percentiles are **bit-identical** to the previous
 /// sort-then-index implementation: the value at sorted rank
 /// `idx = round((n-1)·p)` equals the smallest histogram value whose inclusive
 /// cumulative count first exceeds `idx`. The returned `max` equals
-/// [`compute_max_error_bound`].
+/// [`compute_max_error_bound`]. Grow-on-demand only changes the dense array's
+/// length (trailing zeros are inert in [`select_rank`]); the per-value counts
+/// are identical.
 pub fn compute_error_distribution(model: &PrmiModel, ts: &TrainingSet) -> (u64, u64, u64, u64) {
     let n = ts.len();
     if n == 0 {
         return (0, 0, 0, 0);
     }
 
-    // Pass 1 (parallel): global max. Order-independent.
-    let max = (0..n)
+    // Single parallel pass: each thread keeps a grow-on-demand dense histogram
+    // (sized to its own max error, never beyond `cap_len`), an overflow list for
+    // `err > HIST_DENSE_CAP`, and a running max. Order-independent: reduction
+    // sums counts, concatenates overflow, and maxes — so the result is
+    // bit-identical regardless of thread scheduling.
+    let cap = HIST_DENSE_CAP;
+    let cap_len = cap as usize + 1;
+    let (dense, mut overflow, max) = (0..n)
         .into_par_iter()
-        .map(|i| error_at(model, ts, i))
-        .max()
-        .unwrap();
-
-    // Pass 2: a dense histogram (covering [0, dense_cap]) plus an overflow list
-    // for the rare err > dense_cap. The parallel path allocates one dense buffer
-    // per rayon worker, so above `HIST_PARALLEL_DENSE_LIMIT` it would multiply a
-    // large buffer by the thread count; there a serial single-buffer pass caps
-    // memory. Both produce identical counts (order-independent), so percentiles
-    // stay bit-identical.
-    let dense_cap = max.min(HIST_DENSE_CAP);
-    let parallel = (dense_cap as usize + 1) <= HIST_PARALLEL_DENSE_LIMIT;
-    let (dense, mut overflow) = error_histogram(model, ts, n, dense_cap, parallel);
+        .fold(
+            || (Vec::<u64>::new(), Vec::<u64>::new(), 0u64),
+            |(mut dense, mut ov, mut mx), i| {
+                let e = error_at(model, ts, i);
+                mx = mx.max(e);
+                if e <= cap {
+                    let e = e as usize;
+                    if e >= dense.len() {
+                        // Double (amortized O(1)) but never past `cap_len`; since
+                        // e <= cap, the result always admits index `e`.
+                        let grown = (e + 1).max(dense.len().saturating_mul(2)).min(cap_len);
+                        dense.resize(grown, 0);
+                    }
+                    dense[e] += 1;
+                } else {
+                    ov.push(e);
+                }
+                (dense, ov, mx)
+            },
+        )
+        .reduce(
+            || (Vec::<u64>::new(), Vec::<u64>::new(), 0u64),
+            |(mut d1, mut o1, m1), (d2, o2, m2)| {
+                if d1.len() < d2.len() {
+                    d1.resize(d2.len(), 0);
+                }
+                for (a, b) in d1.iter_mut().zip(d2.iter()) {
+                    *a += *b;
+                }
+                o1.extend(o2);
+                (d1, o1, m1.max(m2))
+            },
+        );
     overflow.sort_unstable();
 
     let idx = |p: f64| (((n - 1) as f64) * p).round() as usize;
@@ -104,60 +130,6 @@ pub fn compute_error_distribution(model: &PrmiModel, ts: &TrainingSet) -> (u64, 
         select_rank(&dense, &overflow, idx(0.99)),
         max,
     )
-}
-
-/// Build the dense error histogram `[0, dense_cap]` plus an overflow list of the
-/// `err > dense_cap` values, over the `n` training pairs. `parallel` selects the
-/// per-worker fold (fast, but `dense_len × threads` memory) or a serial
-/// single-buffer pass (memory-bounded). Both return identical counts — the only
-/// difference is execution strategy. The overflow list is returned unsorted.
-fn error_histogram(
-    model: &PrmiModel,
-    ts: &TrainingSet,
-    n: usize,
-    dense_cap: u64,
-    parallel: bool,
-) -> (Vec<u64>, Vec<u64>) {
-    let dense_len = dense_cap as usize + 1;
-    if parallel {
-        (0..n)
-            .into_par_iter()
-            .fold(
-                || (vec![0u64; dense_len], Vec::<u64>::new()),
-                |(mut dense, mut ov), i| {
-                    let e = error_at(model, ts, i);
-                    if e <= dense_cap {
-                        dense[e as usize] += 1;
-                    } else {
-                        ov.push(e);
-                    }
-                    (dense, ov)
-                },
-            )
-            .reduce(
-                || (vec![0u64; dense_len], Vec::<u64>::new()),
-                |(mut d1, mut o1), (d2, o2)| {
-                    for (a, b) in d1.iter_mut().zip(d2.iter()) {
-                        *a += *b;
-                    }
-                    o1.extend(o2);
-                    (d1, o1)
-                },
-            )
-    } else {
-        // Serial: one dense buffer, no `× threads` amplification.
-        let mut dense = vec![0u64; dense_len];
-        let mut overflow = Vec::<u64>::new();
-        for i in 0..n {
-            let e = error_at(model, ts, i);
-            if e <= dense_cap {
-                dense[e as usize] += 1;
-            } else {
-                overflow.push(e);
-            }
-        }
-        (dense, overflow)
-    }
 }
 
 /// Value at sorted rank `idx` of a multiset stored as a dense histogram
@@ -238,7 +210,6 @@ mod tests {
     #[test]
     fn error_distribution_empty_training_set() {
         // An empty training set should return all zeros without panicking.
-        let ts = make_ts(vec![], vec![]);
         let keys: Vec<u64> = vec![];
         let sa_indices: Vec<u64> = vec![];
         let ts2 = TrainingSet {
@@ -252,7 +223,6 @@ mod tests {
         let ts_small = make_ts(vec![1u64 << 60], vec![0]);
         let config = TrainerConfig::default();
         let model = train_with_config(&ts_small, 16, &config).unwrap();
-        let _ = ts; // suppress unused warning
         assert_eq!(compute_error_distribution(&model, &ts2), (0, 0, 0, 0));
         assert_eq!(compute_max_error_bound(&model, &ts2), 0);
     }
@@ -294,27 +264,6 @@ mod tests {
                 "histogram distribution must match sorted reference for n={n}"
             );
         }
-    }
-
-    #[test]
-    fn error_histogram_serial_equals_parallel() {
-        // The serial single-buffer fallback (used above HIST_PARALLEL_DENSE_LIMIT
-        // to cap memory) must produce identical counts to the parallel fold.
-        let config = TrainerConfig::default();
-        let keys: Vec<u64> = (0..1000u64).map(|i| (i + 1) * (1u64 << 44)).collect();
-        let sa_indices: Vec<u64> = (0..1000u64).collect();
-        let ts = make_ts(keys, sa_indices);
-        let model = train_with_config(&ts, 16, &config).unwrap();
-        let n = ts.len();
-        let dense_cap = compute_max_error_bound(&model, &ts).min(HIST_DENSE_CAP);
-        let par = error_histogram(&model, &ts, n, dense_cap, true);
-        let ser = error_histogram(&model, &ts, n, dense_cap, false);
-        let mut par_ov = par.1.clone();
-        let mut ser_ov = ser.1.clone();
-        par_ov.sort_unstable();
-        ser_ov.sort_unstable();
-        assert_eq!(par.0, ser.0, "dense histograms differ between strategies");
-        assert_eq!(par_ov, ser_ov, "overflow lists differ between strategies");
     }
 
     #[test]

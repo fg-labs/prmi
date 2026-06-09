@@ -223,22 +223,17 @@ impl ModelFileReader {
         );
         let off = MODEL_FILE_HEADER_BYTES + i * BYTES_PER_MODEL_ENTRY;
         // SAFETY: `data_ptr` points to valid bytes kept alive by `mmap` or
-        // `_shm_mmap`. `off + 24 <= data_len` by header validation.
-        unsafe {
-            ModelEntry {
-                alpha: LittleEndian::read_f64(std::slice::from_raw_parts(
-                    self.data_ptr.add(off),
-                    8,
-                )),
-                beta: LittleEndian::read_f64(std::slice::from_raw_parts(
-                    self.data_ptr.add(off + 8),
-                    8,
-                )),
-                err: LittleEndian::read_u64(std::slice::from_raw_parts(
-                    self.data_ptr.add(off + 16),
-                    8,
-                )),
-            }
+        // `_shm_mmap`. `off + BYTES_PER_MODEL_ENTRY <= data_len` by header
+        // validation. Reading the whole 24-byte record off a single base
+        // pointer (rather than three independent `from_raw_parts`) lets the
+        // compiler fold the field loads; the decode is byte-for-byte the same
+        // little-endian read as before.
+        let rec =
+            unsafe { std::slice::from_raw_parts(self.data_ptr.add(off), BYTES_PER_MODEL_ENTRY) };
+        ModelEntry {
+            alpha: LittleEndian::read_f64(&rec[0..8]),
+            beta: LittleEndian::read_f64(&rec[8..16]),
+            err: LittleEndian::read_u64(&rec[16..24]),
         }
     }
 }

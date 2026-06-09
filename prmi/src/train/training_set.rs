@@ -12,7 +12,7 @@
 
 use crate::encoding::{tokenize_32mer, KMER_LEN};
 use crate::train::keys::sa_to_keys;
-use crate::train::mask::{covered_by_bed, homopolymer_in_window, n_in_window, MaskConfig};
+use crate::train::mask::{covered_by_bed, homopolymer_in_window, n_in_window, MaskConfig, NBitmap};
 use crate::train::prior::Prior;
 use std::sync::Arc;
 
@@ -298,7 +298,7 @@ pub fn uniform_training_set(sa: &[u64], bases: &[u8]) -> TrainingSet {
 pub fn masked_training_set(
     sa: &[u64],
     bases: &[u8],
-    n_positions: &[bool],
+    n_positions: &NBitmap,
     mask: &MaskConfig,
     prior: &Prior,
 ) -> TrainingSet {
@@ -311,7 +311,7 @@ pub fn masked_training_set(
     // recorded as a small skip list and `sa_indices` is left virtual — avoiding
     // a ~51.5 GB target vector. Keys are identical to the materialized path
     // (every kept entry has `avail == KMER_LEN`, so the same tokenisation).
-    let no_n_effect = !mask.mask_n_runs || n_positions.iter().all(|&b| !b);
+    let no_n_effect = !mask.mask_n_runs || !n_positions.any();
     let virtualize = matches!(prior, Prior::Uniform)
         && mask.mask_homopolymers.is_none()
         && mask.mask_bed.is_none()
@@ -505,7 +505,7 @@ mod tests {
         // Synthetic no-N base array (values 0..=3).
         let bases: Vec<u8> = (0..256u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
         let sa = crate::sa::build_suffix_array(&bases, 1).unwrap();
-        let n_positions = vec![false; bases.len()];
+        let n_positions = NBitmap::zeros(bases.len());
 
         // Reference materialized (key, rank) pairs via the same short-window rule.
         let mut ref_keys: Vec<u64> = Vec::new();
@@ -557,7 +557,7 @@ mod tests {
     fn masked_with_homopolymer_stays_materialized() {
         let bases: Vec<u8> = (0..256u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
         let sa = crate::sa::build_suffix_array(&bases, 1).unwrap();
-        let n_positions = vec![false; bases.len()];
+        let n_positions = NBitmap::zeros(bases.len());
         let mask = MaskConfig {
             mask_n_runs: true,
             mask_homopolymers: Some(5),

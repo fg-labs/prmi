@@ -33,8 +33,12 @@ pub fn lookup_core<A: Layer + ?Sized, B: Layer + ?Sized>(
         let pos = clamp_to_int(0.0, 0.0, sa_num.saturating_sub(1) as f64) as u64;
         return (pos, u64::MAX);
     }
+    // Compute the f64 key once; both the L2-direct and L1-fallback predictions
+    // use it. Hoisting the cast does not reassociate `alpha + beta*keyf`, so the
+    // predicted value is bit-identical to evaluating `key as f64` twice.
+    let keyf = key as f64;
     let l2e = l2.entry(l2_idx);
-    let mut fpred = l2e.alpha + l2e.beta * (key as f64);
+    let mut fpred = l2e.alpha + l2e.beta * keyf;
     let mut err = l2e.err;
 
     if (err >> 63) != 0 {
@@ -59,7 +63,7 @@ pub fn lookup_core<A: Layer + ?Sized, B: Layer + ?Sized>(
         }
         let local = clamp_to_int(fpred, 0.0, (partial_num - 1) as f64);
         let l1e = l1.entry(partial_start + local);
-        fpred = l1e.alpha + l1e.beta * (key as f64);
+        fpred = l1e.alpha + l1e.beta * keyf;
         err = l1e.err;
     }
 

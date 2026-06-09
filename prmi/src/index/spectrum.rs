@@ -192,6 +192,29 @@ pub(crate) fn compare_query_vs_suffix_2x(
     (false, lcp) // full query matched a prefix of the (longer-or-equal) ref suffix
 }
 
+/// Precompute the keyed-compare `(nbases, mask)` from the query length. The mask
+/// keeps the high `nbases * 2` bits (MSB-first) so only the active bases compare;
+/// `nbases == 0` yields a zero mask that the compare never reads (it returns
+/// early). Loop callers compute this once per prefix depth and pass it to
+/// [`compare_query_vs_suffix_2x_keyed_with_mask`] so the inner probe loop does
+/// not recompute the invariant per probe.
+#[inline]
+pub(crate) fn keyed_compare_mask(query_len: usize) -> (usize, u64) {
+    let nbases = query_len.min(KMER_LEN);
+    let mask: u64 = if nbases == 0 {
+        0
+    } else {
+        // `bits` is in 2..=64, so the shift is well-defined.
+        let bits = nbases * 2;
+        if bits >= 64 {
+            u64::MAX
+        } else {
+            !((1u64 << (64 - bits)) - 1)
+        }
+    };
+    (nbases, mask)
+}
+
 /// Key-aware variant of [`compare_query_vs_suffix_2x`]. Uses a precomputed
 /// query 32-mer key (`query_key = tokenize_32mer(query, min(32, query.len()))`)
 /// and the stored suffix key (`stored_key`, from `LearnedIndex::key_at`) to
@@ -226,6 +249,27 @@ pub(crate) fn compare_query_vs_suffix_2x_keyed(
     enc: PacEncoding,
     l_pac: u64,
 ) -> (bool, u32) {
+    let (nbases, mask) = keyed_compare_mask(query.len());
+    compare_query_vs_suffix_2x_keyed_with_mask(
+        query, query_key, stored_key, sa_pos, pac, enc, l_pac, nbases, mask,
+    )
+}
+
+/// As [`compare_query_vs_suffix_2x_keyed`], but with the loop-invariant
+/// `(nbases, mask)` precomputed by the caller via [`keyed_compare_mask`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn compare_query_vs_suffix_2x_keyed_with_mask(
+    query: &[u8],
+    query_key: u64,
+    stored_key: Option<u64>,
+    sa_pos: u64,
+    pac: &[u8],
+    enc: PacEncoding,
+    l_pac: u64,
+    nbases: usize,
+    mask: u64,
+) -> (bool, u32) {
     // Key path is valid only with a stored key AND a full 32 real doubled bases
     // at `sa_pos` (no T-pad / no sentinel within the first 32). Otherwise fall
     // back to the safe vectorized compare, which honours the sentinel rule.
@@ -234,20 +278,10 @@ pub(crate) fn compare_query_vs_suffix_2x_keyed(
         _ => return compare_query_vs_suffix_2x(query, sa_pos, pac, enc, l_pac),
     };
 
-    // Number of query bases the keys can resolve (the high `nbases` 2-bit fields).
-    let nbases = query.len().min(KMER_LEN);
     if nbases == 0 {
         // Empty query matched (a prefix of) the ref suffix; scalar returns this.
         return (false, 0);
     }
-    // Mask off the low (T-pad) bits of both keys so only the active `nbases`
-    // 2-bit fields participate. `bits` is in 2..=64, so the shift is well-defined.
-    let bits = nbases * 2;
-    let mask: u64 = if bits >= 64 {
-        u64::MAX
-    } else {
-        !((1u64 << (64 - bits)) - 1)
-    };
     let xor = (query_key ^ stored_key) & mask;
 
     if xor != 0 {
@@ -373,6 +407,12 @@ pub struct MemMatch {
 
 /// One breakpoint of an SMEM spectrum: the SA interval `[sa_start, sa_start+occ_count)`
 /// matching the query to length `match_len`.
+///
+/// `#[repr(C)]` with fields in this exact order lets the FFI (`prmi-sys`) fill
+/// its `prmi_smem_step_t` output buffer in place via `*_fill`, with a
+/// compile-time layout assertion guarding the equivalence. Do not reorder the
+/// fields without updating `prmi_smem_step_t` and that assertion.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SmemStep {
     /// SA interval start index (raw 2× SA).
@@ -382,6 +422,13 @@ pub struct SmemStep {
     /// Match length (LCP) at this breakpoint.
     pub match_len: u64,
 }
+
+/// Capacity hint for a spectrum's step vector. A spectrum emits one step per
+/// occurrence-count change (coalesced), which is a small handful even for long
+/// queries, so this preallocation avoids the first few regrowth reallocations
+/// without meaningfully over-allocating. It is a hint only and never affects
+/// the contents.
+const SPECTRUM_STEPS_HINT: usize = 16;
 
 /// One backward-extension request (the lockstep analogue of the serial
 /// `backward_spectrum` arguments). `read` is borrowed for the driver's lifetime.
@@ -672,26 +719,119 @@ impl KmerBounds for KmerTable {
     }
 }
 
+/// Sink for spectrum breakpoints. Lets the search core target a full `Vec`
+/// (`forward_spectrum` / `backward_spectrum`), a single maximal step with no
+/// allocation (`mem_search`), or a caller-provided slice (the FFI, no
+/// intermediate `Vec`) without changing the search logic. The push-new-vs-extend
+/// coalescing decision lives in [`push_step`]; a sink only stores.
+pub(crate) trait StepSink {
+    /// Append a new breakpoint.
+    fn push_new(&mut self, step: SmemStep);
+    /// Extend the most recently pushed breakpoint's `match_len` (same interval,
+    /// deeper prefix). A no-op if nothing has been pushed.
+    fn extend_last_match_len(&mut self, match_len: u64);
+}
+
+impl StepSink for Vec<SmemStep> {
+    #[inline]
+    fn push_new(&mut self, step: SmemStep) {
+        self.push(step);
+    }
+    #[inline]
+    fn extend_last_match_len(&mut self, match_len: u64) {
+        if let Some(last) = self.last_mut() {
+            last.match_len = match_len;
+        }
+    }
+}
+
+/// A [`StepSink`] that retains only the most recent breakpoint — exactly the
+/// `.last()` of the full spectrum — so `mem_search` gets the maximal match
+/// without allocating the intermediate `Vec`.
+#[derive(Default)]
+pub(crate) struct LastStepSink {
+    last: Option<SmemStep>,
+}
+
+impl LastStepSink {
+    #[inline]
+    fn last(&self) -> Option<SmemStep> {
+        self.last
+    }
+}
+
+impl StepSink for LastStepSink {
+    #[inline]
+    fn push_new(&mut self, step: SmemStep) {
+        self.last = Some(step);
+    }
+    #[inline]
+    fn extend_last_match_len(&mut self, match_len: u64) {
+        if let Some(last) = self.last.as_mut() {
+            last.match_len = match_len;
+        }
+    }
+}
+
+/// A [`StepSink`] that writes breakpoints into a caller-provided slice (the FFI
+/// output buffer), counting the TOTAL number emitted — including any beyond the
+/// slice's capacity, which are counted but not written so the caller can detect
+/// overflow and retry with a larger buffer.
+pub(crate) struct SliceStepSink<'a> {
+    out: &'a mut [SmemStep],
+    count: usize,
+}
+
+impl<'a> SliceStepSink<'a> {
+    #[inline]
+    fn new(out: &'a mut [SmemStep]) -> Self {
+        Self { out, count: 0 }
+    }
+    /// Total steps emitted (the value to report as `out_nsteps`).
+    #[inline]
+    fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl StepSink for SliceStepSink<'_> {
+    #[inline]
+    fn push_new(&mut self, step: SmemStep) {
+        if let Some(slot) = self.out.get_mut(self.count) {
+            *slot = step;
+        }
+        self.count += 1;
+    }
+    #[inline]
+    fn extend_last_match_len(&mut self, match_len: u64) {
+        // The most recently pushed step is at `count - 1`; update it only if it
+        // was actually written (within capacity).
+        if let Some(last) = self.count.checked_sub(1).and_then(|i| self.out.get_mut(i)) {
+            last.match_len = match_len;
+        }
+    }
+}
+
 /// Emit/coalesce one forward breakpoint: push a new step when `occ` changes,
 /// else extend the previous step's `match_len`. Matches `forward_spectrum`'s
 /// inline coalescing so the tabled variant produces an identical trace.
 #[inline]
-fn push_step(
-    steps: &mut Vec<SmemStep>,
+fn push_step<S: StepSink + ?Sized>(
+    sink: &mut S,
     prev_occ: &mut u64,
     sa_start: u64,
     occ: u64,
     match_len: u64,
 ) {
     if occ != *prev_occ {
-        steps.push(SmemStep {
+        sink.push_new(SmemStep {
             sa_start,
             occ_count: occ,
             match_len,
         });
         *prev_occ = occ;
-    } else if let Some(last) = steps.last_mut() {
-        last.match_len = match_len;
+    } else {
+        sink.extend_last_match_len(match_len);
     }
 }
 
@@ -711,9 +851,9 @@ impl LearnedIndex {
     /// `uniq` — and in that case `uniq` equals the existing step's `sa_start`
     /// anyway (the lone suffix's index does not change as the match deepens).
     #[allow(clippy::too_many_arguments)]
-    fn push_unique_suffix_tail(
+    fn push_unique_suffix_tail<S: StepSink + ?Sized>(
         &self,
-        steps: &mut Vec<SmemStep>,
+        sink: &mut S,
         prev_occ: &mut u64,
         uniq: u64,
         query: &[u8],
@@ -727,7 +867,7 @@ impl LearnedIndex {
         let key = self.key_at(uniq);
         let (_, lcp) =
             compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
-        push_step(steps, prev_occ, uniq, 1, u64::from(lcp));
+        push_step(sink, prev_occ, uniq, 1, u64::from(lcp));
     }
 
     /// Forward spectrum from a pivot: the breakpoint trace of the narrowing SA
@@ -744,9 +884,24 @@ impl LearnedIndex {
     /// optimization, deliberately deferred to keep this byte-identity-critical
     /// path provably correct.
     pub fn forward_spectrum(&self, query: &[u8], pac: &[u8], enc: PacEncoding) -> Vec<SmemStep> {
-        let mut steps = Vec::new();
+        let mut steps: Vec<SmemStep> = Vec::with_capacity(SPECTRUM_STEPS_HINT);
+        self.forward_spectrum_into(query, pac, enc, &mut steps);
+        steps
+    }
+
+    /// Generic core of [`forward_spectrum`]: drives the narrowing search and
+    /// emits each breakpoint into `sink`. The `Vec`-returning entry point, the
+    /// allocation-free `mem_search` (via [`LastStepSink`]), and the FFI slice
+    /// fill all share this one implementation.
+    pub(crate) fn forward_spectrum_into<S: StepSink + ?Sized>(
+        &self,
+        query: &[u8],
+        pac: &[u8],
+        enc: PacEncoding,
+        sink: &mut S,
+    ) {
         if query.is_empty() {
-            return steps;
+            return;
         }
         // A packed pac that cannot hold its declared base count must fail closed
         // before any walk: a truncated buffer would otherwise be misread as a
@@ -754,7 +909,7 @@ impl LearnedIndex {
         // return `None`, but truncation must not silently extend.)
         if let PacEncoding::Packed { num_bases } = enc {
             if validate_packed_pac(pac, num_bases, "forward_spectrum").is_err() {
-                return steps;
+                return;
             }
         }
         let sa_num = self.sa_num();
@@ -777,7 +932,7 @@ impl LearnedIndex {
             // direct compare, not a boundary search at every remaining depth.
             if hi - lo == 1 {
                 self.push_unique_suffix_tail(
-                    &mut steps,
+                    sink,
                     &mut prev_occ,
                     lo,
                     query,
@@ -786,9 +941,13 @@ impl LearnedIndex {
                     enc,
                     l_pac,
                 );
-                return steps;
+                return;
             }
             let qm = &query[..m];
+            // The keyed-compare mask depends only on `qm.len()`, invariant across
+            // both inner binary searches at this depth — compute it once here
+            // rather than per probe.
+            let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
             // Lower bound of qm within [lo, hi): first index whose suffix is >= qm.
             let mut a = lo;
             let mut b = hi;
@@ -797,8 +956,9 @@ impl LearnedIndex {
                 let pos = self.sa_position_for(mid);
                 bump_probe();
                 let key = self.key_at(mid);
-                let (ref_less, _) =
-                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
+                let (ref_less, _) = compare_query_vs_suffix_2x_keyed_with_mask(
+                    qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
+                );
                 if ref_less {
                     a = mid + 1;
                 } else {
@@ -814,8 +974,9 @@ impl LearnedIndex {
                 let pos = self.sa_position_for(mid);
                 bump_probe();
                 let key = self.key_at(mid);
-                let (_, lcp) =
-                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
+                let (_, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
+                    qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
+                );
                 if (lcp as usize) >= qm.len() {
                     c = mid + 1;
                 } else {
@@ -826,21 +987,11 @@ impl LearnedIndex {
             if occ == 0 {
                 break; // no suffix matches this prefix; maximal match is m-1
             }
-            if occ != prev_occ {
-                steps.push(SmemStep {
-                    sa_start: k,
-                    occ_count: occ,
-                    match_len: m as u64,
-                });
-                prev_occ = occ;
-            } else if let Some(last) = steps.last_mut() {
-                last.match_len = m as u64;
-            }
+            push_step(sink, &mut prev_occ, k, occ, m as u64);
             // Narrow for the next, deeper prefix.
             lo = k;
             hi = c;
         }
-        steps
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -962,16 +1113,30 @@ impl LearnedIndex {
         enc: PacEncoding,
         table: &impl KmerBounds,
     ) -> Vec<SmemStep> {
-        let mut steps = Vec::new();
+        let mut steps: Vec<SmemStep> = Vec::with_capacity(SPECTRUM_STEPS_HINT);
+        self.forward_spectrum_tabled_into(query, pac, enc, table, &mut steps);
+        steps
+    }
+
+    /// Generic core of [`forward_spectrum_tabled`]; see [`Self::forward_spectrum_into`].
+    pub(crate) fn forward_spectrum_tabled_into<S: StepSink + ?Sized>(
+        &self,
+        query: &[u8],
+        pac: &[u8],
+        enc: PacEncoding,
+        table: &impl KmerBounds,
+        sink: &mut S,
+    ) {
         if query.is_empty() {
-            return steps;
+            return;
         }
-        // Mirror `forward_spectrum`/`forward_spectrum_auto`: a packed pac that
-        // cannot hold its declared base count must fail closed before any walk
-        // (this public entry point is reachable directly, not only via `_auto`).
+        // Mirror `forward_spectrum_into`/`forward_spectrum_auto_into`: a packed
+        // pac that cannot hold its declared base count must fail closed before
+        // any walk (the `_tabled` entry point is reachable directly, not only via
+        // `_auto`).
         if let PacEncoding::Packed { num_bases } = enc {
             if validate_packed_pac(pac, num_bases, "forward_spectrum_tabled").is_err() {
-                return steps;
+                return;
             }
         }
         let sa_num = self.sa_num();
@@ -992,9 +1157,9 @@ impl LearnedIndex {
             let cc = table.hi(m, prefix);
             let occ = cc.saturating_sub(kk);
             if occ == 0 {
-                return steps; // maximal match is m-1 (mirrors forward_spectrum)
+                return; // maximal match is m-1 (mirrors forward_spectrum)
             }
-            push_step(&mut steps, &mut prev_occ, kk, occ, m as u64);
+            push_step(sink, &mut prev_occ, kk, occ, m as u64);
             lo = kk;
             hi = cc;
         }
@@ -1007,7 +1172,7 @@ impl LearnedIndex {
             // with one direct compare instead of per-depth boundary searches.
             if hi - lo == 1 {
                 self.push_unique_suffix_tail(
-                    &mut steps,
+                    sink,
                     &mut prev_occ,
                     lo,
                     query,
@@ -1016,9 +1181,10 @@ impl LearnedIndex {
                     enc,
                     l_pac,
                 );
-                return steps;
+                return;
             }
             let qm = &query[..m];
+            let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
             let mut a = lo;
             let mut b = hi;
             while a < b {
@@ -1026,8 +1192,9 @@ impl LearnedIndex {
                 let pos = self.sa_position_for(mid);
                 bump_probe();
                 let key = self.key_at(mid);
-                let (ref_less, _) =
-                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
+                let (ref_less, _) = compare_query_vs_suffix_2x_keyed_with_mask(
+                    qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
+                );
                 if ref_less {
                     a = mid + 1;
                 } else {
@@ -1042,8 +1209,9 @@ impl LearnedIndex {
                 let pos = self.sa_position_for(mid);
                 bump_probe();
                 let key = self.key_at(mid);
-                let (_, lcp) =
-                    compare_query_vs_suffix_2x_keyed(qm, query_key, key, pos, pac, enc, l_pac);
+                let (_, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
+                    qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
+                );
                 if (lcp as usize) >= qm.len() {
                     c = mid + 1;
                 } else {
@@ -1054,11 +1222,10 @@ impl LearnedIndex {
             if occ == 0 {
                 break;
             }
-            push_step(&mut steps, &mut prev_occ, kk, occ, m as u64);
+            push_step(sink, &mut prev_occ, kk, occ, m as u64);
             lo = kk;
             hi = c;
         }
-        steps
     }
 
     /// Forward spectrum using the loaded `.kmt` k-mer table when present
@@ -1071,18 +1238,45 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
     ) -> Vec<SmemStep> {
-        // Guard the packed pac before the `.kmt`-accelerated walk too (the
-        // non-kmt branch re-checks inside `forward_spectrum`; the check is a
-        // cheap no-op there).
-        if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "forward_spectrum").is_err() {
-                return Vec::new();
-            }
-        }
+        let mut steps: Vec<SmemStep> = Vec::with_capacity(SPECTRUM_STEPS_HINT);
+        self.forward_spectrum_auto_into(query, pac, enc, &mut steps);
+        steps
+    }
+
+    /// Generic core of [`forward_spectrum_auto`]: dispatches to the tabled or
+    /// full search and emits breakpoints into `sink`.
+    pub(crate) fn forward_spectrum_auto_into<S: StepSink + ?Sized>(
+        &self,
+        query: &[u8],
+        pac: &[u8],
+        enc: PacEncoding,
+        sink: &mut S,
+    ) {
+        // The packed-pac guard lives in the two delegates below
+        // (`forward_spectrum_tabled_into` / `forward_spectrum_into`); both run it
+        // before any walk, so a truncated buffer is rejected on every path here
+        // (including the one-shot `mem_search` sink) without re-validating twice.
         match &self.kmt {
-            Some(table) => self.forward_spectrum_tabled(query, pac, enc, table),
-            None => self.forward_spectrum(query, pac, enc),
+            Some(table) => self.forward_spectrum_tabled_into(query, pac, enc, table, sink),
+            None => self.forward_spectrum_into(query, pac, enc, sink),
         }
+    }
+
+    /// Fill `out` with the forward spectrum's breakpoints and return the TOTAL
+    /// number of steps. If the return value exceeds `out.len()`, the spectrum
+    /// overflowed the buffer: the first `out.len()` steps were written and the
+    /// caller should retry with a larger buffer. Lets the FFI write straight into
+    /// its output buffer with no intermediate `Vec`.
+    pub fn forward_spectrum_auto_fill(
+        &self,
+        query: &[u8],
+        pac: &[u8],
+        enc: PacEncoding,
+        out: &mut [SmemStep],
+    ) -> usize {
+        let mut sink = SliceStepSink::new(out);
+        self.forward_spectrum_auto_into(query, pac, enc, &mut sink);
+        sink.count()
     }
 
     /// One-shot maximal exact forward match: the longest prefix of `query` that
@@ -1091,7 +1285,10 @@ impl LearnedIndex {
     /// the k-mer table + occ==1 fast path. `match_len == 0` (and `sa_start/occ ==
     /// 0`) when `query` is empty or `query[0]` does not occur.
     pub fn mem_search(&self, query: &[u8], pac: &[u8], enc: PacEncoding) -> MemMatch {
-        match self.forward_spectrum_auto(query, pac, enc).last() {
+        // Track only the maximal step — no intermediate Vec for this one-shot call.
+        let mut sink = LastStepSink::default();
+        self.forward_spectrum_auto_into(query, pac, enc, &mut sink);
+        match sink.last() {
             Some(s) => MemMatch {
                 match_len: s.match_len,
                 sa_start: s.sa_start,
@@ -1136,10 +1333,13 @@ impl LearnedIndex {
                 occ: 0,
             };
         }
-        match self
-            .backward_spectrum(sa_start, occ_count, anchor_len, read, pivot, pac, enc)
-            .last()
-        {
+        // Track only the maximal left step — no intermediate Vec for this
+        // one-shot call (production `seed_override` is always `None`).
+        let mut sink = LastStepSink::default();
+        self.backward_spectrum_inner_into(
+            sa_start, occ_count, anchor_len, read, pivot, pac, enc, None, &mut sink,
+        );
+        match sink.last() {
             Some(s) => MemMatch {
                 match_len: s.match_len,
                 sa_start: s.sa_start,
@@ -1171,7 +1371,7 @@ impl LearnedIndex {
             lower: 0,
             left_ext: 0,
             fb: FbState::new(0, 0, 0, 0),
-            steps: Vec::new(),
+            steps: Vec::with_capacity(SPECTRUM_STEPS_HINT),
             finished: false,
         };
         // Fail closed on an out-of-range anchor window, mirroring the serial
@@ -1317,6 +1517,29 @@ impl LearnedIndex {
         self.backward_spectrum_inner(sa_start, occ_count, anchor_len, read, pivot, pac, enc, None)
     }
 
+    /// Fill `out` with the backward spectrum's left-extension steps and return
+    /// the TOTAL number of steps (overflow semantics as
+    /// [`forward_spectrum_auto_fill`](Self::forward_spectrum_auto_fill)). Lets the
+    /// FFI write straight into its output buffer with no intermediate `Vec`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_spectrum_fill(
+        &self,
+        sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        pac: &[u8],
+        enc: PacEncoding,
+        out: &mut [SmemStep],
+    ) -> usize {
+        let mut sink = SliceStepSink::new(out);
+        self.backward_spectrum_inner_into(
+            sa_start, occ_count, anchor_len, read, pivot, pac, enc, None, &mut sink,
+        );
+        sink.count()
+    }
+
     /// Shared driver for [`backward_spectrum`] and its test-only reference. The
     /// `seed_override` hook (test-only) forces a `(pred, err)` window in place of
     /// the model's `lookup`, so the proptest can prove the expand-on-miss recovery
@@ -1324,6 +1547,37 @@ impl LearnedIndex {
     /// `seed_override` is always `None` and the real model launch is used.
     #[allow(clippy::too_many_arguments)]
     fn backward_spectrum_inner(
+        &self,
+        sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        pac: &[u8],
+        enc: PacEncoding,
+        seed_override: Option<fn(u64) -> (u64, u64)>,
+    ) -> Vec<SmemStep> {
+        let mut steps: Vec<SmemStep> = Vec::with_capacity(SPECTRUM_STEPS_HINT);
+        self.backward_spectrum_inner_into(
+            sa_start,
+            occ_count,
+            anchor_len,
+            read,
+            pivot,
+            pac,
+            enc,
+            seed_override,
+            &mut steps,
+        );
+        steps
+    }
+
+    /// Generic core of [`backward_spectrum_inner`]: emits each left-extension
+    /// step into `sink` (no coalescing — every left step is a distinct step).
+    /// Shared by the `Vec`-returning path and the allocation-free
+    /// `mem_search_backward` (via [`LastStepSink`]).
+    #[allow(clippy::too_many_arguments)]
+    fn backward_spectrum_inner_into<S: StepSink + ?Sized>(
         &self,
         _sa_start: u64,
         occ_count: u64,
@@ -1333,10 +1587,10 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
         seed_override: Option<fn(u64) -> (u64, u64)>,
-    ) -> Vec<SmemStep> {
-        let mut steps = Vec::new();
+        sink: &mut S,
+    ) {
         if occ_count == 0 {
-            return steps;
+            return;
         }
         let sa_num = self.sa_num();
         let l_pac = self.l_pac();
@@ -1348,11 +1602,11 @@ impl LearnedIndex {
         // before any `pac_base_at` read.
         match pivot.checked_add(anchor_len_usize) {
             Some(end) if end <= read.len() => {}
-            _ => return steps,
+            _ => return,
         }
         if let PacEncoding::Packed { num_bases } = enc {
             if validate_packed_pac(pac, num_bases, "backward_spectrum").is_err() {
-                return steps;
+                return;
             }
         }
         let mut left_ext: u64 = 0;
@@ -1408,13 +1662,12 @@ impl LearnedIndex {
                 "c·Q interval empty after binary search: lower={lower} upper={upper}"
             );
             left_ext += 1;
-            steps.push(SmemStep {
+            sink.push_new(SmemStep {
                 sa_start: lower,
                 occ_count: upper - lower,
                 match_len: anchor_len + left_ext,
             });
         }
-        steps
     }
 
     /// Find the boundary index in `[domain_lo, domain_hi)` — the first index `i`
@@ -1455,20 +1708,36 @@ impl LearnedIndex {
             }
         }
         let mut span = (hi - lo).max(1);
+        // Each `go_right` is a cold SA probe. The left- and right-edge probes
+        // (`go_right(lo-1)` / `go_right(hi-1)`) only need re-evaluating when that
+        // edge actually moves, so cache each result and invalidate the entry for
+        // the edge that galloped. `go_right` is a deterministic function of the
+        // index, so a cached value equals what re-probing would return — same
+        // bracket, fewer probes.
+        let mut left_edge: Option<bool> = None; // cached go_right(lo - 1)
+        let mut right_edge: Option<bool> = None; // cached go_right(hi - 1)
         loop {
             // Left edge too far right: `go_right(lo-1)` is false => boundary is at or
             // left of `lo`. Gallop left so the bracket includes it.
-            if lo > domain_lo && !go_right(lo - 1) {
-                lo = lo.saturating_sub(span).max(domain_lo);
-                span = span.saturating_mul(2);
-                continue;
+            if lo > domain_lo {
+                let at_or_right = *left_edge.get_or_insert_with(|| go_right(lo - 1));
+                if !at_or_right {
+                    lo = lo.saturating_sub(span).max(domain_lo);
+                    span = span.saturating_mul(2);
+                    left_edge = None; // `lo` moved; the cached probe is stale.
+                    continue;
+                }
             }
             // Right edge too far left: `go_right(hi-1)` is true => boundary is at or
             // right of `hi`. Gallop right.
-            if hi < domain_hi && go_right(hi - 1) {
-                hi = hi.saturating_add(span).min(domain_hi);
-                span = span.saturating_mul(2);
-                continue;
+            if hi < domain_hi {
+                let at_or_left = *right_edge.get_or_insert_with(|| go_right(hi - 1));
+                if at_or_left {
+                    hi = hi.saturating_add(span).min(domain_hi);
+                    span = span.saturating_mul(2);
+                    right_edge = None; // `hi` moved; the cached probe is stale.
+                    continue;
+                }
             }
             break;
         }
@@ -2507,6 +2776,111 @@ mod keyed_tests {
         );
         // A single base that does occur => match_len >= 1.
         assert!(idx.mem_search(&[fwd[0]], &fwd, e).match_len >= 1);
+    }
+
+    #[test]
+    fn forward_spectrum_fill_matches_vec_and_reports_overflow() {
+        let fwd: Vec<u8> = (0..500u32)
+            .map(|i| ((i.wrapping_mul(40_503) >> 7) & 3) as u8)
+            .collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        // A query with several breakpoints (wide shallow → narrow deep).
+        let q = &fwd[40..130];
+        let want = idx.forward_spectrum_auto(q, &fwd, e);
+
+        // Ample buffer: fill writes exactly the Vec steps and returns the count.
+        let mut buf = vec![
+            SmemStep {
+                sa_start: 0,
+                occ_count: 0,
+                match_len: 0
+            };
+            want.len() + 4
+        ];
+        let n = idx.forward_spectrum_auto_fill(q, &fwd, e, &mut buf);
+        assert_eq!(n, want.len());
+        assert_eq!(&buf[..n], &want[..]);
+
+        // Undersized buffer: returns the full count (> capacity) and writes the
+        // prefix it could fit; the count is what the caller uses to retry.
+        if !want.is_empty() {
+            let cap = want.len() - 1;
+            let mut small = vec![
+                SmemStep {
+                    sa_start: 0,
+                    occ_count: 0,
+                    match_len: 0
+                };
+                cap
+            ];
+            let n2 = idx.forward_spectrum_auto_fill(q, &fwd, e, &mut small);
+            assert_eq!(n2, want.len(), "fill must report the total step count");
+            assert!(n2 > cap, "this case must overflow the buffer");
+        }
+    }
+
+    #[test]
+    fn backward_spectrum_fill_matches_vec_and_reports_overflow() {
+        let fwd: Vec<u8> = (0..500u32)
+            .map(|i| ((i.wrapping_mul(2_246_822_519) >> 9) & 3) as u8)
+            .collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        // Derive an anchor from a forward step, then left-extend it.
+        let read = &fwd;
+        let pivot = 120usize;
+        let anchor = idx.forward_spectrum(&read[pivot..], &fwd, e);
+        let a = *anchor.last().expect("anchor exists");
+        let want =
+            idx.backward_spectrum(a.sa_start, a.occ_count, a.match_len, read, pivot, &fwd, e);
+
+        // Ample buffer: fill writes exactly the Vec steps and returns the count.
+        let mut buf = vec![
+            SmemStep {
+                sa_start: 0,
+                occ_count: 0,
+                match_len: 0
+            };
+            want.len() + 4
+        ];
+        let n = idx.backward_spectrum_fill(
+            a.sa_start,
+            a.occ_count,
+            a.match_len,
+            read,
+            pivot,
+            &fwd,
+            e,
+            &mut buf,
+        );
+        assert_eq!(n, want.len());
+        assert_eq!(&buf[..n], &want[..]);
+
+        // Undersized buffer reports the total count even though it can't fit.
+        if !want.is_empty() {
+            let cap = want.len() - 1;
+            let mut small = vec![
+                SmemStep {
+                    sa_start: 0,
+                    occ_count: 0,
+                    match_len: 0
+                };
+                cap
+            ];
+            let n2 = idx.backward_spectrum_fill(
+                a.sa_start,
+                a.occ_count,
+                a.match_len,
+                read,
+                pivot,
+                &fwd,
+                e,
+                &mut small,
+            );
+            assert_eq!(n2, want.len(), "fill must report the total step count");
+            assert!(n2 > cap, "this case must overflow the buffer");
+        }
     }
 
     /// Reference-lifted queries extend to full depth and become unique, so they

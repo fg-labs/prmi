@@ -145,14 +145,74 @@ pub fn covered_by_bed(intervals: &[BedInterval], p: u64) -> bool {
     }
 }
 
+/// A bit-packed boolean vector marking N positions. Stores one bit per position
+/// instead of one byte (as `Vec<bool>` does) — an 8× memory reduction for the
+/// genome-scale doubled N bitmap on the materialized training path.
+///
+/// Bits beyond `len` (in the final word) are always clear, so [`NBitmap::any`]
+/// can scan whole words without masking.
+#[derive(Debug, Clone, Default)]
+pub struct NBitmap {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl NBitmap {
+    /// An all-clear (no N) bitmap covering `len` positions.
+    pub fn zeros(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    /// Number of positions the bitmap covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the bitmap covers no positions.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Mark position `i` as N (set its bit).
+    #[inline]
+    pub fn set(&mut self, i: usize) {
+        debug_assert!(
+            i < self.len,
+            "NBitmap::set index {i} out of range (len={})",
+            self.len
+        );
+        self.words[i >> 6] |= 1u64 << (i & 63);
+    }
+
+    /// Returns `true` if position `i` is marked N.
+    #[inline]
+    pub fn get(&self, i: usize) -> bool {
+        debug_assert!(
+            i < self.len,
+            "NBitmap::get index {i} out of range (len={})",
+            self.len
+        );
+        (self.words[i >> 6] >> (i & 63)) & 1 != 0
+    }
+
+    /// Returns `true` if any position is marked N. Scans 64 positions per word.
+    pub fn any(&self) -> bool {
+        self.words.iter().any(|&w| w != 0)
+    }
+}
+
 /// Return `true` if the window `bases[p..p+32]` contains any N position.
 ///
-/// Uses the `n_positions` bitmap produced during FASTA parsing. Handles
-/// short windows at the end of the reference gracefully by clamping.
+/// Uses the doubled-text [`NBitmap`] of N positions (built from the FASTA
+/// parser's N bitmap in `build_sidecar_core`). Handles short windows at the end
+/// of the reference gracefully by clamping.
 #[inline]
-pub fn n_in_window(n_positions: &[bool], p: usize) -> bool {
+pub fn n_in_window(n_positions: &NBitmap, p: usize) -> bool {
     let end = (p + 32).min(n_positions.len());
-    n_positions[p..end].iter().any(|&b| b)
+    (p..end).any(|i| n_positions.get(i))
 }
 
 /// Return `true` if `bases[p..p+32]` contains a run of the same base of
@@ -325,15 +385,15 @@ mod tests {
 
     #[test]
     fn n_in_window_no_n() {
-        let n_pos = vec![false; 64];
+        let n_pos = NBitmap::zeros(64);
         assert!(!n_in_window(&n_pos, 0));
         assert!(!n_in_window(&n_pos, 32));
     }
 
     #[test]
     fn n_in_window_n_at_start() {
-        let mut n_pos = vec![false; 64];
-        n_pos[0] = true;
+        let mut n_pos = NBitmap::zeros(64);
+        n_pos.set(0);
         assert!(n_in_window(&n_pos, 0));
         // position 32 doesn't cover position 0
         assert!(!n_in_window(&n_pos, 32));
@@ -341,8 +401,8 @@ mod tests {
 
     #[test]
     fn n_in_window_n_at_end_of_window() {
-        let mut n_pos = vec![false; 64];
-        n_pos[31] = true; // last base of the window [0..32)
+        let mut n_pos = NBitmap::zeros(64);
+        n_pos.set(31); // last base of the window [0..32)
         assert!(n_in_window(&n_pos, 0));
         // window [32..64): position 31 is outside
         assert!(!n_in_window(&n_pos, 32));
@@ -351,9 +411,29 @@ mod tests {
     #[test]
     fn n_in_window_clamps_at_end() {
         // Short reference: 10 bases, all N
-        let n_pos = vec![true; 10];
+        let mut n_pos = NBitmap::zeros(10);
+        for i in 0..10 {
+            n_pos.set(i);
+        }
         assert!(n_in_window(&n_pos, 0)); // window is [0..10) — all N
         assert!(n_in_window(&n_pos, 5)); // window is [5..10) — all N
+    }
+
+    #[test]
+    fn nbitmap_get_set_any() {
+        let mut b = NBitmap::zeros(130); // spans 3 words (64+64+2)
+        assert_eq!(b.len(), 130);
+        assert!(!b.any());
+        assert!(!b.get(0) && !b.get(63) && !b.get(64) && !b.get(129));
+        b.set(63);
+        b.set(64);
+        b.set(129);
+        assert!(b.any());
+        assert!(b.get(63) && b.get(64) && b.get(129));
+        assert!(!b.get(62) && !b.get(65) && !b.get(128));
+        // The empty bitmap reports no N and is empty.
+        let e = NBitmap::zeros(0);
+        assert!(e.is_empty() && !e.any());
     }
 
     // --- homopolymer_in_window -----------------------------------------------
