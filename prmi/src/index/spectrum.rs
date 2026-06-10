@@ -2109,10 +2109,66 @@ impl LearnedIndex {
         steps
     }
 
-    /// Generic core of [`backward_spectrum_inner`]: emits each left-extension
-    /// step into `sink` (no coalescing — every left step is a distinct step).
-    /// Shared by the `Vec`-returning path and the allocation-free
-    /// `mem_search_backward` (via [`LastStepSink`]).
+    /// Locate the SA interval `[lower, upper)` of one left-extended backward
+    /// pattern `p_slice` (the matched span with one more base prepended), via two
+    /// boundary searches. Returns `None` when the interval is empty (the
+    /// extension cannot continue). Drives the per-base backward TRACE
+    /// ([`backward_spectrum_inner_into`]); the one-shot maximal
+    /// ([`mem_search_backward`]) runs that same per-base loop with a last-step
+    /// sink and keeps only its deepest step.
+    ///
+    /// The 32-mer key is recomputed per call: a base is prepended each step, so
+    /// the first 32 bases change; the keyed compare masks it to `p_slice.len()`.
+    /// [`find_boundary`](Self::find_boundary) is seed-independent — the seed sets
+    /// only the probe count, never the interval returned — so each seed is chosen
+    /// for the fewest probes: the LOWER search uses the model window
+    /// `[pred - err, pred + err + 1)` (binary search ~log2(2·err)); the UPPER
+    /// search is unit-seeded at `lower` and gallops right (~2·log2(occ) probes).
+    /// `err` therefore sizes only the lower seed, not the returned interval.
+    #[allow(clippy::too_many_arguments)]
+    fn backward_locate_step(
+        &self,
+        p_slice: &[u8],
+        sa_num: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+        seed_override: Option<fn(u64) -> (u64, u64)>,
+    ) -> Option<(u64, u64)> {
+        let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+        let (pred, err) = match seed_override {
+            Some(f) => f(p_key),
+            None => self.lookup(p_key),
+        };
+        // Lower bound: first SA index whose suffix is >= P (where `ref_less` turns
+        // false). Seed with the model error window `[pred - err, pred + err + 1)`.
+        // The one-shot fast path now peels off unique/collapsing anchors, so this
+        // loop runs only while the interval is genuinely WIDE — where the error
+        // window brackets the boundary directly (binary search ~log2(2·err))
+        // and a unit gallop from `pred` would instead step out across the same
+        // distance. Upper bound: first index NOT sharing the full P prefix,
+        // unit-seeded at `lower` and galloped right (~2·log2(occ) probes, beating a
+        // gallop back from the model's loose right edge).
+        let win_lo = pred.saturating_sub(err);
+        let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
+        let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
+            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+        });
+        let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
+            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+        });
+        if upper <= lower {
+            None
+        } else {
+            Some((lower, upper))
+        }
+    }
+
+    /// Generic core of [`backward_spectrum_inner`]: emits each left-extension step
+    /// into `sink` (no coalescing — every left step is a distinct step). Drives the
+    /// full backward TRACE. The one-shot maximal
+    /// ([`mem_search_backward`](Self::mem_search_backward)) reuses this same
+    /// per-base loop with a last-step sink, keeping only the deepest step.
     #[allow(clippy::too_many_arguments)]
     fn backward_spectrum_inner_into<S: StepSink + ?Sized>(
         &self,
@@ -2156,48 +2212,14 @@ impl LearnedIndex {
             // Left-extended query P: prepend the new base to the matched span.
             // Start index is `pivot - (left_ext + 1)` (>= 0 by the loop condition),
             // end is `pivot + anchor_len` (exclusive); length = anchor_len+left_ext+1.
-            let p_start = pivot - 1 - left_ext as usize;
-            let p_end = pivot + anchor_len_usize;
-            let p_slice = &read[p_start..p_end];
-            // The pattern's first 32 bases CHANGE each left step (a base is
-            // prepended), so recompute its 32-mer key ONCE PER STEP (not per
-            // probe). The keyed compare masks it to `p_slice.len()`.
-            let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
-
-            // Model launch: the 32-mer-prefix window `[pred - err, pred + err + 1)`
-            // brackets where `P` sorts in the SA. The window is a HINT only; the
-            // bounded searches below expand outward on a window-edge miss, so a
-            // wrong/loose `(pred, err)` still yields the TRUE interval.
-            let (pred, err) = match seed_override {
-                Some(f) => f(p_key),
-                None => self.lookup(p_key),
-            };
-            let win_lo = pred.saturating_sub(err);
-            let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
-
-            // Lower bound over [0, sa_num): first SA index whose suffix is >= P
-            // (the first index where `ref_less` is false). Seeded by the window's
-            // left edge; expand-on-miss recovers the true boundary on any seed.
-            let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
-                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
-            });
-            // Upper bound over [lower, sa_num): first SA index NOT sharing the full
-            // P prefix (the first index where `shares_prefix` is false). Seeded by
-            // the window's right edge; expansion recovers the true boundary.
-            let upper = self.find_boundary(lower, sa_num, win_hi, win_hi, |mid| {
-                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
-            });
-
-            if upper <= lower {
-                break; // cannot extend further left
-            }
-            // The binary search returns a structurally contiguous [lower, upper);
-            // a recorded step must therefore be non-empty. Keep this as an
-            // always-on guard on the byte-identity-critical path.
-            assert!(
-                upper > lower,
-                "c·Q interval empty after binary search: lower={lower} upper={upper}"
-            );
+            let p_slice = &read[pivot - 1 - left_ext as usize..pivot + anchor_len_usize];
+            // A structurally contiguous interval (`upper > lower`) or `None` when
+            // the extension cannot continue — `Some` guarantees a non-empty step.
+            let (lower, upper) =
+                match self.backward_locate_step(p_slice, sa_num, pac, enc, l_pac, seed_override) {
+                    Some(interval) => interval,
+                    None => break, // cannot extend further left
+                };
             left_ext += 1;
             sink.push_new(SmemStep {
                 sa_start: lower,
