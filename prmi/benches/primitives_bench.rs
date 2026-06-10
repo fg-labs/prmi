@@ -1,0 +1,227 @@
+// Copyright (C) 2026 Fulcrum Genomics LLC
+// SPDX-License-Identifier: MIT
+
+//! Criterion benchmarks for the cheap O(1)/O(log) FFI primitives the bwa-meme
+//! consumer calls outside the main search, one or more times per pivot:
+//!
+//! - `prmi_isa_at` → [`LearnedIndex::isa_at`] (inverse-SA, the launch-hint source
+//!   for the `est_hint` path).
+//! - `prmi_sa_positions` → [`LearnedIndex::sa_positions`] (resolve a contiguous SA
+//!   interval → genomic positions).
+//! - `prmi_reverse_complement_key` → [`prmi::encoding::reverse_complement_key`]
+//!   (both-strand lookup, the word-level bit-swap).
+//! - `prmi_reverse_complement_2bit` → [`prmi::encoding::reverse_complement_2bit`].
+//! - `prmi_tokenize_32mer` → [`prmi::encoding::tokenize_32mer`].
+//!
+//! (`prmi_sa_positions_strided` and `prmi_lookup` are benched in
+//! `spectrum_bench.rs` / `lookup_bench.rs` respectively.)
+//!
+//! Each primitive is too cheap to time one call at a time (criterion's per-iter
+//! overhead would dominate), so every bench loops over a fixed corpus of inputs
+//! and reports per-element throughput. The index-backed primitives use random
+//! access into the SA to exercise realistic cache behavior; reference size is
+//! env-tunable via `PRMI_BENCH_REFLEN` (default 2_000_000).
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use prmi::encoding::{reverse_complement_2bit, reverse_complement_key, tokenize_32mer, KMER_LEN};
+use prmi::index::LearnedIndex;
+use prmi::train::build_sidecar_with_config;
+use prmi::train::config::{MemoryMode, TrainerConfig};
+use tempfile::TempDir;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Corpus size for the loop-batched primitive benches.
+const N: usize = 1024;
+
+/// Deterministic ACGT bases (0..=3) via a PCG-style LCG.
+fn synth_bases(n: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 61) & 3) as u8
+        })
+        .collect()
+}
+
+/// Build a mode-2 `--with-isa` sidecar over a synthetic reference and return the
+/// tempdir + index. `.isa` is required for the `isa_at` bench.
+fn build_index() -> (TempDir, LearnedIndex) {
+    let ref_len = env_usize("PRMI_BENCH_REFLEN", 2_000_000);
+    let bases = synth_bases(ref_len, 0x2545_F491_4F6C_DD1D);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fa = dir.path().join("ref.fa");
+    {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&fa).unwrap());
+        writeln!(w, ">bench").unwrap();
+        let alphabet = [b'A', b'C', b'G', b'T'];
+        for chunk in bases.chunks(60) {
+            let line: Vec<u8> = chunk.iter().map(|&b| alphabet[b as usize]).collect();
+            w.write_all(&line).unwrap();
+            w.write_all(b"\n").unwrap();
+        }
+    }
+    let prefix = dir.path().join("ref.prmi");
+    let cfg = TrainerConfig::default()
+        .with_memory_mode(MemoryMode::Mode2)
+        .with_isa(true);
+    build_sidecar_with_config(&fa, &prefix, None, Default::default(), 0, Some(cfg))
+        .expect("build sidecar");
+    let idx = LearnedIndex::open(&prefix).expect("open index");
+    assert!(idx.has_isa(), "primitives bench fixture needs .isa");
+    (dir, idx)
+}
+
+// ── Index-backed primitives ─────────────────────────────────────────────────
+
+fn bench_isa_at(c: &mut Criterion, idx: &LearnedIndex) {
+    let sa_num = idx.sa_num();
+    // A scattered set of reference positions (random access into the inverse SA).
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let refpos: Vec<u64> = (0..N)
+        .map(|_| {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            x % sa_num
+        })
+        .collect();
+
+    let mut g = c.benchmark_group("isa_at");
+    g.throughput(Throughput::Elements(refpos.len() as u64));
+    g.bench_function("random", |b| {
+        b.iter(|| {
+            for &p in &refpos {
+                black_box(idx.isa_at(black_box(p)));
+            }
+        });
+    });
+    g.finish();
+}
+
+fn bench_sa_positions(c: &mut Criterion, idx: &LearnedIndex) {
+    let sa_num = idx.sa_num();
+    // `sa_position_for`: scattered single lookups (the per-element cost the
+    // consumer pays when resolving a refpos one at a time).
+    let mut x = 0xD1B5_4A32_D192_ED03u64;
+    let single: Vec<u64> = (0..N)
+        .map(|_| {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            x % sa_num
+        })
+        .collect();
+
+    let mut g = c.benchmark_group("sa_positions");
+    g.throughput(Throughput::Elements(N as u64));
+    g.bench_function("sa_position_for/scattered", |b| {
+        b.iter(|| {
+            for &i in &single {
+                black_box(idx.sa_position_for(black_box(i)));
+            }
+        });
+    });
+
+    // `sa_positions`: resolve a contiguous block (an SA interval) in one call —
+    // the shape used to materialize all occurrences of a seed.
+    for &block in &[16usize, 256usize] {
+        if sa_num < block as u64 {
+            continue; // reference too small for this block size (e.g. tiny PRMI_BENCH_REFLEN)
+        }
+        let start = sa_num.saturating_sub(block as u64) / 3; // arbitrary in-range start
+        let mut out = vec![0u64; block];
+        g.throughput(Throughput::Elements(block as u64));
+        g.bench_with_input(BenchmarkId::new("block", block), &block, |b, _| {
+            b.iter(|| {
+                idx.sa_positions(black_box(start), black_box(&mut out))
+                    .expect("in range");
+                black_box(&out);
+            });
+        });
+    }
+    g.finish();
+}
+
+// ── Encoding primitives (no index needed) ───────────────────────────────────
+
+fn bench_reverse_complement_key(c: &mut Criterion) {
+    // A corpus of random 64-bit words treated as packed 32-mer keys.
+    let mut x = 0x0123_4567_89AB_CDEFu64;
+    let keys: Vec<u64> = (0..N)
+        .map(|_| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            x
+        })
+        .collect();
+
+    let mut g = c.benchmark_group("reverse_complement_key");
+    g.throughput(Throughput::Elements(keys.len() as u64));
+    for &len in &[16usize, KMER_LEN] {
+        g.bench_with_input(BenchmarkId::new("len", len), &len, |b, &len| {
+            b.iter(|| {
+                for &k in &keys {
+                    black_box(reverse_complement_key(black_box(k), len));
+                }
+            });
+        });
+    }
+    g.finish();
+}
+
+fn bench_reverse_complement_2bit(c: &mut Criterion) {
+    let mut g = c.benchmark_group("reverse_complement_2bit");
+    for &len in &[16usize, 32usize, 64usize] {
+        // One representative base slice per length (values 0..=3).
+        let bases = synth_bases(len, 0xABCD_1234_5678_9F01 ^ len as u64);
+        g.throughput(Throughput::Elements(len as u64));
+        g.bench_with_input(BenchmarkId::new("len", len), &bases, |b, bases| {
+            b.iter(|| {
+                black_box(reverse_complement_2bit(black_box(bases)));
+            });
+        });
+    }
+    g.finish();
+}
+
+fn bench_tokenize_32mer(c: &mut Criterion) {
+    // A corpus of 32-base windows over a synthetic backbone.
+    let backbone = synth_bases(N + KMER_LEN, 0x5DEE_CE66_D7A0_0DAFu64);
+    let windows: Vec<&[u8]> = (0..N).map(|i| &backbone[i..i + KMER_LEN]).collect();
+
+    let mut g = c.benchmark_group("tokenize_32mer");
+    g.throughput(Throughput::Elements(windows.len() as u64));
+    g.bench_function("len32", |b| {
+        b.iter(|| {
+            for w in &windows {
+                black_box(tokenize_32mer(black_box(w), KMER_LEN));
+            }
+        });
+    });
+    g.finish();
+}
+
+fn bench_all(c: &mut Criterion) {
+    let (_dir, idx) = build_index();
+    eprintln!(
+        "[primitives_bench] sa_num={} l_pac={} has_isa={}",
+        idx.sa_num(),
+        idx.l_pac(),
+        idx.has_isa(),
+    );
+    bench_isa_at(c, &idx);
+    bench_sa_positions(c, &idx);
+    bench_reverse_complement_key(c);
+    bench_reverse_complement_2bit(c);
+    bench_tokenize_32mer(c);
+}
+
+criterion_group!(benches, bench_all);
+criterion_main!(benches);

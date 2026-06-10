@@ -835,6 +835,19 @@ fn push_step<S: StepSink + ?Sized>(
     }
 }
 
+/// Lex index of the first `m` bases (`0..=3`) as a k-mer, MSB-first — the same
+/// convention [`LearnedIndex::build_kmer_table`] uses for its `w` axis
+/// (`bases[j] == (w >> (2 * (m - 1 - j))) & 0b11`). Used to look a left-extended
+/// backward pattern's `m`-mer prefix up in the k-mer table for a probe-free seed.
+#[inline]
+fn kmer_lex_index(bases: &[u8], m: usize) -> u64 {
+    let mut w = 0u64;
+    for &b in &bases[..m] {
+        w = (w << 2) | (u64::from(b) & 0b11);
+    }
+    w
+}
+
 impl LearnedIndex {
     /// Emit the maximal forward match of a UNIQUE suffix as one coalesced step,
     /// using a single SA probe. Precondition: the active narrowing interval is
@@ -1279,6 +1292,149 @@ impl LearnedIndex {
         sink.count()
     }
 
+    /// One LCP probe: how many leading bases of `query` match the suffix at SA
+    /// index `mid` (`lcp(query, suffix[mid])`, capped at `query.len()`). One cold
+    /// SA-position read plus the keyed 2× compare — the boundary-neighbour probe
+    /// the hinted-spectrum parent walk uses to find the next breakpoint depth.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn lcp_query_suffix(
+        &self,
+        query: &[u8],
+        query_key: u64,
+        mid: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) -> u64 {
+        bump_probe();
+        let pos = self.sa_position_for(mid);
+        let key = self.key_at(mid);
+        let (_, lcp) =
+            compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
+        u64::from(lcp)
+    }
+
+    /// PROTOTYPE — forward spectrum launched from an EXACT SA-index `hint`,
+    /// producing the SAME [`SmemStep`] breakpoint trace as [`forward_spectrum`]
+    /// but via a parent-interval (suffix-tree-parent) walk instead of cold
+    /// per-depth narrowing. This is the trace-returning twin of
+    /// [`mem_search_from_hint`](Self::mem_search_from_hint): that method keeps
+    /// only the maximal interval; this keeps EVERY breakpoint, so a caller can
+    /// drive `min_intv`-gated multi-anchor emission (BWA-MEME reseed) from the
+    /// `no_search` launch.
+    ///
+    /// Mechanism — deep → shallow, `O(number of breakpoints)` probes (not
+    /// `O(match_len)`, the trap a naive per-depth re-narrowing falls into by
+    /// re-probing the unique tail):
+    /// 1. Confirm `L = LCP(query, suffix[hint])` and recover the maximal interval
+    ///    `[lo, hi)` by two boundary gallops seeded at `hint` — exactly as
+    ///    [`mem_search_from_hint`].
+    /// 2. Emit the band `(lo, hi - lo, L)`. The parent band's deepest depth is
+    ///    `m' = max(LCP(query, suffix[lo - 1]), LCP(query, suffix[hi]))` — the two
+    ///    boundary-neighbour suffixes, two probes. Gallop `[lo, hi)` outward at
+    ///    `query[..m']` to the parent interval and repeat until `m' == 0` (the
+    ///    depth-1 band — no shallower breakpoint).
+    ///
+    /// Bands are collected deep→shallow then reversed to ascending `match_len`,
+    /// matching [`forward_spectrum`]'s order. Nested narrowing makes `occ`
+    /// strictly decreasing, so one band == one `push_step` breakpoint: the traces
+    /// are byte-identical when `hint` lies in the maximal interval (the same
+    /// contract as [`mem_search_from_hint`] — a wrong hint yields a shorter
+    /// divergent trace the caller detects via continued-match; verified by
+    /// `forward_spectrum_from_hint_equals_cold`).
+    ///
+    /// Correctness does NOT depend on the gallop seeds (they only set probe
+    /// count): every boundary is the deterministic flip of the same
+    /// `ref_less`/`shares_prefix` predicates [`forward_spectrum`] uses, searched
+    /// over the same global SA, so the located intervals are identical.
+    ///
+    /// Falls back to the cold [`forward_spectrum`] for `hint == 0`, an
+    /// out-of-range hint, or an empty query.
+    pub fn forward_spectrum_from_hint(
+        &self,
+        query: &[u8],
+        hint: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<SmemStep> {
+        let sa_num = self.sa_num();
+        if query.is_empty() || hint == 0 || hint >= sa_num {
+            return self.forward_spectrum(query, pac, enc);
+        }
+        let l_pac = self.l_pac();
+        let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+
+        // (1) Confirm the maximal match length at the hint.
+        let max_len = {
+            let pos = self.sa_position_for(hint);
+            bump_probe();
+            let key = self.key_at(hint);
+            let (_, lcp) =
+                compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
+            lcp as usize
+        };
+        if max_len == 0 {
+            return Vec::new(); // hint shares no prefix with the query (contract violation)
+        }
+
+        // Recover the maximal interval [lo, hi) at depth max_len, seeded at hint.
+        let qm = &query[..max_len];
+        let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+        let mut lo = self.find_boundary(0, sa_num, hint, hint + 1, |mid| {
+            self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+        });
+        let mut hi = self.find_boundary(lo, sa_num, hint, hint + 1, |mid| {
+            self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+        });
+        let mut band_deepest = max_len as u64;
+
+        // (2) Deep → shallow parent-interval walk: one band per breakpoint.
+        let mut bands: Vec<SmemStep> = Vec::with_capacity(SPECTRUM_STEPS_HINT);
+        loop {
+            bands.push(SmemStep {
+                sa_start: lo,
+                occ_count: hi - lo,
+                match_len: band_deepest,
+            });
+
+            // Next-shallower breakpoint depth = max LCP of the two boundary
+            // neighbours (the suffixes just outside [lo, hi)).
+            let lcp_left = if lo > 0 {
+                self.lcp_query_suffix(query, query_key, lo - 1, pac, enc, l_pac)
+            } else {
+                0
+            };
+            let lcp_right = if hi < sa_num {
+                self.lcp_query_suffix(query, query_key, hi, pac, enc, l_pac)
+            } else {
+                0
+            };
+            let m_parent = lcp_left.max(lcp_right);
+            if m_parent == 0 {
+                break; // current band's shallowest depth is 1: no shallower breakpoint
+            }
+
+            // Parent interval at depth m_parent: gallop [lo, hi) outward. The
+            // parent contains the current interval, so its lower bound is ≤ lo
+            // (domain [0, lo + 1)) and its upper bound is ≥ hi.
+            let pqm = &query[..m_parent as usize];
+            let pqm_key = tokenize_32mer(pqm, pqm.len().min(KMER_LEN));
+            let new_lo = self.find_boundary(0, lo + 1, lo, lo + 1, |mid| {
+                self.ref_less(pqm, pqm_key, mid, pac, enc, l_pac)
+            });
+            let new_hi = self.find_boundary(new_lo, sa_num, hi.saturating_sub(1), hi, |mid| {
+                self.shares_prefix(pqm, pqm_key, mid, pac, enc, l_pac)
+            });
+            lo = new_lo;
+            hi = new_hi;
+            band_deepest = m_parent;
+        }
+
+        bands.reverse(); // ascending match_len, matching forward_spectrum's order
+        bands
+    }
+
     /// One-shot maximal exact forward match: the longest prefix of `query` that
     /// occurs in the reference, with its SA interval. Equals the MAXIMAL (deepest)
     /// step of [`forward_spectrum_auto`] — byte-identical by construction; reuses
@@ -1557,6 +1713,178 @@ impl LearnedIndex {
             sa_start: lower,
             occ: upper.saturating_sub(lower),
         }
+    }
+
+    /// PROTOTYPE — cold backward spectrum whose per-step seed window comes from
+    /// the k-mer table instead of the learned-model `lookup`. Produces the SAME
+    /// `SmemStep` trace as [`backward_spectrum`] — byte-identical by
+    /// [`find_boundary`](Self::find_boundary)'s seed-independence (the seed only
+    /// sets probe count, never the boundary it returns) — but works WITHOUT a
+    /// hint, the bwa-meme reseed case (first left-extension of each anchor, no
+    /// carried refpos). The question it answers: does the table's exact k-mer
+    /// interval beat the model window on the un-accelerated backward direction,
+    /// the way `.kmt` accelerated forward?
+    ///
+    /// Identical loop to [`backward_spectrum_inner_into`](Self::backward_spectrum_inner_into)
+    /// except the seed source; `forward_spectrum_from_hint_equals_cold`'s backward
+    /// twin (`backward_spectrum_tabled_equals_cold`) is the divergence guard.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_spectrum_tabled(
+        &self,
+        _sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        pac: &[u8],
+        enc: PacEncoding,
+        table: &impl KmerBounds,
+    ) -> Vec<SmemStep> {
+        let mut steps: Vec<SmemStep> = Vec::with_capacity(SPECTRUM_STEPS_HINT);
+        if occ_count == 0 {
+            return steps;
+        }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        // Checked: a large caller-provided `anchor_len` must not wrap when
+        // narrowed to usize or added to `pivot` (the `read[p_start..anchor_end]`
+        // slice below would otherwise panic on an out-of-range bound). Fail
+        // closed, mirroring `mem_search_backward_from_hint`.
+        let anchor_len_usize = match usize::try_from(anchor_len) {
+            Ok(v) => v,
+            Err(_) => return steps,
+        };
+        let anchor_end = match pivot.checked_add(anchor_len_usize) {
+            Some(v) => v,
+            None => return steps,
+        };
+        if anchor_end > read.len() {
+            return steps;
+        }
+        let k = table.k() as usize;
+        let mut left_ext: u64 = 0;
+
+        while (left_ext as usize) < pivot {
+            let c = read[pivot - 1 - left_ext as usize];
+            if c >= 4 {
+                break; // ambiguous read base
+            }
+            let p_start = pivot - 1 - left_ext as usize;
+            let p_slice = &read[p_start..anchor_end];
+            let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+
+            // Seed window from the k-mer table: the EXACT SA interval of P's first
+            // `min(|P|, k)` bases (a superset of P's interval — P extends it), with
+            // zero SA probes. Replaces the model `lookup`'s `[pred-err, pred+err+1)`.
+            let m = p_slice.len().min(k);
+            let w = kmer_lex_index(p_slice, m);
+            let (win_lo, win_hi) = (table.lo(m, w), table.hi(m, w));
+
+            let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
+                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+            });
+            let upper = self.find_boundary(lower, sa_num, win_hi, win_hi, |mid| {
+                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+            });
+
+            if upper <= lower {
+                break; // cannot extend further left
+            }
+            left_ext += 1;
+            steps.push(SmemStep {
+                sa_start: lower,
+                occ_count: upper - lower,
+                match_len: anchor_len + left_ext,
+            });
+        }
+        steps
+    }
+
+    /// PROTOTYPE — backward spectrum launched from an EXACT SA-index `hint` (the
+    /// anchor's inverse-SA index), producing the SAME `SmemStep` trace as
+    /// [`backward_spectrum`] but via a direct leftward reference walk with each
+    /// left step's interval seeded exactly from the inverse SA — the full-trace
+    /// twin of [`mem_search_backward_from_hint`](Self::mem_search_backward_from_hint),
+    /// which keeps only the maximal step.
+    ///
+    /// Mechanism: walk left while `read[pivot-1-k]` matches the reference base at
+    /// `p_anchor-1-k` (no SA search for the walk itself); at each extended step
+    /// recover the interval of `P_k = read[pivot-k .. pivot+anchor_len]` with two
+    /// boundary searches tight-seeded from `isa_at(p_anchor-k)` (the exact SA index
+    /// of `P_k` at this locus; a loose seed = `hint` without `.isa`). Emits one
+    /// step per left base, exactly as cold `backward_spectrum`.
+    ///
+    /// Byte-identical to [`backward_spectrum`] when `hint` is at the maximal-
+    /// extension locus (same contract as [`mem_search_backward_from_hint`]): the
+    /// walk then extends exactly as far as cold's interval-non-empty loop, and each
+    /// step recovers the same pattern's interval (`find_boundary` is seed-
+    /// independent). A diverged hint yields a shorter trace the caller detects via
+    /// continued-match. Verified by `backward_spectrum_from_hint_equals_cold`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_spectrum_from_hint(
+        &self,
+        read: &[u8],
+        pivot: usize,
+        anchor_len: u64,
+        hint: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<SmemStep> {
+        let mut steps: Vec<SmemStep> = Vec::with_capacity(SPECTRUM_STEPS_HINT);
+        let sa_num = self.sa_num();
+        // Checked: fail closed instead of wrapping `pivot + anchor_len` (a wrapped
+        // bound would slip past the `> read.len()` guard). Mirrors
+        // `mem_search_backward_from_hint`.
+        let anchor_len_usize = match usize::try_from(anchor_len) {
+            Ok(v) => v,
+            Err(_) => return steps,
+        };
+        let anchor_end = match pivot.checked_add(anchor_len_usize) {
+            Some(v) => v,
+            None => return steps,
+        };
+        if hint == 0 || hint >= sa_num || anchor_end > read.len() {
+            return steps;
+        }
+        let l_pac = self.l_pac();
+        let p_anchor = self.sa_position_for(hint);
+
+        let mut left_ext: u64 = 0;
+        while (left_ext as usize) < pivot && p_anchor > left_ext {
+            let read_base = read[pivot - 1 - left_ext as usize];
+            if read_base >= 4 {
+                break; // ambiguous read base
+            }
+            // Extend only while the read matches the reference at the hinted locus.
+            let ref_pos = p_anchor - 1 - left_ext;
+            match doubled_base_at(pac, enc, l_pac, ref_pos) {
+                Some(b) if b == read_base => {}
+                _ => break,
+            }
+            left_ext += 1;
+
+            // Interval of P = read[pivot-left_ext .. anchor_end], at text position
+            // `p_anchor - left_ext`, tight-seeded from the inverse SA.
+            let p_start = pivot - left_ext as usize;
+            let p_slice = &read[p_start..anchor_end];
+            let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+            let seed = self.isa_at(p_anchor - left_ext).unwrap_or(hint);
+            let lower = self.find_boundary(0, sa_num, seed, seed + 1, |mid| {
+                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+            });
+            let upper = self.find_boundary(lower, sa_num, seed, seed + 1, |mid| {
+                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+            });
+            if upper <= lower {
+                break; // diverged hint: pattern absent (shorter trace, caller's gate)
+            }
+            steps.push(SmemStep {
+                sa_start: lower,
+                occ_count: upper - lower,
+                match_len: anchor_len + left_ext,
+            });
+        }
+        steps
     }
 
     /// Start a stepper; performs the first model lookup + Lower `FbState` init, or
@@ -3034,6 +3362,39 @@ mod keyed_tests {
             }
         }
 
+        /// The hinted forward SPECTRUM (`forward_spectrum_from_hint`) MUST be
+        /// byte-identical to the cold `forward_spectrum` trace for EVERY SA index
+        /// in the maximal interval — the parent-interval walk changes speed, never
+        /// the trace. The hard gate for the trace-returning no_search path that
+        /// the bwa-meme reseed needs (min_intv-gated multi-anchor emission).
+        #[test]
+        fn forward_spectrum_from_hint_equals_cold(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..50), 1..6),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for q in &queries {
+                let cold = idx.forward_spectrum(q, &fwd, e);
+                let maximal = idx.mem_search(q, &fwd, e);
+                if maximal.match_len == 0 {
+                    // No match → no interior hint exists; hint==0 falls back to cold.
+                    prop_assert_eq!(idx.forward_spectrum_from_hint(q, 0, &fwd, e), cold);
+                    continue;
+                }
+                // Every SA index in the maximal interval is a valid launch hint and
+                // must reproduce the identical breakpoint trace.
+                for off in 0..maximal.occ {
+                    let hint = maximal.sa_start + off;
+                    let hinted = idx.forward_spectrum_from_hint(q, hint, &fwd, e);
+                    prop_assert_eq!(
+                        hinted, cold.clone(),
+                        "hinted spectrum != cold at hint={}, query={:?}", hint, q
+                    );
+                }
+            }
+        }
+
         /// Backward `mem_search_backward_from_hint` == from-scratch
         /// `mem_search_backward` when the hint is at the maximal-extension locus.
         /// `build_mode2` builds NO `.isa`, so this also exercises the loose-seed
@@ -3073,6 +3434,155 @@ mod keyed_tests {
                 }
             }
         }
+
+        /// The hinted backward SPECTRUM (`backward_spectrum_from_hint`, full trace)
+        /// MUST be byte-identical to cold `backward_spectrum` when the hint is at
+        /// the maximal-extension locus — every left step, not just the maximal.
+        /// The hard gate for the trace-returning hinted left extension.
+        #[test]
+        fn backward_spectrum_from_hint_equals_cold(
+            fwd in prop::collection::vec(0u8..=3, 80..220),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let sa_num = idx.sa_num();
+            let w = 50usize;
+            for s in (0..fwd.len().saturating_sub(w)).step_by(23) {
+                let read = &fwd[s..s + w];
+                for pivot in [12usize, 24, 36] {
+                    let anchor = idx.mem_search(&read[pivot..], &fwd, e);
+                    if anchor.match_len == 0 {
+                        continue;
+                    }
+                    let cold = idx.backward_spectrum(
+                        anchor.sa_start, anchor.occ, anchor.match_len, read, pivot, &fwd, e,
+                    );
+                    let refpos = (s + pivot) as u64;
+                    let hint = (0..sa_num).find(|&i| idx.sa_position_for(i) == refpos).unwrap();
+                    let hinted = idx.backward_spectrum_from_hint(
+                        read, pivot, anchor.match_len, hint, &fwd, e,
+                    );
+                    prop_assert_eq!(
+                        hinted, cold,
+                        "backward hinted spectrum != cold at s={}, pivot={}", s, pivot
+                    );
+                }
+            }
+        }
+
+        /// STALE-HINT SAFETY (the gating contract for the bwa-meme reseed): a
+        /// WRONG `hint` to `mem_search_backward_from_hint` can only UNDER-extend or
+        /// return `occ == 0` — it can NEVER return a full-length-but-wrong interval
+        /// that would pass a length check. Two invariants, over random wrong hints:
+        ///   (a) self-consistency: when `occ > 0`, the returned `(sa_start, occ)` is
+        ///       EXACTLY the true SA interval of the read substring of length
+        ///       `match_len` (`mem_search` of that substring), so `match_len` and
+        ///       the interval can never disagree; and
+        ///   (b) never-longer: `match_len <= ` the cold (`est_hint = 0`) maximal.
+        /// Together ⇒ a consumer LENGTH check (hinted `match_len == expected`) is a
+        /// sufficient stale-hint gate: equal length forces the identical substring,
+        /// hence the identical, correct interval.
+        #[test]
+        fn backward_stale_hint_is_self_consistent_and_not_longer(
+            fwd in prop::collection::vec(0u8..=3, 80..220),
+            hint_frac in 0.0f64..1.0,
+            pivot in 12usize..40,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let sa_num = idx.sa_num();
+            let w = 50usize;
+            prop_assume!(fwd.len() >= w);
+            // A read lifted from the reference (so the length-1 anchor occurs), fed
+            // a DELIBERATELY WRONG hint: a random SA index, not read[pivot]'s locus.
+            let s = pivot % (fwd.len() - w + 1);
+            let read = &fwd[s..s + w];
+            let anchor_len: u64 = 1;
+            let anchor_end = pivot + anchor_len as usize;
+            let wrong_hint = 1 + (hint_frac * (sa_num - 1) as f64) as u64; // in [1, sa_num)
+
+            let hinted = idx.mem_search_backward_from_hint(
+                read, pivot, anchor_len, wrong_hint, true, &fwd, e,
+            );
+
+            // (a) Self-consistency: interval == true interval of the implied substring.
+            if hinted.occ > 0 {
+                let left_ext = hinted.match_len - anchor_len;
+                let p_start = pivot - left_ext as usize;
+                let p = &read[p_start..anchor_end];
+                let truth = idx.mem_search(p, &fwd, e);
+                prop_assert_eq!(truth.match_len as usize, p.len(),
+                    "implied substring must occur fully (p={:?})", p);
+                prop_assert_eq!(
+                    (hinted.sa_start, hinted.occ), (truth.sa_start, truth.occ),
+                    "interval disagrees with match_len's substring at hint={}", wrong_hint
+                );
+            }
+
+            // (b) Never longer than the cold maximal of the same length-1 anchor.
+            let anchor = idx.mem_search(&read[pivot..anchor_end], &fwd, e);
+            let cold = idx.mem_search_backward(
+                anchor.sa_start, anchor.occ, anchor_len, read, pivot, &fwd, e,
+            );
+            prop_assert!(
+                hinted.match_len <= cold.match_len,
+                "stale hint over-extended: hinted={} cold={} hint={}",
+                hinted.match_len, cold.match_len, wrong_hint
+            );
+        }
+
+        /// The `.kmt`-seeded cold backward spectrum (`backward_spectrum_tabled`)
+        /// MUST be byte-identical to the model-seeded cold `backward_spectrum` —
+        /// the seed source changes probe count, never the trace (the divergence
+        /// guard for the parallel loop copy).
+        #[test]
+        fn backward_spectrum_tabled_equals_cold(
+            fwd in prop::collection::vec(0u8..=3, 80..220),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let table = idx.build_kmer_table(5, &fwd, e);
+            let w = 50usize;
+            for s in (0..fwd.len().saturating_sub(w)).step_by(23) {
+                let read = &fwd[s..s + w];
+                for pivot in [12usize, 24, 36] {
+                    let anchor = idx.mem_search(&read[pivot..], &fwd, e);
+                    if anchor.match_len == 0 {
+                        continue;
+                    }
+                    let cold = idx.backward_spectrum(
+                        anchor.sa_start, anchor.occ, anchor.match_len, read, pivot, &fwd, e,
+                    );
+                    let tabled = idx.backward_spectrum_tabled(
+                        anchor.sa_start, anchor.occ, anchor.match_len, read, pivot, &fwd, e, &table,
+                    );
+                    prop_assert_eq!(
+                        tabled, cold,
+                        "backward tabled != model-seeded cold at s={}, pivot={}", s, pivot
+                    );
+                }
+            }
+        }
+    }
+
+    /// Both backward-spectrum PROTOTYPES must fail closed (empty trace) on a
+    /// pathological `anchor_len` rather than panicking on the `pivot + anchor_len`
+    /// cast/add — mirroring `mem_search_backward_from_hint`'s guards.
+    #[test]
+    fn backward_spectrum_prototypes_reject_overflowing_anchor_len() {
+        let fwd: Vec<u8> = (0..120u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let read = &fwd[..50];
+        let table = idx.build_kmer_table(5, &fwd, e);
+        // `anchor_len = u64::MAX` overflows `pivot + anchor_len`; both prototypes
+        // must return an empty trace instead of panicking.
+        assert!(idx
+            .backward_spectrum_from_hint(read, 24, u64::MAX, 1, &fwd, e)
+            .is_empty());
+        assert!(idx
+            .backward_spectrum_tabled(1, 1, u64::MAX, read, 24, &fwd, e, &table)
+            .is_empty());
     }
 
     #[test]
