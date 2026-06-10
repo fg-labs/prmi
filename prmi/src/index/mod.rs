@@ -214,6 +214,15 @@ impl LearnedIndex {
         self.sa.position(i)
     }
 
+    /// Software-prefetch SA entry `i` (position + key, one cache line) into L1.
+    /// Advisory hint used by the boundary-search probe loops to overlap the next
+    /// cold read with the current compare; never affects results. Out-of-range
+    /// `i` is ignored.
+    #[inline(always)]
+    pub(crate) fn prefetch_sa(&self, i: u64) {
+        self.sa.prefetch(i);
+    }
+
     /// Global maximum prediction error bound recorded in `.meta`.
     pub fn max_error_bound(&self) -> u64 {
         self.meta.rmi.max_error_bound
