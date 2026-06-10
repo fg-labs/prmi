@@ -17,10 +17,10 @@ use rayon::prelude::*;
 /// - `l_pac <= q < 2*l_pac` -> `3 - fwd(2*l_pac - 1 - q)`  (reverse-complement)
 /// - `q >= 2*l_pac`         -> `None` (sentinel / end-of-text; sorts smallest)
 ///
-/// Test-only since the vectorized [`compare_query_vs_suffix_2x`] reads the
-/// doubled text in bulk via `fill_doubled_chunk`; retained as the per-base
-/// oracle backing [`compare_query_vs_suffix_2x_scalar`] and the unit tests.
-#[cfg(test)]
+/// The vectorized [`compare_query_vs_suffix_2x`] reads the doubled text in bulk
+/// via `fill_doubled_chunk`; this per-base accessor backs the scalar oracle and
+/// the single-base leftward walk in
+/// [`mem_search_backward_from_hint`](LearnedIndex::mem_search_backward_from_hint).
 #[inline]
 pub(crate) fn doubled_base_at(pac: &[u8], enc: PacEncoding, l_pac: u64, q: u64) -> Option<u8> {
     if q >= 2 * l_pac {
@@ -1302,6 +1302,85 @@ impl LearnedIndex {
         }
     }
 
+    /// One-shot maximal forward match launched from an EXACT SA index hint
+    /// (`hint`), skipping the model lookup AND the nested interval-narrowing —
+    /// BWA-MEME's `no_search=true` / `mem_search_tradeoff` fast path. `hint` MUST
+    /// be a SA index whose suffix lies in the query's maximal-match interval
+    /// (the caller obtains it from the inverse SA, `prmi_isa_at(refpos)`); the
+    /// result is then byte-identical to [`mem_search`] (the launch changes speed,
+    /// never the answer — see `mem_search_hint_equals_unhinted`). A wrong hint is
+    /// a caller contract violation and yields an undefined (non-equal) answer.
+    ///
+    /// Mechanism: one keyed compare gives `match_len = LCP(query, suffix[hint])`
+    /// (every suffix in the maximal interval has this same LCP — none matches
+    /// deeper, or the interval would not be maximal). When `want_interval`, two
+    /// boundary searches gallop outward from `hint` to recover `[sa_start, sa_start
+    /// + occ)` at depth `match_len`; otherwise only `match_len` is computed.
+    ///
+    /// `hint` must satisfy `0 < hint < sa_num` (0 is the no-hint sentinel and the
+    /// sentinel row; out of range is a caller error the FFI rejects).
+    pub fn mem_search_from_hint(
+        &self,
+        query: &[u8],
+        hint: u64,
+        want_interval: bool,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Fail closed on an undersized packed pac (as the non-hint paths do): a
+        // truncated buffer would otherwise be misread inside the compare helpers
+        // (a missing sentinel byte → wrong LCP, or an out-of-bounds unwrap).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_from_hint").is_err() {
+                return zero;
+            }
+        }
+        if query.is_empty() || hint == 0 || hint >= self.sa_num() {
+            return zero;
+        }
+        let l_pac = self.l_pac();
+        let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+        // Confirm: the maximal match length is the LCP of the query against the
+        // hinted suffix (one probe instead of the whole narrowing search).
+        let pos = self.sa_position_for(hint);
+        bump_probe();
+        let key = self.key_at(hint);
+        let (_, lcp) =
+            compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
+        let match_len = u64::from(lcp);
+        if match_len == 0 {
+            return zero;
+        }
+        if !want_interval {
+            return MemMatch {
+                match_len,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        // Recover the maximal interval `[lower, upper)` of `query[..match_len]`,
+        // seeding the boundary searches at the hint (which lies inside it).
+        let sa_num = self.sa_num();
+        let qm = &query[..match_len as usize];
+        let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+        let lower = self.find_boundary(0, sa_num, hint, hint + 1, |mid| {
+            self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+        });
+        let upper = self.find_boundary(lower, sa_num, hint, hint + 1, |mid| {
+            self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+        });
+        MemMatch {
+            match_len,
+            sa_start: lower,
+            occ: upper.saturating_sub(lower),
+        }
+    }
+
     /// One-shot maximal exact BACKWARD (leftward) match: the deepest left
     /// extension of the right anchor `[sa_start, sa_start+occ_count)` (matching
     /// `read[pivot..pivot+anchor_len)`), with its SA interval. The backward twin
@@ -1351,6 +1430,132 @@ impl LearnedIndex {
                 sa_start,
                 occ: occ_count,
             },
+        }
+    }
+
+    /// One-shot maximal LEFT extension launched from an EXACT SA index hint —
+    /// the backward twin of [`mem_search_from_hint`](Self::mem_search_from_hint),
+    /// BWA-MEME's `no_search` for the left direction. `hint` is the SA index whose
+    /// suffix is the right anchor (`read[pivot..pivot+anchor_len]`); the caller
+    /// obtains it from the inverse SA (`prmi_isa_at(refpos)`). No prior anchor
+    /// interval is needed — `hint` replaces it (this drops the caller's separate
+    /// length-1 anchor search).
+    ///
+    /// Mechanism: `p_anchor = sa_position_for(hint)` is the anchor's genomic
+    /// position; the left extension is a direct reference walk
+    /// (`read[pivot-1-k]` vs `doubled_base_at(p_anchor-1-k)`) — no SA search, no
+    /// per-step model launch — giving `left_ext` in `O(left_ext)`. When the
+    /// interval is requested, the maximal pattern `read[pivot-left_ext ..
+    /// pivot+anchor_len]` (which starts at text position `p_anchor - left_ext`) is
+    /// resolved by two boundary searches tight-seeded from
+    /// `isa_at(p_anchor - left_ext)` (or a correct loose seed without `.isa`).
+    ///
+    /// `*match_len` is ALWAYS the TOTAL anchored span `anchor_len + left_ext` —
+    /// the caller's gating signal: a short span means the hint diverged from the
+    /// read, so fall back to the model launch. The result equals
+    /// [`mem_search_backward`](Self::mem_search_backward) (`est_hint == 0`)
+    /// whenever `hint` is at a maximal-extension locus (the launch changes speed,
+    /// never the answer).
+    ///
+    /// `hint` must satisfy `0 < hint < sa_num`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mem_search_backward_from_hint(
+        &self,
+        read: &[u8],
+        pivot: usize,
+        anchor_len: u64,
+        hint: u64,
+        want_interval: bool,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Fail closed on an undersized packed pac (as the non-hint paths do): a
+        // truncated buffer would otherwise be misread inside `doubled_base_at`.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_backward_from_hint").is_err() {
+                return zero;
+            }
+        }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        // Checked: a large caller-provided `anchor_len` must not wrap when
+        // narrowed to usize or added to `pivot` (a wrapped window bound would
+        // pass the `> read.len()` guard and read out of range).
+        let anchor_len_usize = match usize::try_from(anchor_len) {
+            Ok(v) => v,
+            Err(_) => return zero,
+        };
+        let anchor_end = match pivot.checked_add(anchor_len_usize) {
+            Some(v) => v,
+            None => return zero,
+        };
+        if hint == 0 || hint >= sa_num || anchor_end > read.len() {
+            return zero;
+        }
+        // Genomic position the anchor aligns to (text start of `read[pivot..]`).
+        let p_anchor = self.sa_position_for(hint);
+
+        // Direct leftward reference walk: extend while the read base matches the
+        // reference base one position further left. Stops at an ambiguous read
+        // base, a read/text boundary, a sentinel, or a mismatch.
+        let mut left_ext: u64 = 0;
+        while (left_ext as usize) < pivot && p_anchor > left_ext {
+            let read_base = read[pivot - 1 - left_ext as usize];
+            if read_base >= 4 {
+                break;
+            }
+            let ref_pos = p_anchor - 1 - left_ext;
+            match doubled_base_at(pac, enc, l_pac, ref_pos) {
+                Some(b) if b == read_base => left_ext += 1,
+                _ => break,
+            }
+        }
+        // Checked: the FFI casts `match_len` to u32 downstream, so a u64 wrap
+        // here would surface as a silently truncated match length.
+        let match_len = match anchor_len.checked_add(left_ext) {
+            Some(v) => v,
+            None => return zero,
+        };
+
+        if !want_interval {
+            return MemMatch {
+                match_len,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        // Interval of the maximal pattern P = read[pivot-left_ext .. anchor_end],
+        // which occurs at text position `p_anchor - left_ext`.
+        let p_start = pivot - left_ext as usize;
+        let p_slice = &read[p_start..anchor_end];
+        if p_slice.is_empty() {
+            // Degenerate (anchor_len == 0, no left extension): empty pattern.
+            return MemMatch {
+                match_len,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+        // Tight seed from the inverse SA when present (the exact SA index of P at
+        // this locus); otherwise the hint itself — `find_boundary` expands on a
+        // miss, so the seed only affects speed, never the boundary it returns.
+        let seed = self.isa_at(p_anchor - left_ext).unwrap_or(hint);
+        let lower = self.find_boundary(0, sa_num, seed, seed + 1, |mid| {
+            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+        });
+        let upper = self.find_boundary(lower, sa_num, seed, seed + 1, |mid| {
+            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+        });
+        MemMatch {
+            match_len,
+            sa_start: lower,
+            occ: upper.saturating_sub(lower),
         }
     }
 
@@ -2261,6 +2466,52 @@ mod keyed_tests {
         assert!(idx.key_at(0).is_some(), "mode-2 sidecar must store keys");
     }
 
+    /// An undersized packed pac must fail closed (zero match) in both forward
+    /// hint paths, exactly as the non-hint paths do — never reach the compare
+    /// helpers, where a missing byte would mis-decode or panic.
+    #[test]
+    fn mem_search_from_hint_rejects_undersized_packed_pac() {
+        let fwd: Vec<u8> = (0..80u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // `num_bases` claims 4096 bases (needs ≥1024 packed bytes); `tiny_pac`
+        // holds 4. Validation runs before the hint check, so any in-range hint
+        // still fails closed.
+        let enc = PacEncoding::Packed { num_bases: 4096 };
+        let tiny_pac = [0u8; 4];
+        let q = [0u8, 1, 2, 3];
+        assert_eq!(idx.mem_search_from_hint(&q, 1, true, &tiny_pac, enc), zero);
+        assert_eq!(idx.mem_search_from_hint(&q, 1, false, &tiny_pac, enc), zero);
+    }
+
+    /// A pathological `anchor_len` must not overflow `pivot + anchor_len`; the
+    /// backward hint path fails closed instead of panicking on the cast/add.
+    #[test]
+    fn mem_search_backward_from_hint_rejects_overflowing_anchor_len() {
+        let fwd: Vec<u8> = (0..120u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        let read = &fwd[..50];
+        let got = idx.mem_search_backward_from_hint(
+            read,
+            24,
+            u64::MAX,
+            1,
+            true,
+            &fwd,
+            PacEncoding::Unpacked,
+        );
+        assert_eq!(got, zero);
+    }
+
     /// The k-mer table built from the in-memory unpacked `bases` must be
     /// byte-identical to the table built from the packed `.pac` form of the
     /// same reference. This is the invariant that lets `build_sidecar_core`
@@ -2748,6 +2999,78 @@ mod keyed_tests {
                     None => MemMatch { match_len: 0, sa_start: 0, occ: 0 },
                 };
                 prop_assert_eq!(got, want_auto, "mem_search != forward_spectrum_tabled last, query={:?}", q);
+            }
+        }
+
+        /// The ISA-launch (`mem_search_from_hint`) MUST be byte-identical to the
+        /// from-scratch `mem_search` for EVERY SA index in the maximal interval —
+        /// the launch hint changes speed, never the answer. This is the hard gate
+        /// for the est_hint>0 / no_search fast path.
+        #[test]
+        fn mem_search_hint_equals_unhinted(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..50), 1..6),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for q in &queries {
+                let unhinted = idx.mem_search(q, &fwd, e);
+                if unhinted.match_len == 0 {
+                    continue; // no match → no valid hint exists
+                }
+                // Every SA index in the maximal interval is a valid launch hint
+                // and must reproduce the identical (sa_start, occ, match_len).
+                for off in 0..unhinted.occ {
+                    let hint = unhinted.sa_start + off;
+                    let hinted = idx.mem_search_from_hint(q, hint, true, &fwd, e);
+                    prop_assert_eq!(
+                        hinted, unhinted,
+                        "hinted != unhinted at hint={}, query={:?}", hint, q
+                    );
+                    // want_interval=false must still report the same match_len.
+                    let ml_only = idx.mem_search_from_hint(q, hint, false, &fwd, e);
+                    prop_assert_eq!(ml_only.match_len, unhinted.match_len, "match_len-only mismatch");
+                }
+            }
+        }
+
+        /// Backward `mem_search_backward_from_hint` == from-scratch
+        /// `mem_search_backward` when the hint is at the maximal-extension locus.
+        /// `build_mode2` builds NO `.isa`, so this also exercises the loose-seed
+        /// fallback (`isa_at(..).unwrap_or(hint)`) — `find_boundary`'s
+        /// seed-independence must still yield the identical interval.
+        #[test]
+        fn mem_search_backward_hint_equals_unhinted(
+            fwd in prop::collection::vec(0u8..=3, 80..220),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let sa_num = idx.sa_num();
+            // Reference-lifted reads: read == a window of fwd at genomic `s`, so
+            // the anchor's natural locus is `s + pivot` and its left walk follows
+            // the read↔reference alignment (the maximal-extension locus).
+            let w = 50usize;
+            for s in (0..fwd.len().saturating_sub(w)).step_by(23) {
+                let read = &fwd[s..s + w];
+                for pivot in [12usize, 24, 36] {
+                    let anchor = idx.mem_search(&read[pivot..], &fwd, e);
+                    if anchor.match_len == 0 {
+                        continue;
+                    }
+                    let global = idx.mem_search_backward(
+                        anchor.sa_start, anchor.occ, anchor.match_len, read, pivot, &fwd, e,
+                    );
+                    // Inverse SA at genomic `s + pivot` (no `.isa` here → scan).
+                    let refpos = (s + pivot) as u64;
+                    let hint = (0..sa_num).find(|&i| idx.sa_position_for(i) == refpos).unwrap();
+                    let hinted = idx.mem_search_backward_from_hint(
+                        read, pivot, anchor.match_len, hint, true, &fwd, e,
+                    );
+                    prop_assert_eq!(
+                        hinted, global,
+                        "backward hinted != from-scratch at s={}, pivot={}", s, pivot
+                    );
+                }
             }
         }
     }

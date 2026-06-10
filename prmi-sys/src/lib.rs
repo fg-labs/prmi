@@ -187,6 +187,60 @@ pub unsafe extern "C" fn prmi_sa_num(handle: *const prmi_index_t) -> size_t {
     unsafe { Handle::as_ref(handle) }.idx.sa_num() as size_t
 }
 
+/// Whether the loaded sidecar carries an inverse suffix array (`.isa`), enabling
+/// the `prmi_isa_at` launch hint / `mem_search` no-search fast path. Returns 1 if
+/// present, else 0 (also 0 for a NULL handle or an shm-opened index, which does
+/// not carry the `.isa`). The consumer branches on this at open time.
+///
+/// # Safety
+/// `handle` must be a valid handle from `prmi_open`, or NULL (returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn prmi_has_isa(handle: *const prmi_index_t) -> c_int {
+    if handle.is_null() {
+        return 0;
+    }
+    c_int::from(unsafe { Handle::as_ref(handle) }.idx.has_isa())
+}
+
+/// Inverse suffix array lookup: given a reference position `refpos` (0-based in
+/// the 2× doubled-coordinate space prmi indexes), write its SA index to
+/// `*out_sa_index`. This is the exact launch hint to feed back as `est_hint` to
+/// `prmi_mem_search` (BWA-MEME's `ref2sa`).
+///
+/// Returns 0 on success; `-1` null handle/out-ptr, `-2` `refpos >= sa_num`,
+/// `-5` the loaded sidecar has no `.isa` (build with `prmi build --with-isa`).
+///
+/// # Safety
+/// `handle` valid or NULL; `out_sa_index` writable on success.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_isa_at(
+    handle: *const prmi_index_t,
+    refpos: u64,
+    out_sa_index: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null() || out_sa_index.is_null() {
+        set_last_error("prmi_isa_at: null handle or out_sa_index");
+        return -1;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    if !h.idx.has_isa() {
+        set_last_error("prmi_isa_at: sidecar has no .isa (build with --with-isa)");
+        return -5;
+    }
+    if refpos >= h.idx.sa_num() {
+        set_last_error("prmi_isa_at: refpos out of range");
+        return -2;
+    }
+    // has_isa() is true and refpos < sa_num (== isa num_entries), so isa_at is Some.
+    let sa_index = h
+        .idx
+        .isa_at(refpos)
+        .expect("isa_at in range with .isa loaded");
+    unsafe { *out_sa_index = sa_index };
+    0
+}
+
 /// Global max prediction error stored in the sidecar.
 ///
 /// # Safety
@@ -1104,14 +1158,22 @@ pub const PRMI_MEM_WANT_INTERVAL: u32 = 0x1;
 /// already applied by the caller); finds the longest prefix that occurs in the
 /// reference. `*out_match_len` is ALWAYS written (0 if `query[0]` has no match).
 /// With `flags & PRMI_MEM_WANT_INTERVAL`, also writes `*out_sa_start`/`*out_occ`
-/// (the SA interval at `match_len`). `est_hint` is reserved for the ISA/no-search
-/// launch (spec step 2); it is accepted but currently ignored (ignoring a launch
-/// hint is byte-identical — it only affects speed). Byte-identity: the returned
-/// `(sa_start, occ, match_len)` equals the maximal step `prmi_forward_spectrum`
-/// produces for the same query.
+/// (the SA interval at `match_len`).
 ///
-/// Returns 0 on success; `-1` null handle/pointer, `-2` `query_len < 0` or
-/// `pac_num_bases` too large for this platform, `-3` internal panic.
+/// `est_hint`: `0` → prmi does its own model launch (full search). `> 0` → an
+/// EXACT inverse-SA hint (from `prmi_isa_at(refpos)`): prmi confirms+extends from
+/// that exact suffix and skips the model launch and interval narrowing
+/// (BWA-MEME's `no_search`/`mem_search_tradeoff`). The hint MUST be a SA index in
+/// the query's maximal-match interval; the launch changes speed, never the answer
+/// — the result is byte-identical to `est_hint == 0`. A hint `>= sa_num` returns
+/// `-2`.
+///
+/// Byte-identity: the returned `(sa_start, occ, match_len)` equals the maximal
+/// step `prmi_forward_spectrum` produces for the same query.
+///
+/// Returns 0 on success; `-1` null handle/pointer, `-2` `query_len < 0`,
+/// `pac_num_bases` too large for this platform, or `est_hint >= sa_num`,
+/// `-3` internal panic.
 ///
 /// # Safety
 /// `handle` valid; `query` valid for `query_len` bytes; `pac` valid for
@@ -1131,7 +1193,6 @@ pub unsafe extern "C" fn prmi_mem_search(
     out_occ: *mut u64,
 ) -> c_int {
     clear_last_error();
-    let _ = est_hint; // reserved (spec step 2: ISA/no-search launch)
     if handle.is_null() || query.is_null() || pac.is_null() || out_match_len.is_null() {
         set_last_error("prmi_mem_search: null pointer");
         return -1;
@@ -1149,6 +1210,14 @@ pub unsafe extern "C" fn prmi_mem_search(
         return -2;
     }
     let h = unsafe { Handle::as_ref(handle) };
+    // est_hint == 0 → internal model launch; > 0 → exact ISA launch (no_search).
+    // An out-of-range hint is a caller error (the spec's no_search contract is
+    // that the hint is the exact in-interval SA index).
+    if est_hint != 0 && est_hint >= h.idx.sa_num() {
+        set_last_error("prmi_mem_search: est_hint out of range");
+        return -2;
+    }
+    let want_interval = flags & PRMI_MEM_WANT_INTERVAL != 0;
     let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
     let pac_bytes = match packed_pac_bytes(pac_num_bases) {
         Some(b) => b,
@@ -1162,7 +1231,12 @@ pub unsafe extern "C" fn prmi_mem_search(
         num_bases: pac_num_bases,
     };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.idx.mem_search(q, pac_slice, enc)
+        if est_hint == 0 {
+            h.idx.mem_search(q, pac_slice, enc)
+        } else {
+            h.idx
+                .mem_search_from_hint(q, est_hint, want_interval, pac_slice, enc)
+        }
     }));
     let m = match res {
         Ok(m) => m,
@@ -1193,14 +1267,24 @@ pub unsafe extern "C" fn prmi_mem_search(
 /// (`anchor_len + left_ext`). With `flags & PRMI_MEM_WANT_INTERVAL`, also writes
 /// `*out_sa_start`/`*out_occ` (the SA interval at the maximal match). When no
 /// left extension is possible the anchor itself is returned (`match_len ==
-/// anchor_len`); when `occ_count == 0`, all-zero. `est_hint` is reserved for the
-/// ISA launch (spec step 2) and currently ignored (byte-identical to ignore it).
+/// anchor_len`); when `occ_count == 0`, all-zero.
+///
+/// `est_hint`: `0` → model-launch backward search (uses `sa_start`/`occ_count`).
+/// `> 0` → an EXACT inverse-SA hint (`prmi_isa_at(refpos)` for the anchor's
+/// reference position): prmi confirms the left extension directly against the
+/// reference and skips the per-step model launch (BWA-MEME's `no_search` for the
+/// left direction). The hint REPLACES the anchor interval, so `sa_start`/
+/// `occ_count` are ignored. The result is byte-identical to `est_hint == 0`
+/// whenever the hint is at a maximal-extension locus; a stale/diverged hint
+/// yields a SHORTER `*out_match_len` (the caller's signal to fall back to
+/// `est_hint == 0`). A hint `>= sa_num` returns `-2`.
 ///
 /// Byte-identity: the returned `(sa_start, occ, match_len)` equals the maximal
 /// step `prmi_backward_spectrum` produces for the same inputs.
 ///
 /// Returns 0 on success; `-1` null handle/pointer, `-2` `read_len <= 0`,
-/// `pivot < 0`, or `pac_num_bases` too large for this platform, `-3` internal panic.
+/// `pivot < 0`, `pac_num_bases` too large for this platform, or `est_hint >= sa_num`;
+/// `-3` internal panic.
 ///
 /// # Safety
 /// `handle` valid; `read` valid for `read_len` bytes; `pac` valid for
@@ -1225,7 +1309,6 @@ pub unsafe extern "C" fn prmi_mem_search_backward(
     out_occ: *mut u64,
 ) -> c_int {
     clear_last_error();
-    let _ = est_hint; // reserved (spec step 2: ISA/no-search launch)
     if handle.is_null() || read.is_null() || pac.is_null() || out_match_len.is_null() {
         set_last_error("prmi_mem_search_backward: null pointer");
         return -1;
@@ -1241,6 +1324,14 @@ pub unsafe extern "C" fn prmi_mem_search_backward(
         return -2;
     }
     let h = unsafe { Handle::as_ref(handle) };
+    // est_hint == 0 → model-launch backward search (uses sa_start/occ_count);
+    // > 0 → exact ISA launch (no_search): the hint replaces the anchor interval,
+    // so sa_start/occ_count are ignored. Out-of-range hint is a caller error.
+    if est_hint != 0 && est_hint >= h.idx.sa_num() {
+        set_last_error("prmi_mem_search_backward: est_hint out of range");
+        return -2;
+    }
+    let want_interval = flags & PRMI_MEM_WANT_INTERVAL != 0;
     let r = unsafe { std::slice::from_raw_parts(read, read_len as usize) };
     let pac_bytes = match packed_pac_bytes(pac_num_bases) {
         Some(b) => b,
@@ -1254,15 +1345,27 @@ pub unsafe extern "C" fn prmi_mem_search_backward(
         num_bases: pac_num_bases,
     };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.idx.mem_search_backward(
-            sa_start,
-            occ_count,
-            anchor_len,
-            r,
-            pivot as usize,
-            pac_slice,
-            enc,
-        )
+        if est_hint == 0 {
+            h.idx.mem_search_backward(
+                sa_start,
+                occ_count,
+                anchor_len,
+                r,
+                pivot as usize,
+                pac_slice,
+                enc,
+            )
+        } else {
+            h.idx.mem_search_backward_from_hint(
+                r,
+                pivot as usize,
+                anchor_len,
+                est_hint,
+                want_interval,
+                pac_slice,
+                enc,
+            )
+        }
     }));
     let m = match res {
         Ok(m) => m,

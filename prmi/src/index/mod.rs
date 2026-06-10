@@ -14,6 +14,7 @@ pub mod spectrum;
 use crate::error::{Error, Result};
 use crate::index::lookup::lookup_core;
 use crate::index::shm::{read_shm_blob, write_shm_blob, ShmBlob};
+use crate::sidecar::isa_file::IsaFileReader;
 use crate::sidecar::kmt_file::KmtFileReader;
 use crate::sidecar::meta::Meta;
 use crate::sidecar::model_file::{ModelFileReader, ModelLayer};
@@ -34,6 +35,10 @@ pub struct LearnedIndex {
     /// rejects an absent, corrupt, or reference-mismatched `.kmt` (both the
     /// file-backed `open` and the shm `open_shm` paths can populate it).
     kmt: Option<KmtFileReader>,
+    /// Optional inverse suffix array (the ISA launch hint for the no-search
+    /// `mem_search` fast path). `None` for sidecars built without `--with-isa`,
+    /// or loaded via `open_shm` (the shm blob does not carry the `.isa`).
+    isa: Option<IsaFileReader>,
 }
 
 const _ASSERT_SEND_SYNC: fn() = || {
@@ -57,12 +62,21 @@ impl LearnedIndex {
         // digest, since equal-length references share `sa_num`), is ignored
         // with a warning and the always-correct full search is used instead.
         let kmt = load_kmt_best_effort(&paths.kmt, &meta, &sa);
+        // Optional `.isa` inverse suffix array. Best-effort: a `.isa` whose entry
+        // count != `sa_num` (a different-LENGTH reference) is ignored, leaving
+        // `has_isa() == false` so the model-launch path is used. Unlike `.kmt`,
+        // the `.isa` is NOT digest-bound, so a same-length different-reference
+        // `.isa` is not detected here — but `prmi build` removes a stale `.isa`,
+        // and a wrong hint only degrades to a fall-back launch (the consumer
+        // gates on the returned `match_len`), never to a wrong answer.
+        let isa = load_isa_best_effort(&paths.isa, &sa);
         Ok(Self {
             meta,
             sa,
             l1,
             l2,
             kmt,
+            isa,
         })
     }
 
@@ -139,12 +153,16 @@ impl LearnedIndex {
         // `open`: any problem (corrupt slice or a `sa_num`/reference mismatch)
         // is ignored with a warning and the full forward search is used.
         let kmt = load_kmt_from_shm_best_effort(&blob, &meta, &sa);
+        // The shm blob does not carry the `.isa`; ISA launch is file-backed only
+        // (`open`). `has_isa()` is therefore false for shm-opened indexes.
+        let isa = None;
         Ok(Self {
             meta,
             sa,
             l1,
             l2,
             kmt,
+            isa,
         })
     }
 
@@ -165,6 +183,21 @@ impl LearnedIndex {
     /// `forward_spectrum_auto` resolves shallow bands without SA probes).
     pub fn has_kmt(&self) -> bool {
         self.kmt.is_some()
+    }
+
+    /// `true` if a valid `.isa` inverse suffix array is loaded (so the consumer
+    /// can supply `mem_search`'s no-search launch hint via [`Self::isa_at`]).
+    pub fn has_isa(&self) -> bool {
+        self.isa.is_some()
+    }
+
+    /// Inverse suffix array: the SA index of reference position `refpos` (in the
+    /// 2× doubled-coordinate space). `None` if no `.isa` is loaded or
+    /// `refpos >= sa_num()`. This is the launch hint fed back as `est_hint` to
+    /// [`crate::index::spectrum::LearnedIndex::mem_search_from_hint`].
+    pub fn isa_at(&self, refpos: u64) -> Option<u64> {
+        let isa = self.isa.as_ref()?;
+        (refpos < isa.num_entries()).then(|| isa.sa_index_at(refpos))
     }
 
     /// Number of forward reference bases (`l_pac`). The 2× SA has `2*l_pac + 1`
@@ -341,6 +374,38 @@ fn load_kmt_best_effort(kmt_path: &Path, meta: &Meta, sa: &SaFileReader) -> Opti
     } else {
         log::warn!(
             "prmi: .kmt does not match this sidecar (sa_num/reference); using the full forward search"
+        );
+        None
+    }
+}
+
+/// Load the optional `.isa` inverse suffix array, returning `None` (with a
+/// warning) if it is absent, corrupt, or sized for a different SA (entry count
+/// != `sa_num`). ISA only supplies an optional launch hint, so an invalid one is
+/// always safe to ignore (the model-launch path stays correct).
+fn load_isa_best_effort(isa_path: &Path, sa: &SaFileReader) -> Option<IsaFileReader> {
+    let r = match IsaFileReader::open(isa_path) {
+        Ok(r) => r,
+        // A genuinely absent `.isa` is the common case (built without
+        // `--with-isa`) — silent. Any other error (corrupt, unreadable,
+        // permission/IO) is surfaced and we fall back to the model-launch path;
+        // do NOT use `Path::exists()`, which also reports `false` when metadata
+        // is inaccessible and would silently mask a real failure.
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return None;
+        }
+        Err(e) => {
+            log::warn!("prmi: ignoring .isa ({e}); ISA launch hint unavailable");
+            return None;
+        }
+    };
+    if r.num_entries() == sa.num_entries() {
+        Some(r)
+    } else {
+        log::warn!(
+            "prmi: .isa entry count ({}) != sa_num ({}); ISA launch hint unavailable",
+            r.num_entries(),
+            sa.num_entries()
         );
         None
     }

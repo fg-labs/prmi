@@ -268,20 +268,28 @@ fn build_sidecar_core(
 
     let paths = SidecarPaths::from_prefix(prefix);
 
-    // Remove any pre-existing `.kmt` so a rebuild (especially one WITHOUT
-    // `--kmer-table-k`) can never inherit a stale table for the old reference.
-    // A fresh table is written at the end if requested. Propagate anything other
-    // than "already absent": a swallowed permission/I/O error would silently
-    // leave the stale table in place for the next open.
-    match std::fs::remove_file(&paths.kmt) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(Error::Io {
-                path: paths.kmt.clone(),
-                source: e,
-            })
+    // Remove any pre-existing `.kmt`/`.isa` so a rebuild (especially one WITHOUT
+    // `--kmer-table-k` / `--with-isa`) can never inherit a stale sidecar for the
+    // old reference. Fresh ones are written at the end if requested. Propagate
+    // anything other than "already absent": a swallowed permission/I/O error
+    // would silently leave the stale sidecar in place for the next open.
+    for stale in [&paths.kmt, &paths.isa] {
+        match std::fs::remove_file(stale) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Io {
+                    path: stale.clone(),
+                    source: e,
+                })
+            }
         }
+    }
+
+    // .isa — optional inverse-suffix-array sidecar (the ISA launch hint). Built
+    // directly from the SA permutation; independent of the `.sa` memory mode.
+    if config.with_isa {
+        crate::sidecar::isa_file::write_isa_file(&paths.isa, &sa)?;
     }
 
     // .sa — write all genome-region entries in the requested memory mode.

@@ -110,6 +110,11 @@ pub enum Cmd {
         /// K=12 (~358 MB) for human-scale references. Omit to build no table.
         #[arg(long, value_name = "K")]
         kmer_table_k: Option<u32>,
+        /// Also emit a `.isa` inverse-suffix-array sidecar (the ISA launch hint
+        /// for prmi_mem_search's no-search fast path). Costs ~+5 B/entry on disk
+        /// (~+32 GB for hg38). Off by default.
+        #[arg(long, default_value_t = false)]
+        with_isa: bool,
     },
     /// Convert a KMC text-format dump to a prmi u64-key histogram TSV.
     ///
@@ -212,6 +217,7 @@ impl Cli {
                 threads,
                 store_keys,
                 kmer_table_k,
+                with_isa,
             } => {
                 // Resolve the reference source: exactly one of the positional
                 // FASTA or `--pac`. clap's `conflicts_with` rejects both; here
@@ -277,6 +283,7 @@ impl Cli {
                     prior,
                     memory_mode: mem_mode,
                     kmer_table_k,
+                    with_isa,
                     ..Default::default()
                 };
 
