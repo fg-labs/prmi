@@ -1473,16 +1473,20 @@ impl LearnedIndex {
             let sa_num = self.sa_num();
             let l_pac = self.l_pac();
             let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
-            let match_len = self.forward_maximal_len(query, query_key, sa_num, pac, enc, l_pac);
+            let (match_len, ip) =
+                self.forward_maximal_len(query, query_key, sa_num, pac, enc, l_pac);
             if match_len == 0 {
                 return zero;
             }
             let qm = &query[..match_len as usize];
             let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
-            let (pred, err) = self.lookup(qm_key);
-            let win_lo = pred.saturating_sub(err);
-            let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
-            let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
+            // Recover `qm`'s interval by galloping from the insertion point `ip`
+            // (which lies at the edge of that interval) rather than re-looking-up
+            // `qm`'s key and re-searching the model window. `find_boundary` is
+            // seed-independent, so `lower` is byte-identical; the seed only sets
+            // the probe count — ~0 here for a unique deep match, vs ~log2(occ) when
+            // a high-occ 32-mer prefix's loose window brackets the wide block.
+            let lower = self.find_boundary(0, sa_num, ip, ip, |mid| {
                 self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
             });
             let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
@@ -1705,7 +1709,10 @@ impl LearnedIndex {
             .map(|&b| (b & 0x3) ^ 0x3)
             .collect();
         let q_key = tokenize_32mer(&q, q.len().min(KMER_LEN));
-        let match_len = self.forward_maximal_len(&q, q_key, sa_num, pac, enc, l_pac);
+        // The insertion point is in RC-strand space; the forward `p_slice` interval
+        // recovered below is in forward space, so it does not seed that recovery —
+        // ignore it here.
+        let (match_len, _ip) = self.forward_maximal_len(&q, q_key, sa_num, pac, enc, l_pac);
         // `match_len >= anchor_len` (the anchor occurs, so RC(anchor) = Q[..anchor_len]
         // does too). No left extension => the anchor itself is maximal.
         if match_len <= anchor_len {
@@ -2543,6 +2550,11 @@ impl LearnedIndex {
     /// strand of the 2× text) — the maximal exact match of `q` anchored at its
     /// start — in O(log n) probes regardless of the match length.
     ///
+    /// Returns `(match_len, insertion_point)`. The insertion point (`q`'s
+    /// `find_boundary` over `[0, sa_num)`) lies at the edge of the maximal match's
+    /// SA interval, so a caller recovering that interval can gallop from it
+    /// (~0 probes) instead of re-searching the model window for the prefix's key.
+    ///
     /// Model-launch the bounded search for `q`'s insertion point (the first SA
     /// index whose suffix is >= `q`); the longest common prefix with `q` is then
     /// held by one of the insertion point's two sorted neighbors — a standard
@@ -2564,9 +2576,9 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
         l_pac: u64,
-    ) -> u64 {
+    ) -> (u64, u64) {
         if q.is_empty() {
-            return 0;
+            return (0, 0);
         }
         let (pred, err) = self.lookup(q_key);
         let win_lo = pred.saturating_sub(err);
@@ -2581,7 +2593,7 @@ impl LearnedIndex {
         if ip < sa_num {
             ml = ml.max(self.lcp_at(q, q_key, ip, pac, enc, l_pac));
         }
-        u64::from(ml)
+        (u64::from(ml), ip)
     }
 
     /// Test-only: drive [`backward_spectrum`] with a forced `(pred, err)` window in
