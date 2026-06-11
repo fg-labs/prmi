@@ -1306,6 +1306,77 @@ pub unsafe extern "C" fn prmi_mem_search(
     0
 }
 
+/// DIAGNOSTIC twin of [`prmi_mem_search`] with the per-call wrapper guards
+/// removed — NO `clear_last_error`/`set_last_error`, NO `catch_unwind` — to A/B
+/// the fixed FFI overhead the consumer pays on every seeding call (see
+/// `examples/ffi_overhead.rs`). The search work and outputs are byte-identical to
+/// `prmi_mem_search`; only the boundary cost differs (the correctness guards —
+/// null/range/`packed_pac_bytes` narrowing — are kept). A search panic would
+/// unwind across the FFI boundary (UB), so this is for measurement, or for builds
+/// compiled `panic=abort` (where `catch_unwind` is already a no-op and this
+/// matches the production path).
+///
+/// Returns the same codes as [`prmi_mem_search`] EXCEPT it never sets the
+/// thread-local error string: `0` ok; `-1` null pointer (incl. `WANT_INTERVAL`
+/// with null `out_sa_start`/`out_occ`); `-2` `query_len < 0`, `pac_num_bases` too
+/// large for this platform, or `est_hint >= sa_num`.
+///
+/// # Safety
+/// Same contract as [`prmi_mem_search`]; additionally the caller must ensure the
+/// process is built `panic=abort` (or accept that a search panic is UB here).
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn prmi_mem_search_lean(
+    handle: *const prmi_index_t,
+    query: *const u8,
+    query_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+    est_hint: u64,
+    flags: u32,
+    out_match_len: *mut u32,
+    out_sa_start: *mut u64,
+    out_occ: *mut u64,
+) -> c_int {
+    if handle.is_null() || query.is_null() || pac.is_null() || out_match_len.is_null() {
+        return -1;
+    }
+    if flags & PRMI_MEM_WANT_INTERVAL != 0 && (out_sa_start.is_null() || out_occ.is_null()) {
+        return -1;
+    }
+    if query_len < 0 {
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    if est_hint != 0 && est_hint >= h.idx.sa_num() {
+        return -2;
+    }
+    let want_interval = flags & PRMI_MEM_WANT_INTERVAL != 0;
+    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let m = if est_hint == 0 {
+        h.idx.mem_search(q, pac_slice, enc)
+    } else {
+        h.idx
+            .mem_search_from_hint(q, est_hint, want_interval, pac_slice, enc)
+    };
+    unsafe { *out_match_len = m.match_len as u32 };
+    if want_interval {
+        unsafe {
+            *out_sa_start = m.sa_start;
+            *out_occ = m.occ;
+        }
+    }
+    0
+}
+
 /// One-shot maximal exact BACKWARD (leftward) match — the backward twin of
 /// `prmi_mem_search`. From the right anchor `(sa_start, occ_count, anchor_len)`
 /// matching `read[pivot..pivot+anchor_len)`, extend leftward and return the
