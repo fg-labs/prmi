@@ -265,6 +265,12 @@ fn main() {
     };
     let bwork = make_bwork(0, backbone_end);
     let bwork_rep = make_bwork(repeat_start, repeat_len);
+    // Straddle corpus: anchor inside the repeat (occ > 1), left context in the
+    // unique backbone, so the match is ambiguous near the anchor and unique deeper
+    // in. This is the real-data SMEM shape that neither the all-unique nor the
+    // pure-repeat corpus models; the O(log) RC backward search handles all three
+    // uniformly (one bounded search regardless of where/whether occ collapses).
+    let bwork_collapse = make_bwork(repeat_start.saturating_sub(pivot), 2 * pivot);
 
     // One-shot backward (the BWA-MEME reseed primitive: emit ONE maximal SMEM,
     // gated by min_intv — no per-length trace). The question: does the hinted
@@ -331,15 +337,19 @@ fn main() {
         work.iter().map(|b| b.occ as f64).sum::<f64>() / work.len() as f64
     };
     println!(
-        "\nbackward corpora: unique n={} mean_anchor_occ={:.1} | repeat n={} mean_anchor_occ={:.1}",
+        "\nbackward corpora: unique n={} mean_anchor_occ={:.1} | repeat n={} \
+         mean_anchor_occ={:.1} | collapse n={} mean_anchor_occ={:.1}",
         bwork.len(),
         mean_occ(&bwork),
         bwork_rep.len(),
         mean_occ(&bwork_rep),
+        bwork_collapse.len(),
+        mean_occ(&bwork_collapse),
     );
     println!("\nbackward / maximal one-shot (per call):");
     bwd_maximal("unique:", &bwork);
     bwd_maximal("repeat:", &bwork_rep);
+    bwd_maximal("collapse:", &bwork_collapse);
 
     // Full backward TRACE — the per-anchor reseed cost. Compare cold (model-seeded
     // per left step), .kmt-seeded cold (no hint — the reseed case), and hinted

@@ -1441,11 +1441,60 @@ impl LearnedIndex {
 
     /// One-shot maximal exact forward match: the longest prefix of `query` that
     /// occurs in the reference, with its SA interval. Equals the MAXIMAL (deepest)
-    /// step of [`forward_spectrum_auto`] — byte-identical by construction; reuses
-    /// the k-mer table + occ==1 fast path. `match_len == 0` (and `sa_start/occ ==
-    /// 0`) when `query` is empty or `query[0]` does not occur.
+    /// step of [`forward_spectrum_auto`] — byte-identical by construction.
+    /// `match_len == 0` (and `sa_start/occ == 0`) when `query` is empty or
+    /// `query[0]` does not occur.
     pub fn mem_search(&self, query: &[u8], pac: &[u8], enc: PacEncoding) -> MemMatch {
-        // Track only the maximal step — no intermediate Vec for this one-shot call.
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Fail closed on an undersized packed pac: the O(log) path below reaches
+        // `forward_maximal_len`'s `fill_doubled_chunk`, where `pac_base_at(..)`
+        // returns `None` on an out-of-range byte and is `.unwrap()`ed — a panic.
+        // The `forward_spectrum_*` paths guard this; the one-shot must too.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search").is_err() {
+                return zero;
+            }
+        }
+        if query.is_empty() {
+            return zero;
+        }
+        // Without a k-mer table the cold path narrows the interval at EVERY prefix
+        // length (O(query_len) bounded searches, ~258 probes/call). The maximal
+        // match needs only the length and its interval, so find the length with a
+        // single O(log n) maximal-prefix search (the forward twin of the backward
+        // RC search — forward extension already appends, so no reverse-complement)
+        // and recover the interval once. With a table loaded its exact deep k-mer
+        // interval is the cheaper launch, so keep the tabled trace there.
+        if self.kmt.is_none() {
+            let sa_num = self.sa_num();
+            let l_pac = self.l_pac();
+            let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+            let match_len = self.forward_maximal_len(query, query_key, sa_num, pac, enc, l_pac);
+            if match_len == 0 {
+                return zero;
+            }
+            let qm = &query[..match_len as usize];
+            let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+            let (pred, err) = self.lookup(qm_key);
+            let win_lo = pred.saturating_sub(err);
+            let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
+            let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
+                self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+            });
+            let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
+                self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+            });
+            return MemMatch {
+                match_len,
+                sa_start: lower,
+                occ: upper - lower,
+            };
+        }
+        // Table loaded: take the maximal step of the tabled trace.
         let mut sink = LastStepSink::default();
         self.forward_spectrum_auto_into(query, pac, enc, &mut sink);
         match sink.last() {
@@ -1454,11 +1503,7 @@ impl LearnedIndex {
                 sa_start: s.sa_start,
                 occ: s.occ_count,
             },
-            None => MemMatch {
-                match_len: 0,
-                sa_start: 0,
-                occ: 0,
-            },
+            None => zero,
         }
     }
 
@@ -1572,24 +1617,121 @@ impl LearnedIndex {
                 occ: 0,
             };
         }
-        // Track only the maximal left step — no intermediate Vec for this
-        // one-shot call (production `seed_override` is always `None`).
-        let mut sink = LastStepSink::default();
-        self.backward_spectrum_inner_into(
-            sa_start, occ_count, anchor_len, read, pivot, pac, enc, None, &mut sink,
-        );
-        match sink.last() {
-            Some(s) => MemMatch {
-                match_len: s.match_len,
-                sa_start: s.sa_start,
-                occ: s.occ_count,
-            },
-            // No left extension: the anchor itself is the maximal backward match.
-            None => MemMatch {
+        // Fail closed on an undersized packed pac: the O(log) path below reaches
+        // `forward_maximal_len`'s `fill_doubled_chunk`, where an out-of-range
+        // `pac_base_at(..)` is `.unwrap()`ed — a panic. Guard once up front so
+        // both the occ==1 hint delegate and the occ>1 search fail closed.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_backward").is_err() {
+                return MemMatch {
+                    match_len: 0,
+                    sa_start: 0,
+                    occ: 0,
+                };
+            }
+        }
+        // Unique-anchor fast path: a 1-wide interval already pins the genomic
+        // locus, so the maximal left extension is a probe-free leftward reference
+        // walk (`doubled_base_at`) plus one interval recovery — `sa_start` is itself
+        // a valid `est_hint`. `sa_start == 0` is the sentinel row (no real anchor
+        // matches there); fall through.
+        if occ_count == 1 && sa_start != 0 {
+            return self
+                .mem_search_backward_from_hint(read, pivot, anchor_len, sa_start, true, pac, enc);
+        }
+        // Ambiguous anchor (occ > 1): find the maximal left extension with a single
+        // O(log) bounded search instead of re-locating per left base. The longest
+        // left extension of the anchor is the longest SUFFIX of `read[..anchor_end]`
+        // that occurs in the reference — equivalently the longest PREFIX of its
+        // reverse-complement that occurs (each left base prepended to the pattern is
+        // a base APPENDED to the RC, so the RC prefixes nest and one maximal-prefix
+        // search finds them all). The 2× index already holds the RC suffixes, and
+        // `occ` is strand-symmetric (`occ(RC(P)) == occ(P)`), so this is exact.
+        //
+        // The per-base loop was O(extension-length) (a model launch + two bounded
+        // searches at every base); this is O(log n) regardless of how far the match
+        // extends — BWA-MEME's cold backward cost. Byte-identical: `match_len` is
+        // the same maximal span and the interval is recovered for the same pattern
+        // (`mem_search_backward_equals_maximal_backward_step`).
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        // Checked: a large caller-provided `anchor_len` must not truncate when
+        // narrowed to usize or wrap when added to `pivot` (a wrapped `anchor_end`
+        // would slip past the `> read.len()` guard and mis-slice). Fail closed,
+        // mirroring `mem_search_backward_from_hint`.
+        let anchor_len_usize = match usize::try_from(anchor_len) {
+            Ok(v) => v,
+            Err(_) => {
+                return MemMatch {
+                    match_len: 0,
+                    sa_start: 0,
+                    occ: 0,
+                };
+            }
+        };
+        let anchor_end = match pivot.checked_add(anchor_len_usize) {
+            Some(v) => v,
+            None => {
+                return MemMatch {
+                    match_len: 0,
+                    sa_start: 0,
+                    occ: 0,
+                };
+            }
+        };
+        if anchor_end > read.len() {
+            return MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        // Largest ambiguous-free left extent: the extension stops at the first
+        // invalid base (the per-base loop likewise broke there). The anchor itself
+        // is assumed valid (it occurs).
+        let mut q_start = pivot;
+        while q_start > 0 && read[q_start - 1] < 4 {
+            q_start -= 1;
+        }
+        // Q = reverse-complement of read[q_start..anchor_end]; |Q| caps the span.
+        // Mask-and-complement (`(b & 0x3) ^ 0x3`, same semantics as
+        // `reverse_complement_2bit`) rather than `3 - b`: byte-identical for the
+        // 2-bit contract (0..=3) but cannot underflow if a caller passes a
+        // malformed anchor byte > 3 (the `q_start` walk only validates the left
+        // extension, not the anchor region).
+        let q: Vec<u8> = read[q_start..anchor_end]
+            .iter()
+            .rev()
+            .map(|&b| (b & 0x3) ^ 0x3)
+            .collect();
+        let q_key = tokenize_32mer(&q, q.len().min(KMER_LEN));
+        let match_len = self.forward_maximal_len(&q, q_key, sa_num, pac, enc, l_pac);
+        // `match_len >= anchor_len` (the anchor occurs, so RC(anchor) = Q[..anchor_len]
+        // does too). No left extension => the anchor itself is maximal.
+        if match_len <= anchor_len {
+            return MemMatch {
                 match_len: anchor_len,
                 sa_start,
                 occ: occ_count,
-            },
+            };
+        }
+        // Recover the forward interval of the maximal pattern
+        // P = read[anchor_end - match_len .. anchor_end].
+        let p_slice = &read[anchor_end - match_len as usize..anchor_end];
+        let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+        let (pred, err) = self.lookup(p_key);
+        let win_lo = pred.saturating_sub(err);
+        let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
+        let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
+            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+        });
+        let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
+            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+        });
+        MemMatch {
+            match_len,
+            sa_start: lower,
+            occ: upper - lower,
         }
     }
 
@@ -2114,8 +2256,8 @@ impl LearnedIndex {
     /// boundary searches. Returns `None` when the interval is empty (the
     /// extension cannot continue). Drives the per-base backward TRACE
     /// ([`backward_spectrum_inner_into`]); the one-shot maximal
-    /// ([`mem_search_backward`]) runs that same per-base loop with a last-step
-    /// sink and keeps only its deepest step.
+    /// ([`mem_search_backward`]) instead finds the whole extension with a single
+    /// O(log) reverse-complement search and does not step base by base.
     ///
     /// The 32-mer key is recomputed per call: a base is prepended each step, so
     /// the first 32 bases change; the keyed compare masks it to `p_slice.len()`.
@@ -2167,8 +2309,9 @@ impl LearnedIndex {
     /// Generic core of [`backward_spectrum_inner`]: emits each left-extension step
     /// into `sink` (no coalescing — every left step is a distinct step). Drives the
     /// full backward TRACE. The one-shot maximal
-    /// ([`mem_search_backward`](Self::mem_search_backward)) reuses this same
-    /// per-base loop with a last-step sink, keeping only the deepest step.
+    /// ([`mem_search_backward`](Self::mem_search_backward)) does NOT use this
+    /// per-base loop — it finds the whole extension with a single O(log)
+    /// reverse-complement search — so the two are independent.
     #[allow(clippy::too_many_arguments)]
     fn backward_spectrum_inner_into<S: StepSink + ?Sized>(
         &self,
@@ -2374,6 +2517,71 @@ impl LearnedIndex {
         let key = self.key_at(mid);
         let (_, lcp) = compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
         (lcp as usize) >= p_slice.len()
+    }
+
+    /// One LCP probe: the length of the common prefix between `p_slice` and the
+    /// suffix at SA index `mid`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn lcp_at(
+        &self,
+        p_slice: &[u8],
+        p_key: u64,
+        mid: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) -> u32 {
+        bump_probe();
+        let pos = self.sa_position_for(mid);
+        let key = self.key_at(mid);
+        let (_, lcp) = compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
+        lcp
+    }
+
+    /// Length of the longest prefix of `q` that occurs in the reference (either
+    /// strand of the 2× text) — the maximal exact match of `q` anchored at its
+    /// start — in O(log n) probes regardless of the match length.
+    ///
+    /// Model-launch the bounded search for `q`'s insertion point (the first SA
+    /// index whose suffix is >= `q`); the longest common prefix with `q` is then
+    /// held by one of the insertion point's two sorted neighbors — a standard
+    /// suffix-array property, since the suffixes sharing the most with `q` are
+    /// exactly those adjacent to where `q` itself would sort. Two LCP probes at
+    /// those neighbors give the answer.
+    ///
+    /// Used to find the maximal BACKWARD extension without re-locating per base:
+    /// the caller passes `q = reverse_complement(read[..anchor_end])`, whose
+    /// maximal prefix match is the maximal suffix match of the read (the deepest
+    /// left extension). `find_boundary` is seed-independent, so the model window
+    /// only sets the probe count, never the insertion point found.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_maximal_len(
+        &self,
+        q: &[u8],
+        q_key: u64,
+        sa_num: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+    ) -> u64 {
+        if q.is_empty() {
+            return 0;
+        }
+        let (pred, err) = self.lookup(q_key);
+        let win_lo = pred.saturating_sub(err);
+        let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
+        let ip = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
+            self.ref_less(q, q_key, mid, pac, enc, l_pac)
+        });
+        let mut ml: u32 = 0;
+        if ip > 0 {
+            ml = ml.max(self.lcp_at(q, q_key, ip - 1, pac, enc, l_pac));
+        }
+        if ip < sa_num {
+            ml = ml.max(self.lcp_at(q, q_key, ip, pac, enc, l_pac));
+        }
+        u64::from(ml)
     }
 
     /// Test-only: drive [`backward_spectrum`] with a forced `(pred, err)` window in
@@ -2886,6 +3094,54 @@ mod keyed_tests {
             PacEncoding::Unpacked,
         );
         assert_eq!(got, zero);
+    }
+
+    /// The one-shot forward `mem_search` O(log) path reaches
+    /// `forward_maximal_len` → `fill_doubled_chunk`, which `.unwrap()`s
+    /// `pac_base_at`; an undersized packed pac must fail closed (zero), not panic.
+    #[test]
+    fn mem_search_rejects_undersized_packed_pac() {
+        let fwd: Vec<u8> = (0..80u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Claims 4096 bases (needs ≥1024 packed bytes); `tiny_pac` holds 4.
+        let enc = PacEncoding::Packed { num_bases: 4096 };
+        let tiny_pac = [0u8; 4];
+        let q = [0u8, 1, 2, 3, 0, 1, 2, 3];
+        assert_eq!(idx.mem_search(&q, &tiny_pac, enc), zero);
+    }
+
+    /// One-shot backward `mem_search_backward` must fail closed (zero), not
+    /// panic, on (a) an undersized packed pac (the O(log) RC search would
+    /// `.unwrap()` an out-of-range `pac_base_at`) and (b) a pathological
+    /// `anchor_len` that overflows `pivot + anchor_len`.
+    #[test]
+    fn mem_search_backward_rejects_undersized_pac_and_overflow() {
+        let fwd: Vec<u8> = (0..120u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        let read = &fwd[..50];
+        // (a) occ>1 ambiguous anchor + undersized packed pac → fail closed.
+        let enc = PacEncoding::Packed { num_bases: 4096 };
+        let tiny_pac = [0u8; 4];
+        assert_eq!(
+            idx.mem_search_backward(1, 2, 3, read, 24, &tiny_pac, enc),
+            zero
+        );
+        // (b) overflowing anchor_len (Unpacked, so the packed guard is skipped
+        // and the checked `pivot + anchor_len` arithmetic is what must catch it).
+        assert_eq!(
+            idx.mem_search_backward(1, 2, u64::MAX, read, 24, &fwd, PacEncoding::Unpacked),
+            zero
+        );
     }
 
     /// The k-mer table built from the in-memory unpacked `bases` must be
