@@ -280,6 +280,16 @@ impl SaFileReader {
             path: path.to_path_buf(),
             source: e,
         })?;
+        // Hint transparent huge pages for the SA. Seeding does ~20 RANDOM reads
+        // per call into this many-GB array (≈83 GB for hg38), so 4 KB pages force
+        // a page-table walk on nearly every probe — the TLB (~1.5 K entries)
+        // cannot cover the working set. 2 MB pages cut the TLB footprint ~512×,
+        // removing the per-probe page walk (orthogonal to cache residency: it
+        // helps even when the entry is in L3). Advisory and Linux-only — a no-op
+        // elsewhere and harmless if THP is unavailable; never affects
+        // correctness, only latency.
+        #[cfg(target_os = "linux")]
+        let _ = mmap.advise(memmap2::Advice::HugePage);
         let (num_entries, bpe_usize) = validate_sa_header(&mmap, path, mmap.len())?;
         let data_ptr = mmap.as_ptr();
         let data_len = mmap.len();
