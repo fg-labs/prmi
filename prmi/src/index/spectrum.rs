@@ -1742,6 +1742,131 @@ impl LearnedIndex {
         }
     }
 
+    /// Largest left-extension span `L` in `[anchor_len, span_max]` whose
+    /// length-`L` window ending at `pivot + anchor_len` occurs with count
+    /// `>= min_intv`, floored at `anchor_len` — the consumer's `min_intv`-
+    /// truncated reseed span (`zz_left_span_reseed`) in ONE call.
+    ///
+    /// Walks the reverse-complement strand DOWNWARD from the maximal extension:
+    /// each left base prepended to the forward pattern is a base APPENDED to its
+    /// RC, so the RC prefixes NEST (forward intervals don't) and `occ(RC(P)) ==
+    /// occ(P)`. The interval `[lo, hi)` is therefore carried across decreasing `L`
+    /// by a linear outward scan capped at `min_intv` — no per-candidate model
+    /// launch (the old span search issued a full forward `mem_search` per binary
+    /// step). Model-launched; the `.isa`-seeded fast path lands with the interval
+    /// variant.
+    ///
+    /// Byte-identical to the brute-force `truncated_span_oracle` — verified by
+    /// `mem_search_backward_truncated_span_rc_equals_oracle`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mem_search_backward_truncated_span_rc(
+        &self,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        min_intv: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> u64 {
+        if occ_count == 0 {
+            return 0;
+        }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        // Checked: a large caller-provided `anchor_len` must not wrap
+        // `pivot + anchor_len` (mirrors `mem_search_backward`); fail closed to the
+        // anchor floor on an invalid window.
+        let anchor_end = match usize::try_from(anchor_len)
+            .ok()
+            .and_then(|al| pivot.checked_add(al))
+        {
+            Some(end) if end <= read.len() => end,
+            _ => return anchor_len,
+        };
+        // Q = RC(read[q_start..anchor_end]) over the maximal ambiguity-free left
+        // extent; Q[..L] is the RC of the length-L window ending at `anchor_end`.
+        // Mask-and-complement (can't underflow on a malformed `> 3` byte; matches
+        // `reverse_complement_2bit`).
+        let mut q_start = pivot;
+        while q_start > 0 && read[q_start - 1] < 4 {
+            q_start -= 1;
+        }
+        let rc_len = anchor_end - q_start;
+        let mut rc_stack = [0u8; 256];
+        let rc_heap;
+        let q: &[u8] = if rc_len <= rc_stack.len() {
+            for (dst, &b) in rc_stack
+                .iter_mut()
+                .zip(read[q_start..anchor_end].iter().rev())
+            {
+                *dst = (b & 0x3) ^ 0x3;
+            }
+            &rc_stack[..rc_len]
+        } else {
+            rc_heap = read[q_start..anchor_end]
+                .iter()
+                .rev()
+                .map(|&b| (b & 0x3) ^ 0x3)
+                .collect::<Vec<u8>>();
+            &rc_heap
+        };
+        let q_key = tokenize_32mer(q, q.len().min(KMER_LEN));
+        // Maximal left-extension span + `q`'s insertion point.
+        let (span_max, ip) = self.forward_maximal_len(q, q_key, sa_num, pac, enc, l_pac);
+        if span_max <= anchor_len {
+            return anchor_len;
+        }
+        // The outward scan below needs a row INSIDE `Q[..span_max]`'s interval, but
+        // `ip` is the insertion point — it sits at the interval's edge, on whichever
+        // side `q[span_max]` would sort. The in-interval seed is the neighbor that
+        // shares the maximal prefix (`ip - 1` if it does, else `ip`); one probe.
+        let sm = &q[..span_max as usize];
+        let sm_key = tokenize_32mer(sm, sm.len().min(KMER_LEN));
+        let seed = if ip > 0 && self.shares_prefix(sm, sm_key, ip - 1, pac, enc, l_pac) {
+            ip - 1
+        } else {
+            ip
+        };
+        // Outward expansion of `[lo, hi)` at depth `l`, capped at `min_intv`.
+        let expand = |l: u64, lo: &mut u64, hi: &mut u64| {
+            let p = &q[..l as usize];
+            let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
+            while *lo > 0
+                && *hi - *lo < min_intv
+                && self.shares_prefix(p, p_key, *lo - 1, pac, enc, l_pac)
+            {
+                *lo -= 1;
+            }
+            while *hi < sa_num
+                && *hi - *lo < min_intv
+                && self.shares_prefix(p, p_key, *hi, pac, enc, l_pac)
+            {
+                *hi += 1;
+            }
+        };
+        // Maximal depth first: below the crossing the scan is uncapped and reaches
+        // the true maximal interval; at/above it the cap fires at `min_intv`.
+        let mut lo = seed;
+        let mut hi = seed + 1;
+        expand(span_max, &mut lo, &mut hi);
+        if hi - lo >= min_intv {
+            return span_max;
+        }
+        // Walk DOWN one base at a time, carrying `[lo, hi)`. The first `L` reaching
+        // `min_intv` is `L*`.
+        let mut l = span_max;
+        while l > anchor_len {
+            l -= 1;
+            expand(l, &mut lo, &mut hi);
+            if hi - lo >= min_intv {
+                return l;
+            }
+        }
+        // Even the anchor span fails the threshold -> floor at the anchor.
+        anchor_len
+    }
+
     /// One-shot maximal LEFT extension launched from an EXACT SA index hint —
     /// the backward twin of [`mem_search_from_hint`](Self::mem_search_from_hint),
     /// BWA-MEME's `no_search` for the left direction. `hint` is the SA index whose
@@ -3510,6 +3635,77 @@ mod keyed_tests {
                 sa_start,
                 occ,
             },
+        }
+    }
+
+    /// Independent brute-force oracle for `mem_search_backward_truncated_span_rc`:
+    /// the largest total span `L` in `[anchor_len, span_max]` whose exact length-`L`
+    /// window fully matches with occ `>= min_intv`, floored at `anchor_len`. Scans
+    /// every `L` (no monotonicity assumption) using only `mem_search` /
+    /// `mem_search_backward`, so it shares no code with the RC-downward impl.
+    #[allow(clippy::too_many_arguments)]
+    fn truncated_span_oracle(
+        idx: &LearnedIndex,
+        s: u64,
+        o: u64,
+        al: u64,
+        read: &[u8],
+        pivot: usize,
+        min_intv: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> u64 {
+        let span_max = idx
+            .mem_search_backward(s, o, al, read, pivot, pac, enc)
+            .match_len;
+        if span_max <= al {
+            return al;
+        }
+        let anchor_end = pivot + al as usize;
+        let mut best = al;
+        let mut l = al;
+        while l <= span_max {
+            let window = &read[anchor_end - l as usize..anchor_end];
+            let mm = idx.mem_search(window, pac, enc);
+            if mm.match_len >= l && mm.occ >= min_intv {
+                best = l;
+            }
+            l += 1;
+        }
+        best
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// `mem_search_backward_truncated_span_rc` (RC-downward, one call) ==
+        /// the linear `truncated_span_oracle` for length-1 reseed anchors across a
+        /// spread of `min_intv` — including 0 (no truncation -> span_max) and a huge
+        /// value (floor -> anchor_len). `anchor_len == 1` matches the consumer's
+        /// length-1 pivot reseed.
+        #[test]
+        fn mem_search_backward_truncated_span_rc_equals_oracle(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+            read in prop::collection::vec(0u8..=3, 30..120),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for pivot in (1..read.len()).step_by(7) {
+                // Length-1 forward anchor at the pivot (the consumer's reseed anchor).
+                let a = idx.mem_search(&read[pivot..pivot + 1], &fwd, e);
+                if a.match_len == 0 {
+                    continue;
+                }
+                let (s, o, al) = (a.sa_start, a.occ, 1u64);
+                for &min_intv in &[0u64, 1, 2, 5, 20, 1_000_000] {
+                    let want = truncated_span_oracle(&idx, s, o, al, &read, pivot, min_intv, &fwd, e);
+                    let got = idx
+                        .mem_search_backward_truncated_span_rc(o, al, &read, pivot, min_intv, &fwd, e);
+                    prop_assert_eq!(
+                        got, want,
+                        "truncated_span_rc != oracle at pivot {} min_intv {}", pivot, min_intv
+                    );
+                }
+            }
         }
     }
 
