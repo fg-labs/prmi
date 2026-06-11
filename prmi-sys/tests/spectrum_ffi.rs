@@ -11,8 +11,9 @@ use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
     prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
     prmi_bwd_task_t, prmi_close, prmi_forward_spectrum, prmi_forward_spectrum_batch,
-    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_open, prmi_sa_num,
-    prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t, PRMI_MEM_WANT_INTERVAL,
+    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_mem_search_lean, prmi_open,
+    prmi_sa_num, prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
+    PRMI_MEM_WANT_INTERVAL,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -1148,6 +1149,97 @@ fn forward_spectrum_batch_out_of_arena_returns_minus_two() {
         rc2, -2,
         "out-of-arena steps window should return -2, got {rc2}"
     );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_mem_search_lean` (the guards-removed diagnostic twin) writes
+/// BYTE-IDENTICAL outputs and returns the same code as `prmi_mem_search` for the
+/// same inputs — across the model-launch (`est_hint == 0`) and ISA-launch
+/// (`est_hint > 0`) paths, with and without `WANT_INTERVAL`. The two differ only
+/// by `clear_last_error`/`catch_unwind`, which don't affect outputs.
+#[test]
+fn mem_search_lean_matches_mem_search() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pnb = pac_unpacked.len() as u64;
+
+    // Run both entry points on the same inputs; assert identical rc + outputs.
+    let both = |query: &[u8], est_hint: u64, flags: u32| {
+        let (mut ml_a, mut ss_a, mut occ_a) = (0u32, 0u64, 0u64);
+        let (mut ml_b, mut ss_b, mut occ_b) = (0u32, 0u64, 0u64);
+        let rc_a = unsafe {
+            prmi_mem_search(
+                handle,
+                query.as_ptr(),
+                query.len() as i32,
+                pac_packed.as_ptr(),
+                pnb,
+                est_hint,
+                flags,
+                &mut ml_a,
+                &mut ss_a,
+                &mut occ_a,
+            )
+        };
+        let rc_b = unsafe {
+            prmi_mem_search_lean(
+                handle,
+                query.as_ptr(),
+                query.len() as i32,
+                pac_packed.as_ptr(),
+                pnb,
+                est_hint,
+                flags,
+                &mut ml_b,
+                &mut ss_b,
+                &mut occ_b,
+            )
+        };
+        assert_eq!(rc_a, rc_b, "rc differs (hint={est_hint}, flags={flags})");
+        assert_eq!(
+            ml_a, ml_b,
+            "match_len differs (hint={est_hint}, flags={flags})"
+        );
+        if flags & PRMI_MEM_WANT_INTERVAL != 0 {
+            assert_eq!(
+                (ss_a, occ_a),
+                (ss_b, occ_b),
+                "interval differs (hint={est_hint})"
+            );
+        }
+    };
+
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+    both(&query, 0, PRMI_MEM_WANT_INTERVAL); // model launch, interval
+    both(&query, 0, 0); // model launch, match_len only
+
+    // ISA launch: a valid in-interval hint = the exact match's sa_start.
+    let (mut ml, mut ss, mut occ) = (0u32, 0u64, 0u64);
+    assert_eq!(
+        unsafe {
+            prmi_mem_search(
+                handle,
+                query.as_ptr(),
+                query.len() as i32,
+                pac_packed.as_ptr(),
+                pnb,
+                0,
+                PRMI_MEM_WANT_INTERVAL,
+                &mut ml,
+                &mut ss,
+                &mut occ,
+            )
+        },
+        0
+    );
+    if ss > 0 && occ > 0 {
+        both(&query, ss, PRMI_MEM_WANT_INTERVAL); // est_hint = in-interval SA index
+    }
 
     unsafe { prmi_close(handle) };
     drop(dir);
