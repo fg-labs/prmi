@@ -2165,6 +2165,147 @@ impl LearnedIndex {
         self.mem_search(window, pac, enc)
     }
 
+    /// `min_intv`-truncated FORWARD extension — the forward analogue of
+    /// [`mem_search_backward_truncated_interval`](Self::mem_search_backward_truncated_interval),
+    /// for the reseed's RIGHT (forward) bound. Given `query` and its already-found
+    /// `maximal` match `[sa_start, sa_start + occ)` at length `match_len`, finds the
+    /// largest length `L < match_len` whose length-`L` prefix occurs `>= min_intv`
+    /// times and returns `MemMatch { match_len: L, sa_start, occ }` for that interval
+    /// (or the zero `MemMatch` when even `L == 1` is too frequent-bounded to reach).
+    /// The caller passes a `maximal` whose `occ < min_intv` (the `occ >= min_intv`
+    /// case needs no truncation and is handled before the call).
+    ///
+    /// Unlike the LEFT reseed (where prepending bases breaks forward nesting, forcing
+    /// the RC walk of `_interval_rc`), FORWARD prefixes nest directly: `query[..L]`
+    /// is a prefix of `query[..L+1]`, so `query[..L]`'s interval is a SUPERSET of
+    /// `query[..L+1]`'s, same start. So the walk carries `[lo, hi)` OUTWARD from the
+    /// maximal interval as `L` shrinks — a short `shares_prefix` scan capped at
+    /// `min_intv` per step, no model launch. `occ` is monotone non-increasing in `L`,
+    /// so the first `L` (largest) reaching `min_intv` is `L*`.
+    ///
+    /// `want_interval == false` returns only `L*` in `match_len` (the driver's
+    /// `next_pivot` use), skipping the two boundary recoveries. With
+    /// `want_interval == true` the exact interval is recovered by galloping
+    /// `find_boundary` out from the capped walk's interior `[lo, hi)` seed (the
+    /// forward analogue of `_interval_rc`'s `recover`): `find_boundary` is
+    /// seed-independent, so the boundaries (and `occ`) are byte-identical to a cold
+    /// `mem_search`; the tight seed only removes the model launch.
+    ///
+    /// `maximal` must be a real result from a prior `mem_search` on `query`
+    /// (`match_len <= query.len()` and `[sa_start, sa_start + occ)` a non-empty
+    /// sub-range of `[0, sa_num)`). A `pub` entrypoint can be handed anything, so a
+    /// `maximal` violating those bounds — or an undersized `Packed` `pac` — fails
+    /// closed to the zero `MemMatch` rather than panicking on an out-of-range slice,
+    /// SA probe, or packed-decode `.unwrap()`.
+    ///
+    /// Verified by `forward_truncate_below_maximal_equals_oracle`. Like the other
+    /// truncated-reseed primitives it is `pub` with no in-tree caller until the
+    /// `collect` reseed module lands; the proptest is its only current consumer.
+    pub fn forward_truncate_below_maximal(
+        &self,
+        query: &[u8],
+        maximal: MemMatch,
+        min_intv: u64,
+        want_interval: bool,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Fail closed on an undersized packed pac before any compare/probe helper
+        // can reach a packed-decode `.unwrap()` (mirrors the other one-shot
+        // entrypoints). Unlike them, this primitive is not preceded by a `mem_search`
+        // on this index that would already have validated the pac, so the guard is
+        // load-bearing here.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "forward_truncate_below_maximal").is_err() {
+                return zero;
+            }
+        }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        // Fail closed on a malformed `maximal`. Unlike the other truncated-reseed
+        // primitives, this one slices `query` and SA-probes directly off the
+        // caller-supplied interval, so an inconsistent `maximal` would otherwise
+        // panic (`query[..l]`) or drive an out-of-range SA index (`shares_prefix`).
+        // A real `maximal` from `mem_search` always satisfies these.
+        let lmax = match usize::try_from(maximal.match_len) {
+            Ok(v) if v <= query.len() => v,
+            _ => return zero,
+        };
+        // The initial interval must be a valid, non-empty `[lo, hi) ⊆ [0, sa_num)`.
+        let hi0 = match maximal.sa_start.checked_add(maximal.occ) {
+            Some(v) if maximal.occ > 0 && maximal.sa_start < sa_num && v <= sa_num => v,
+            _ => return zero,
+        };
+        // Carry the forward interval outward as the length shrinks (occ grows).
+        let mut lo = maximal.sa_start;
+        let mut hi = hi0;
+        let mut best_len = 0usize;
+        let mut l = lmax;
+        while l > 1 {
+            l -= 1;
+            let p = &query[..l];
+            let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
+            // Expand outward to interval(l), capped at min_intv (mirrors the RC walk).
+            while lo > 0
+                && hi - lo < min_intv
+                && self.shares_prefix(p, p_key, lo - 1, pac, enc, l_pac)
+            {
+                lo -= 1;
+            }
+            while hi < sa_num
+                && hi - lo < min_intv
+                && self.shares_prefix(p, p_key, hi, pac, enc, l_pac)
+            {
+                hi += 1;
+            }
+            if hi - lo >= min_intv {
+                best_len = l; // largest L with occ >= min_intv (occ monotone in L)
+                break;
+            }
+        }
+        if best_len == 0 {
+            return MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        // Length-only caller (next_pivot): `L*` is already fixed by the walk;
+        // skip both recovery searches.
+        if !want_interval {
+            return MemMatch {
+                match_len: best_len as u64,
+                sa_start: 0,
+                occ: 0,
+            };
+        }
+        // The capped walk stopped expanding the moment width reached `min_intv`, so
+        // the carried `[lo, hi)` is an interior subset of the true length-`L*`
+        // interval. Recover the EXACT boundaries by galloping `find_boundary` out
+        // from that interior seed instead of a cold model-seeded `mem_search` — the
+        // forward analogue of the backward `recover()`. `find_boundary` is
+        // seed-independent, so the boundaries (and thus `occ`) are byte-identical;
+        // the tight seed only removes the model launch and shortens the gallop.
+        let p = &query[..best_len];
+        let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
+        let lower = self.find_boundary(0, sa_num, lo, lo, |mid| {
+            self.ref_less(p, p_key, mid, pac, enc, l_pac)
+        });
+        let upper = self.find_boundary(lower, sa_num, hi, hi, |mid| {
+            self.shares_prefix(p, p_key, mid, pac, enc, l_pac)
+        });
+        MemMatch {
+            match_len: best_len as u64,
+            sa_start: lower,
+            occ: upper - lower,
+        }
+    }
+
     /// One-shot maximal LEFT extension launched from an EXACT SA index hint —
     /// the backward twin of [`mem_search_from_hint`](Self::mem_search_from_hint),
     /// BWA-MEME's `no_search` for the left direction. `hint` is the SA index whose
@@ -4176,6 +4317,150 @@ mod keyed_tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Independent oracle for `forward_truncate_below_maximal`: the largest length
+    /// `L < maximal.match_len` whose prefix `query[..L]` occurs `>= min_intv` times,
+    /// with its exact interval recovered by `mem_search`. Uses only `mem_search`, so
+    /// it shares no code with the capped outward-walk impl. Returns the zero
+    /// `MemMatch` when no such `L` exists.
+    fn forward_truncate_oracle(
+        idx: &LearnedIndex,
+        query: &[u8],
+        maximal: MemMatch,
+        min_intv: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        let lmax = maximal.match_len as usize;
+        let mut l = lmax;
+        while l > 1 {
+            l -= 1;
+            // `query[..l]` is a prefix of the matching `query[..lmax]`, so it occurs.
+            let mm = idx.mem_search(&query[..l], pac, enc);
+            if mm.occ >= min_intv {
+                return MemMatch {
+                    match_len: l as u64,
+                    sa_start: mm.sa_start,
+                    occ: mm.occ,
+                };
+            }
+        }
+        MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// `forward_truncate_below_maximal` (capped outward FORWARD walk) ==
+        /// `forward_truncate_oracle` (the exact interval at the brute-force largest
+        /// `L < Lmax` with `occ >= min_intv`), across reference-lifted queries and a
+        /// spread of `min_intv` — including 1 (truncate one below the maximal) and a
+        /// huge value (no `L` qualifies -> zero). Also checks the
+        /// `want_interval == false` span-only return matches `L*`.
+        #[test]
+        fn forward_truncate_below_maximal_equals_oracle(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for start in (0..fwd.len().saturating_sub(4)).step_by(11) {
+                for qlen in [4usize, 12, 32] {
+                    if start + qlen > fwd.len() {
+                        continue;
+                    }
+                    let q = &fwd[start..start + qlen];
+                    let maximal = idx.mem_search(q, &fwd, e);
+                    if maximal.match_len < 2 {
+                        continue; // need Lmax >= 2 to truncate below it
+                    }
+                    for &min_intv in &[1u64, 2, 3, 5, 20, 1_000_000] {
+                        let want = forward_truncate_oracle(&idx, q, maximal, min_intv, &fwd, e);
+                        let got =
+                            idx.forward_truncate_below_maximal(q, maximal, min_intv, true, &fwd, e);
+                        prop_assert_eq!(
+                            got, want,
+                            "forward_truncate != oracle (qlen={} min_intv={})", qlen, min_intv
+                        );
+                        // `want_interval == false` returns only `L*` in `match_len`.
+                        let span_only =
+                            idx.forward_truncate_below_maximal(q, maximal, min_intv, false, &fwd, e);
+                        prop_assert_eq!(
+                            span_only.match_len, want.match_len,
+                            "forward_truncate span-only != L* (qlen={} min_intv={})", qlen, min_intv
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `forward_truncate_below_maximal` is a `pub` method that slices `query` and
+    /// SA-probes directly off the caller-supplied `maximal`/`pac`, so a malformed
+    /// `maximal` OR an undersized packed `pac` must fail closed (zero `MemMatch`)
+    /// rather than panic on an out-of-range slice / SA index / packed-decode unwrap.
+    #[test]
+    fn forward_truncate_below_maximal_fails_closed_on_bad_input() {
+        let fwd: Vec<u8> = (0..120u32).map(|i| (i % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let q = &fwd[10..30];
+        let sa_num = idx.sa_num();
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // match_len past the query end -> `query[..l]` would slice OOB.
+        let bad_len = MemMatch {
+            match_len: (q.len() + 5) as u64,
+            sa_start: 0,
+            occ: 2,
+        };
+        // sa_start + occ past sa_num -> the initial `hi` would index an OOB SA row.
+        let bad_hi = MemMatch {
+            match_len: 8,
+            sa_start: sa_num - 1,
+            occ: 10,
+        };
+        // sa_start at/over sa_num -> the downward `shares_prefix(lo - 1)` probe is OOB.
+        let bad_start = MemMatch {
+            match_len: 8,
+            sa_start: sa_num + 5,
+            occ: 1,
+        };
+        // Degenerate empty interval.
+        let bad_occ = MemMatch {
+            match_len: 8,
+            sa_start: 3,
+            occ: 0,
+        };
+        for bad in [bad_len, bad_hi, bad_start, bad_occ] {
+            for &want_interval in &[true, false] {
+                assert_eq!(
+                    idx.forward_truncate_below_maximal(q, bad, 2, want_interval, &fwd, e),
+                    zero,
+                    "malformed maximal {bad:?} (want_interval={want_interval}) must fail closed"
+                );
+            }
+        }
+        // An undersized `Packed` pac must fail closed BEFORE any `shares_prefix`
+        // probe reaches a packed-decode `.unwrap()` (mirrors the guarded one-shot
+        // entrypoints). Use a real (well-formed) `maximal` so only the packed guard
+        // can trip: `num_bases` claims far more bases than the empty `pac` holds.
+        let good = idx.mem_search(q, &fwd, e);
+        assert!(good.match_len >= 2, "fixture should yield a maximal match");
+        let packed = PacEncoding::Packed { num_bases: 1 << 20 };
+        for &want_interval in &[true, false] {
+            assert_eq!(
+                idx.forward_truncate_below_maximal(q, good, 2, want_interval, &[], packed),
+                zero,
+                "undersized packed pac (want_interval={want_interval}) must fail closed"
+            );
         }
     }
 
