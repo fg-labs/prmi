@@ -1787,3 +1787,177 @@ pub unsafe extern "C" fn prmi_reverse_complement_2bit(
     }
     0
 }
+
+/// One SMEM in the C ABI — the layout the consumer `memcpy`s into its `SMEM[]`.
+/// `#[repr(C)]`, field-for-field identical to `prmi::index::collect::Smem`
+/// (a const layout assertion below pins size + alignment).
+#[repr(C)]
+pub struct prmi_smem_t {
+    /// Read index (stamped into every emitted SMEM; the consumer groups by it).
+    pub rid: u32,
+    /// Match start in the read (inclusive).
+    pub m: u32,
+    /// Match end in the read (inclusive).
+    pub n: u32,
+    /// SA-interval start index (raw 2× SA).
+    pub k: i64,
+    /// Reverse-complement bi-interval start; always 0 on the learned path.
+    pub l: i64,
+    /// Occurrence count = SA-interval size.
+    pub s: i64,
+}
+
+/// SMEM-collection parameters, mirroring the bwa-mem3 `mem_opt_t` fields the
+/// seeding walk reads. `split_len` is the caller-precomputed
+/// `round(min_seed_len * split_factor)`. `max_mem_intv == 0` skips pass 3.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct prmi_collect_opts_t {
+    /// Minimum seed length; emitted SMEMs span `>= min_seed_len`.
+    pub min_seed_len: u32,
+    /// Reseed length threshold: pass-1 SMEMs with span `>= split_len` are reseeded.
+    pub split_len: u32,
+    /// Reseed occurrence threshold: only pass-1 SMEMs with `s <= split_width`.
+    pub split_width: i64,
+    /// Pass-3 `max_mem_intv` strategy. **Pass 3 is not yet supported — only `0` is
+    /// accepted; a nonzero value is rejected with `-5`.**
+    pub max_mem_intv: i64,
+}
+
+/// `prmi_smem_t` and `prmi::index::collect::Smem` are both `#[repr(C)]` with the
+/// same fields in the same order, so an output buffer of one can be filled in
+/// place as a slice of the other. This guards size/alignment (and, given identical
+/// `#[repr(C)]` field types/order, therefore the field offsets too).
+const _: () = {
+    assert!(
+        core::mem::size_of::<prmi_smem_t>() == core::mem::size_of::<prmi::index::collect::Smem>()
+    );
+    assert!(
+        core::mem::align_of::<prmi_smem_t>() == core::mem::align_of::<prmi::index::collect::Smem>()
+    );
+};
+
+/// Collect ALL SMEMs for ONE read (passes 1+2, sorted within-read) byte-identically
+/// to bwa-mem3 FMI seeding — the fused entrypoint that runs the whole zigzag walk in
+/// one call instead of the consumer's 91–155 per-read `prmi_mem_search*` crossings.
+///
+/// `read` is 2-bit encoded (`0..=3`, `4` = N), `read_len` bytes. `rid` is stamped
+/// into every emitted `prmi_smem_t::rid`. `pac` is the FORWARD pac (bntpac packed,
+/// `ceil(pac_num_bases/4)` bytes). The SMEMs are written to `out[..*out_n]`;
+/// `out_cap` is the slot capacity.
+///
+/// An EMPTY read (`read_len == 0`) is valid — it yields 0 SMEMs (unlike the
+/// per-query `prmi_mem_search*` entrypoints, which reject `read_len <= 0`); `read`
+/// may be NULL in that case (the canonical C empty-slice representation).
+///
+/// Returns 0 on success (`*out_n` = SMEM count); `-1` null pointer (null `handle`/
+/// `opts`/`pac`/`out_n`, null `read` with nonzero `read_len`, or null `out` with
+/// nonzero `out_cap`); `-2` invalid `read_len`/`out_cap` or `pac_num_bases` too
+/// large for this platform; `-3` internal panic; `-4` `out` too small (`*out_n` is
+/// set to the required count — grow and retry); `-5` `max_mem_intv != 0` (pass 3
+/// not yet supported).
+///
+/// # Safety
+/// `handle` valid; `read` valid for `read_len` bytes; `opts` valid; `pac` valid for
+/// `ceil(pac_num_bases/4)` bytes; `out` valid for `out_cap` `prmi_smem_t` slots (may
+/// be null iff `out_cap == 0`); `out_n` writable.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn prmi_collect_smems(
+    handle: *const prmi_index_t,
+    read: *const u8,
+    read_len: c_int,
+    rid: u32,
+    opts: *const prmi_collect_opts_t,
+    pac: *const u8,
+    pac_num_bases: u64,
+    out: *mut prmi_smem_t,
+    out_cap: c_int,
+    out_n: *mut c_int,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null() || opts.is_null() || pac.is_null() || out_n.is_null() {
+        set_last_error("prmi_collect_smems: null pointer");
+        return -1;
+    }
+    // Unlike the per-query `prmi_mem_search*` entrypoints (which reject
+    // `read_len <= 0`), an empty read is VALID here: a whole-read collector over an
+    // empty read yields 0 SMEMs (`Ok(0)`). Only a negative length is an error.
+    if read_len < 0 || out_cap < 0 {
+        set_last_error("prmi_collect_smems: invalid read_len or out_cap");
+        return -2;
+    }
+    // `read`/`out` may be NULL only for the empty case (the canonical C empty-slice
+    // representation, `NULL + 0`); a NULL pointer with a nonzero length is an error.
+    if read.is_null() && read_len != 0 {
+        set_last_error("prmi_collect_smems: null read with nonzero read_len");
+        return -1;
+    }
+    if out.is_null() && out_cap != 0 {
+        set_last_error("prmi_collect_smems: null out with nonzero out_cap");
+        return -1;
+    }
+    let o = unsafe { &*opts };
+    // Pass 3 (`max_mem_intv > 0`) is not yet ported; reject it loudly rather than
+    // emit an incomplete (passes 1+2 only) seed set.
+    if o.max_mem_intv != 0 {
+        set_last_error("prmi_collect_smems: max_mem_intv > 0 (pass 3) is not yet supported");
+        return -5;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    // `from_raw_parts` requires a non-null pointer even for length 0, so build an
+    // empty slice directly for the empty case (mirrors `out_slice` below); `read`
+    // is guaranteed non-null when `read_len > 0` by the check above.
+    let r: &[u8] = if read_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(read, read_len as usize) }
+    };
+    let copts = prmi::index::collect::CollectOpts {
+        min_seed_len: o.min_seed_len,
+        split_len: o.split_len,
+        split_width: o.split_width,
+        max_mem_intv: o.max_mem_intv,
+    };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_collect_smems: pac_num_bases too large for this platform");
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    // Reinterpret the prmi_smem_t output buffer as a Smem slice (layout-asserted).
+    let out_slice: &mut [prmi::index::collect::Smem] = if out_cap == 0 {
+        &mut []
+    } else {
+        unsafe {
+            std::slice::from_raw_parts_mut(out as *mut prmi::index::collect::Smem, out_cap as usize)
+        }
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx
+            .collect_smems(r, rid, &copts, pac_slice, enc, out_slice)
+    }));
+    match res {
+        Ok(Ok(n)) => {
+            unsafe {
+                *out_n = n as c_int;
+            }
+            0
+        }
+        Ok(Err(needed)) => {
+            unsafe {
+                *out_n = needed as c_int;
+            }
+            -4
+        }
+        Err(_) => {
+            set_last_error("prmi_collect_smems: internal panic");
+            -3
+        }
+    }
+}

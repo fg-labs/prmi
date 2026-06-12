@@ -1,0 +1,1183 @@
+// Copyright (C) 2026 Fulcrum Genomics LLC
+// SPDX-License-Identifier: MIT
+
+//! Fused per-read SMEM collection — `LearnedIndex::collect_smems`.
+//!
+//! Collapses the consumer's per-read zigzag SMEM walk (currently 91–155 stateless
+//! C→Rust FFI calls/read) into ONE native Rust entrypoint, byte-identical to
+//! bwa-mem3's FMI seeding. The per-call search cost is already at parity with
+//! bwa-meme (MODE2: prmi 7.0 vs 7.76 probes/call); the entire residual is **call
+//! count** (bwa-meme ~53). Running the walk in one process lets the SA-interval
+//! state cross `zz_left_span` → `zz_right_emit` → next-step in-register — the thing
+//! the FFI boundary forces cold — collapsing the call count toward bwa-meme's.
+//!
+//! This is a port of the consumer's zigzag (B) driver `mem_collect_smem_zigzag`
+//! (`mem_collect_smem_learned.cpp`) with `PRMI_ZIGZAG_RESEED` semantics, no-ISA
+//! (MODE_NONE): every search runs at `est_hint = 0`, so the `ZzHintState`
+//! machinery is omitted. Built on the existing, byte-identity-tested per-call
+//! primitives (`mem_search`, `mem_search_backward`,
+//! `mem_search_backward_truncated_span_rc`, `forward_truncate_below_maximal`) — no
+//! new search math.
+//!
+//! **Pass 3 (`max_mem_intv > 0`) is NOT yet ported.** It needs the model-seeded
+//! forward-narrowing primitive from the (still-unmerged) forward-routing work; the
+//! FFI rejects `max_mem_intv != 0` up front, and [`LearnedIndex::collect_smems`]
+//! documents the precondition. Passes 1+2 (`max_mem_intv == 0`) are byte-identical
+//! to FMI seeding today.
+
+use crate::index::smem::PacEncoding;
+use crate::index::LearnedIndex;
+
+/// Per-primitive SA-probe attribution for the `collect_gate` harness (profiling
+/// only; compiled out without `spectrum-probe-count`). Each [`Guard`] brackets one
+/// helper's probe delta into a disjoint bucket so the per-read probe budget can be
+/// split across pass-1 left/right and reseed left/forward (slot 4, `pass3`, is
+/// reserved for the deferred pass 3 and stays zero until it lands).
+#[cfg(feature = "spectrum-probe-count")]
+pub mod attrib {
+    use crate::index::spectrum::probe_count;
+    use std::cell::Cell;
+
+    /// Bucket labels, indexed by slot (see [`Guard::new`]).
+    pub const LABELS: [&str; 5] = ["p1_left", "p1_right", "rs_left", "rs_fwd", "pass3"];
+    thread_local! {
+        static COUNTS: [Cell<u64>; 5] = const { [const { Cell::new(0) }; 5] };
+    }
+
+    /// Zero all buckets.
+    pub fn reset() {
+        COUNTS.with(|c| c.iter().for_each(|x| x.set(0)));
+    }
+
+    /// Snapshot of the buckets (parallel to [`LABELS`]).
+    pub fn snapshot() -> [u64; 5] {
+        COUNTS.with(|c| std::array::from_fn(|i| c[i].get()))
+    }
+
+    /// RAII guard: on drop, adds the probes issued during its lifetime to bucket
+    /// `slot`. Place at the top of a helper; nesting two guards would double-count,
+    /// so guard only one disjoint level (the `collect` helpers don't nest).
+    pub struct Guard {
+        slot: usize,
+        start: u64,
+    }
+    impl Guard {
+        /// Start attributing probes to bucket `slot` until this guard drops.
+        pub fn new(slot: usize) -> Self {
+            Self {
+                slot,
+                start: probe_count::get(),
+            }
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let delta = probe_count::get() - self.start;
+            COUNTS.with(|c| c[self.slot].set(c[self.slot].get() + delta));
+        }
+    }
+}
+
+/// One SMEM, mirroring the consumer's `SMEM` (FMI_search.h:86-89) field-for-field,
+/// INCLUDING the signed `i64` interval fields. `l` (the FMI reverse-complement
+/// bi-interval) is always 0 on the learned path (cpp:760); kept for struct/layout
+/// compatibility with the consumer's `memcpy` into `SMEM[]`. `k` (SA index) and
+/// `s` (occurrence count) are guaranteed non-negative on a real index; typed `i64`
+/// to match the consumer's comparator and `--dump-smems` byte-for-byte.
+///
+/// `#[repr(C)]` with this exact field order matches `prmi_smem_t` (prmi-sys); the
+/// `i64` triple forces 8-byte alignment, so a 4-byte pad follows the `u32` triple
+/// (`k` at offset 16, not 12). A layout test pins this.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Smem {
+    /// Read index (stamped into every emitted SMEM; the consumer groups by it).
+    pub rid: u32,
+    /// Match start in the read (inclusive).
+    pub m: u32,
+    /// Match end in the read (inclusive).
+    pub n: u32,
+    /// SA-interval start index (raw 2× SA). Non-negative; `i64` for ABI parity.
+    pub k: i64,
+    /// Reverse-complement bi-interval start; always 0 on the learned path.
+    pub l: i64,
+    /// Occurrence count = SA-interval size. Non-negative; `i64` for ABI parity.
+    pub s: i64,
+}
+
+/// SMEM-collection parameters, mirroring the bwa-mem3 `mem_opt_t` fields the
+/// seeding walk reads. `split_len` is caller-precomputed
+/// `round(min_seed_len * split_factor)` (cpp:1700). `max_mem_intv == 0` skips
+/// pass 3 (the only currently-supported value — see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectOpts {
+    /// Minimum seed length; emitted SMEMs span `>= min_seed_len`.
+    pub min_seed_len: u32,
+    /// Reseed length threshold: pass-1 SMEMs with span `>= split_len` are reseeded.
+    pub split_len: u32,
+    /// Reseed occurrence threshold: only pass-1 SMEMs with `s <= split_width`.
+    pub split_width: i64,
+    /// Pass-3 `max_mem_intv` strategy; `0` disables pass 3. **Pass 3 is not yet
+    /// ported — only `0` is supported (the FFI rejects nonzero).**
+    pub max_mem_intv: i64,
+}
+
+impl LearnedIndex {
+    /// Collect all SMEMs for ONE read (passes 1+2, sorted within-read per the
+    /// design §4.7), byte-identical to FMI seeding.
+    ///
+    /// `read` is 2-bit encoded (`0..=3`, `4` = N). `rid` is stamped into every
+    /// emitted [`Smem::rid`]. `pac`/`enc` are the reference encoding (as for
+    /// [`LearnedIndex::mem_search`]). Writes up to `out.len()` SMEMs.
+    ///
+    /// Returns `Ok(count)` with the SMEMs written to `out[..count]`, or
+    /// `Err(needed)` if `out` is too small (the caller grows `out` to `>= needed`
+    /// and retries). A safe per-read capacity is `2 * read.len()` (passes 1+2 emit
+    /// `<= read.len()`; the reserved pass-3 budget keeps the `2 *` slack).
+    ///
+    /// **Precondition: `opts.max_mem_intv == 0`.** Pass 3 (`max_mem_intv > 0`) is
+    /// not yet ported; the FFI rejects a nonzero value (`-5`) before reaching here,
+    /// and a direct Rust caller passing nonzero panics (rather than silently getting
+    /// a passes-1+2-only seed set). This precondition is removed when pass 3 lands.
+    ///
+    /// Concurrency-safe: `&self` is read-only (SA/model/kmt + the init-once
+    /// `base_intervals`); all scratch is stack/local, so many worker threads may
+    /// call this on a shared index with no shared mutable state.
+    pub fn collect_smems(
+        &self,
+        read: &[u8],
+        rid: u32,
+        opts: &CollectOpts,
+        pac: &[u8],
+        enc: PacEncoding,
+        out: &mut [Smem],
+    ) -> Result<usize, usize> {
+        assert_eq!(
+            opts.max_mem_intv, 0,
+            "collect_smems: pass 3 (max_mem_intv > 0) is not yet supported"
+        );
+        let mut smems = self.collect_smems_unsorted(read, rid, opts, pac, enc);
+        Self::sort_within_read(&mut smems);
+        if smems.len() > out.len() {
+            return Err(smems.len());
+        }
+        out[..smems.len()].copy_from_slice(&smems);
+        Ok(smems.len())
+    }
+
+    /// Within-read two-stage sort (port of cpp:1833-1850, restricted to one rid).
+    /// Stage 1 is the per-rid restriction of the global `compare_smem`
+    /// (`m ASC, n DESC`); stage 2 is the per-rid `ks_introsort(mem_intv1_learned)`
+    /// by `(m<<32)|n` (`m ASC, n ASC`). Both C++ sorts are unstable, so for SMEMs
+    /// that share `(m, n)` the `(k, s)` order is the unstable-sort result and is NOT
+    /// derivable from the spec — this composition is deterministic but its tie order
+    /// is verified at the consumer box-gate.
+    // KNOWN OPEN: (m,n)-tie order vs the C++ unstable introsort (deferred to box-gate).
+    fn sort_within_read(smems: &mut [Smem]) {
+        // Stage 1: m ASC, n DESC.
+        smems.sort_unstable_by(|a, b| a.m.cmp(&b.m).then(b.n.cmp(&a.n)));
+        // Stage 2: m ASC, n ASC (dominates stage 1 for distinct (m,n)).
+        smems.sort_unstable_by(|a, b| a.m.cmp(&b.m).then(a.n.cmp(&b.n)));
+    }
+
+    /// The per-read walk (passes 1+2) in EMISSION order, before the within-read
+    /// sort (Task 7). Returned as a `Vec` so the whole set is available to sort.
+    /// Port of the `mem_collect_smem_zigzag` driver (cpp:1644-1834), no-ISA.
+    ///
+    /// Pass 3 (`max_mem_intv > 0`) is NOT run here — it is deferred (see the module
+    /// docs); the entrypoint's precondition keeps `max_mem_intv == 0`.
+    fn collect_smems_unsorted(
+        &self,
+        read: &[u8],
+        rid: u32,
+        opts: &CollectOpts,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<Smem> {
+        let rlen = read.len();
+        let mut smems: Vec<Smem> = Vec::new();
+
+        // ---- Pass 1: zigzag walk over all positions (min_intv = 1) ----
+        let mut x = 0;
+        while x < rlen {
+            self.zz_step1(
+                read,
+                rid,
+                &mut x,
+                1,
+                opts.min_seed_len,
+                &mut smems,
+                pac,
+                enc,
+            );
+        }
+        let num1 = smems.len();
+
+        // ---- Reseed selection (filter, preserves pass-1 order; cpp:1702-1719) ----
+        // For each pass-1 SMEM with span >= split_len && s <= split_width, reseed at
+        // the midpoint with min_intv = s + 1. (The no-ISA port omits the refpos cache.)
+        let split_len = opts.split_len;
+        let mut reseeds: Vec<(usize, i64)> = Vec::new();
+        for p in &smems[..num1] {
+            let span = p.n + 1 - p.m;
+            if span < split_len || p.s > opts.split_width {
+                continue;
+            }
+            let mid = ((p.m + p.n + 1) >> 1) as usize;
+            reseeds.push((mid, p.s + 1));
+        }
+
+        // ---- Pass 2: one reseed walk per selected pivot ----
+        for (pivot, min_intv) in reseeds {
+            self.zz_step1_reseed(
+                read,
+                rid,
+                pivot,
+                min_intv,
+                opts.min_seed_len,
+                &mut smems,
+                pac,
+                enc,
+            );
+        }
+
+        // ---- Pass 3 (max_mem_intv strategy) is deferred; see the module docs. ----
+
+        smems
+    }
+
+    /// Maximal LEFT exact-match span INCLUDING the pivot base — the analogue of
+    /// BWA-MEME's `ss_exact_match_len` (port of `zz_left_span`, cpp:834-878). The
+    /// driver repositions `pivot = pivot - span + 1`. Returns `>= 1` (the pivot
+    /// base itself), even on a degenerate/no-extension anchor.
+    ///
+    /// One backward extension with the SA-interval carried in-register (the
+    /// in-process win vs the consumer's two FFI crossings): a length-1 forward
+    /// anchor at `read[pivot]` is extended left, and `mem_search_backward` returns
+    /// `match_len` = the TOTAL span (1 + left_ext). `zz_left_span` uses ONLY the
+    /// span (the interval is discarded).
+    ///
+    /// The forward anchor `mem_search` is elided: on the span-only (ambiguous) path
+    /// the anchor `sa_start` is unused, and its `occ` only gated an `occ==0 ->
+    /// return 1` redundant with the RC search's `match_len <= anchor_len ->
+    /// anchor_len` floor (a non-occurring base yields `match_len=0`). The unique-
+    /// anchor fast path (`occ==1 && sa_start!=0`) cannot fire for the `sa_start=0`
+    /// unit sentinel, so it reproduces the genome path exactly — one fewer
+    /// `mem_search` per left-extension step.
+    fn zz_left_span(&self, read: &[u8], pivot: usize, pac: &[u8], enc: PacEncoding) -> usize {
+        #[cfg(feature = "spectrum-probe-count")]
+        let _g = attrib::Guard::new(0); // p1_left
+        let m = self.mem_search_backward(0, 1, 1, read, pivot, pac, enc);
+        if m.match_len == 0 {
+            return 1; // no extension (cpp:870-876)
+        }
+        m.match_len as usize
+    }
+
+    /// Forward maximal match from `pivot` over the N-clamped window of length
+    /// `qlen`, emitting ONE SMEM if it clears the seed gate (port of `zz_right_emit`,
+    /// cpp:694-816; the `ZzHintState` block cpp:713-812 is omitted in the no-ISA
+    /// port). Returns `match_len` (returned ALWAYS — the driver advances
+    /// `search_pivot = pivot + match_len`).
+    ///
+    /// Emit gate (cpp:753): `match_len >= min_seed_len && occ >= min_intv`. The
+    /// emitted SMEM is `{rid, m=pivot, n=pivot+match_len-1, k=sa_start, l=0, s=occ}`.
+    #[allow(clippy::too_many_arguments)]
+    fn zz_right_emit(
+        &self,
+        read: &[u8],
+        rid: u32,
+        pivot: usize,
+        qlen: usize,
+        min_intv: i64,
+        min_seed_len: u32,
+        out: &mut Vec<Smem>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> usize {
+        #[cfg(feature = "spectrum-probe-count")]
+        let _g = attrib::Guard::new(1); // p1_right
+        if qlen == 0 {
+            return 0;
+        }
+        let m = self.mem_search(&read[pivot..pivot + qlen], pac, enc);
+        let match_len = m.match_len as usize;
+        if m.match_len >= min_seed_len as u64 && m.occ as i64 >= min_intv {
+            out.push(Smem {
+                rid,
+                m: pivot as u32,
+                n: (pivot + match_len - 1) as u32,
+                k: m.sa_start as i64,
+                l: 0,
+                s: m.occ as i64,
+            });
+        }
+        match_len
+    }
+
+    /// One pass-1 zigzag invocation at `*io_pivot` (port of `zz_step1`, cpp:898-975,
+    /// non-tradeoff / no-ISA). Emits SMEMs onto `out` and advances `*io_pivot` to
+    /// BWA-MEME's `next_pivot`. The driver's pass-1 loop is
+    /// `x=0; while x<rlen { zz_step1(&mut x) }`.
+    #[allow(clippy::too_many_arguments)]
+    fn zz_step1(
+        &self,
+        read: &[u8],
+        rid: u32,
+        io_pivot: &mut usize,
+        min_intv: i64,
+        min_seed_len: u32,
+        out: &mut Vec<Smem>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) {
+        let rlen = read.len();
+        let msl = min_seed_len as usize;
+        let mut pivot = *io_pivot;
+
+        // ---- read[pivot] ambiguous (cpp:916-921) ----
+        if read[pivot] >= 4 {
+            pivot = if rlen - pivot < msl { rlen } else { pivot + 1 };
+            *io_pivot = pivot;
+            return;
+        }
+
+        if pivot != 0 && read[pivot - 1] < 4 {
+            // ---- zigzag loop (cpp:923-959) ----
+            let next_pivot = rlen;
+            let mut search_pivot = pivot;
+            while search_pivot < next_pivot {
+                // Ambiguous guard at the (re)entry position (cpp:930-939).
+                if read[search_pivot] >= 4 {
+                    if rlen - search_pivot < msl {
+                        pivot = rlen;
+                        search_pivot = rlen;
+                    } else {
+                        search_pivot += 1;
+                        pivot += 1;
+                    }
+                    continue;
+                }
+                // Left extension (non-emitting), reposition pivot. `pivot + 1 - left`
+                // avoids usize underflow (left <= pivot+1 by construction).
+                let left = self.zz_left_span(read, pivot, pac, enc);
+                pivot = pivot + 1 - left;
+                if next_pivot - pivot < msl {
+                    break; // cpp:945
+                }
+                // Right extension (EMITS), advance search_pivot.
+                let qlen = self.fwd_qlen(read, pivot);
+                let right = self.zz_right_emit(
+                    read,
+                    rid,
+                    pivot,
+                    qlen,
+                    min_intv,
+                    min_seed_len,
+                    out,
+                    pac,
+                    enc,
+                );
+                search_pivot = pivot + right; // cpp:956
+                pivot = search_pivot; // cpp:957
+            }
+            pivot = next_pivot; // cpp:959
+        } else {
+            // ---- left boundary: single right emit (cpp:960-971) ----
+            let qlen = self.fwd_qlen(read, pivot);
+            let right = self.zz_right_emit(
+                read,
+                rid,
+                pivot,
+                qlen,
+                min_intv,
+                min_seed_len,
+                out,
+                pac,
+                enc,
+            );
+            pivot += right;
+            if right == 0 {
+                pivot += 1; // infinite-loop guard (cpp:970): read[pivot] doesn't occur
+            }
+        }
+
+        *io_pivot = pivot;
+    }
+
+    /// N-clamped forward window length from `p` (stop at the first `read[i] >= 4`),
+    /// mirroring the consumer's `fwd_qlen` (cpp:907-913).
+    #[inline]
+    fn fwd_qlen(&self, read: &[u8], p: usize) -> usize {
+        let rlen = read.len();
+        for (i, &b) in read.iter().enumerate().skip(p) {
+            if b >= 4 {
+                return i - p;
+            }
+        }
+        rlen - p
+    }
+
+    /// The `min_intv`-bounded forward extent from `pivot`: the longest `L` in
+    /// `[1, Lmax]` whose length-`L` forward match has `occ >= min_intv` (`occ` is
+    /// monotone non-increasing in `L`). Returns `(emit_len, sa, occ, lmax)` where
+    /// `emit_len` is that `L` (or 0 if even length-1 is too frequent), `(sa, occ)`
+    /// is its interval, and `lmax` is the maximal-match length. Shared by the
+    /// next_pivot computation and `zz_right_emit_reseed` (emit) so they agree by
+    /// construction. Port of cpp:1037-1118 / 1043-1057 (no-cap, no-hint).
+    ///
+    /// `want_interval == false` (the next_pivot caller, which uses only `emit_len`)
+    /// returns `(emit_len, 0, 0, lmax)` and skips the truncation interval recovery.
+    /// The truncation itself is `forward_truncate_below_maximal` (forward intervals
+    /// nest, so it expands the maximal interval outward — no per-length re-locate).
+    #[allow(clippy::too_many_arguments)]
+    fn reseed_bounded_fwd(
+        &self,
+        read: &[u8],
+        pivot: usize,
+        qlen: usize,
+        min_intv: i64,
+        want_interval: bool,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> (usize, u64, u64, usize) {
+        #[cfg(feature = "spectrum-probe-count")]
+        let _g = attrib::Guard::new(3); // rs_fwd
+        if qlen == 0 {
+            return (0, 0, 0, 0);
+        }
+        let mm = self.mem_search(&read[pivot..pivot + qlen], pac, enc);
+        let lmax = mm.match_len as usize;
+        if lmax == 0 {
+            return (0, 0, 0, 0);
+        }
+        if mm.occ as i64 >= min_intv {
+            return (lmax, mm.sa_start, mm.occ, lmax); // maximal already bounded
+        }
+        // Largest L < Lmax with occ(L) >= min_intv. The forward analogue of TRUNC_IV:
+        // walk the forward interval outward from the maximal (one model launch + a
+        // capped linear scan), then recover the crossing interval only when the
+        // caller needs it. Byte-identical (same L*, exact interval).
+        let t = self.forward_truncate_below_maximal(
+            &read[pivot..pivot + qlen],
+            mm,
+            min_intv as u64,
+            want_interval,
+            pac,
+            enc,
+        );
+        (t.match_len as usize, t.sa_start, t.occ, lmax)
+    }
+
+    /// Reseed (pass-2) non-emitting left extension (port of `zz_left_span_reseed`,
+    /// TRUNC_IV branch cpp:1199-1209). One `mem_search_backward_truncated_span_rc`
+    /// that returns the `min_intv`-bounded left span `L*` (the maximal RC search +
+    /// truncation, interval recovery elided since the span is all the driver uses).
+    /// Returns the total span `>= 1` (driver repositions `pivot = pivot - span + 1`).
+    ///
+    /// The len-1 forward anchor BWA-MEME's reseed launches from is elided: the
+    /// span-only RC path never reads the anchor `sa_start`, and its `occ` only gated
+    /// an `occ==0 -> return 1` that is redundant with the RC search's own
+    /// `span_max <= anchor_len -> 1` floor (a non-occurring base yields
+    /// `span_max=0`). So pass a unit sentinel interval (`occ_count = 1`,
+    /// `anchor_len = 1`) and let the RC search do the occurrence test — one fewer
+    /// `mem_search` per reseed-left step.
+    fn zz_left_span_reseed(
+        &self,
+        read: &[u8],
+        pivot: usize,
+        min_intv: i64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> usize {
+        #[cfg(feature = "spectrum-probe-count")]
+        let _g = attrib::Guard::new(2); // rs_left
+        let span = self.mem_search_backward_truncated_span_rc(
+            1, // occ_count: unit sentinel (nonzero); the RC floor handles non-occurrence
+            1, // anchor_len
+            read,
+            pivot,
+            min_intv as u64,
+            pac,
+            enc,
+        );
+        if span == 0 {
+            return 1;
+        }
+        span as usize
+    }
+
+    /// Reseed (pass-2) right extension that emits (port of `zz_right_emit_reseed`,
+    /// cpp:1060-1138, no-ISA). Emits the `min_intv`-bounded SMEM gated on
+    /// `emit_len >= min_seed_len` ALONE (the interval already satisfies `min_intv`
+    /// by construction, cpp:1120-1122). Returns the length to advance by
+    /// (`emit_len`, or `Lmax` when nothing emits — cpp:1137).
+    #[allow(clippy::too_many_arguments)]
+    fn zz_right_emit_reseed(
+        &self,
+        read: &[u8],
+        rid: u32,
+        pivot: usize,
+        qlen: usize,
+        min_intv: i64,
+        min_seed_len: u32,
+        out: &mut Vec<Smem>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> usize {
+        if qlen == 0 {
+            return 0;
+        }
+        let (emit_len, emit_sa, emit_occ, lmax) =
+            self.reseed_bounded_fwd(read, pivot, qlen, min_intv, true, pac, enc);
+        if emit_len >= min_seed_len as usize && emit_occ > 0 {
+            out.push(Smem {
+                rid,
+                m: pivot as u32,
+                n: (pivot + emit_len - 1) as u32,
+                k: emit_sa as i64,
+                l: 0,
+                s: emit_occ as i64,
+            });
+        }
+        if emit_len > 0 {
+            emit_len
+        } else {
+            lmax
+        }
+    }
+
+    /// One reseed (pass-2) zigzag invocation at a single reseed `pivot` (port of
+    /// `zz_step1_reseed`, cpp:1273-1350, no-ISA). Single-shot (does NOT walk
+    /// pivots); `next_pivot` is bounded by the `min_intv`-bounded forward extent
+    /// from the ORIGINAL pivot (cpp:1303-1306), NOT `rlen`. Emits onto `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn zz_step1_reseed(
+        &self,
+        read: &[u8],
+        rid: u32,
+        pivot: usize,
+        min_intv: i64,
+        min_seed_len: u32,
+        out: &mut Vec<Smem>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) {
+        let rlen = read.len();
+        let msl = min_seed_len as usize;
+        if pivot >= rlen || read[pivot] >= 4 {
+            return; // ambiguous / OOB: no emit, single-shot (cpp:1288-1292)
+        }
+        let mut pivot = pivot;
+        if pivot != 0 && read[pivot - 1] < 4 {
+            // next_pivot from the ORIGINAL reseed pivot (cpp:1302-1306).
+            let qlen0 = self.fwd_qlen(read, pivot);
+            // next_pivot needs only the length -> span-only (skip interval recovery).
+            let fwd_ext = self
+                .reseed_bounded_fwd(read, pivot, qlen0, min_intv, false, pac, enc)
+                .0;
+            let mut next_pivot = pivot + if fwd_ext > 0 { fwd_ext } else { 1 };
+            if next_pivot > rlen {
+                next_pivot = rlen;
+            }
+            let mut search_pivot = pivot;
+            while search_pivot < next_pivot {
+                if read[search_pivot] >= 4 {
+                    if rlen - search_pivot < msl {
+                        pivot = rlen;
+                        search_pivot = rlen;
+                    } else {
+                        search_pivot += 1;
+                        pivot += 1;
+                    }
+                    continue;
+                }
+                let left = self.zz_left_span_reseed(read, pivot, min_intv, pac, enc);
+                pivot = pivot + 1 - left;
+                if next_pivot - pivot < msl {
+                    break; // cpp:1324
+                }
+                let qlen = self.fwd_qlen(read, pivot);
+                let right = self.zz_right_emit_reseed(
+                    read,
+                    rid,
+                    pivot,
+                    qlen,
+                    min_intv,
+                    min_seed_len,
+                    out,
+                    pac,
+                    enc,
+                );
+                search_pivot = pivot + right; // cpp:1334
+                if right == 0 {
+                    break; // cpp:1337 stall guard
+                }
+                pivot = search_pivot; // cpp:1338
+            }
+        } else {
+            // Left boundary: single right emit (cpp:1340-1347).
+            let qlen = self.fwd_qlen(read, pivot);
+            self.zz_right_emit_reseed(
+                read,
+                rid,
+                pivot,
+                qlen,
+                min_intv,
+                min_seed_len,
+                out,
+                pac,
+                enc,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::spectrum::MemMatch;
+    use crate::train::config::{MemoryMode, TrainerConfig};
+    use crate::train::{build_sidecar_from_pac_with_config, mask::MaskConfig};
+    use proptest::prelude::*;
+    use std::io::Write;
+    use std::mem::{align_of, offset_of, size_of};
+
+    fn write_pac(path: &std::path::Path, bases: &[u8]) {
+        let l = bases.len();
+        let mut buf = vec![0u8; l / 4 + 1];
+        for (i, &b) in bases.iter().enumerate() {
+            buf[i >> 2] |= b << ((3 - (i & 3)) * 2);
+        }
+        buf.push((l % 4) as u8);
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+    }
+
+    /// Build a mode-2 sidecar from forward bases `fwd`, returning the opened index
+    /// and the tempdir (kept alive for the mmap lifetime). At runtime, pass `&fwd`
+    /// as the `pac` arg with [`PacEncoding::Unpacked`] (mirrors the spectrum.rs tests).
+    fn build_mode2(fwd: &[u8]) -> (tempfile::TempDir, LearnedIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let pac = dir.path().join("r.pac");
+        write_pac(&pac, fwd);
+        let prefix = dir.path().join("r.prmi");
+        let cfg = TrainerConfig::default().with_memory_mode(MemoryMode::Mode2);
+        build_sidecar_from_pac_with_config(
+            &pac,
+            &prefix,
+            None,
+            MaskConfig::default(),
+            1,
+            Some(cfg),
+        )
+        .unwrap();
+        let idx = LearnedIndex::open(&prefix).unwrap();
+        (dir, idx)
+    }
+
+    /// Independent ground-truth for [`LearnedIndex::zz_left_span`]: the largest
+    /// left window `read[pivot-L+1..=pivot]` that occurs in the reference, found
+    /// via FORWARD `mem_search` per window (a different code path than
+    /// `zz_left_span`'s RC backward extension). Left-window occurrence is monotone
+    /// in `L` (a shorter window is a suffix of a longer occurring one), so the
+    /// first non-occurrence breaks. Stops at an N to the left or index 0.
+    fn left_span_oracle(idx: &LearnedIndex, read: &[u8], pivot: usize, fwd: &[u8]) -> usize {
+        let enc = PacEncoding::Unpacked;
+        // Leftmost reachable index without crossing an N.
+        let mut lo = pivot;
+        while lo > 0 && read[lo - 1] < 4 {
+            lo -= 1;
+        }
+        let max_window = pivot - lo + 1;
+        let mut best = 1;
+        for span in 1..=max_window {
+            let start = pivot + 1 - span;
+            let m = idx.mem_search(&read[start..=pivot], fwd, enc);
+            if m.match_len as usize >= span && m.occ > 0 {
+                best = span;
+            } else {
+                break;
+            }
+        }
+        best
+    }
+
+    /// N-clamped forward window length from `p` (test mirror of `fwd_qlen`).
+    fn fwd_qlen(read: &[u8], p: usize) -> usize {
+        let rlen = read.len();
+        for (i, &b) in read.iter().enumerate().skip(p) {
+            if b >= 4 {
+                return i - p;
+            }
+        }
+        rlen - p
+    }
+
+    /// `true` iff `win` (no N) occurs in the 2× reference — via a full `mem_search`
+    /// match (`match_len == win.len() && occ > 0`). Used by the definitional MEM
+    /// oracle below.
+    fn occurs(idx: &LearnedIndex, win: &[u8], fwd: &[u8]) -> bool {
+        if win.iter().any(|&b| b >= 4) {
+            return false;
+        }
+        let m = idx.mem_search(win, fwd, PacEncoding::Unpacked);
+        m.match_len as usize == win.len() && m.occ > 0
+    }
+
+    /// Definitional set of maximal exact matches (MEMs) of `read` vs the reference,
+    /// length `>= min_seed_len`, no N. A window `read[m..=n]` is a MEM iff it occurs
+    /// and is both left-maximal (`m==0` || `read[m-1]` is N || `read[m-1..=n]` does
+    /// not occur) and right-maximal (symmetric). For `min_intv == 1` this is exactly
+    /// the pass-1 zigzag SMEM set — an oracle independent of the zigzag control flow.
+    fn mem_set_oracle(
+        idx: &LearnedIndex,
+        read: &[u8],
+        fwd: &[u8],
+        min_seed_len: u32,
+    ) -> std::collections::BTreeSet<(u32, u32)> {
+        let rlen = read.len();
+        let msl = min_seed_len as usize;
+        let mut set = std::collections::BTreeSet::new();
+        for m in 0..rlen {
+            for n in m..rlen {
+                if n - m + 1 < msl {
+                    continue;
+                }
+                if !occurs(idx, &read[m..=n], fwd) {
+                    continue;
+                }
+                let left_max = m == 0 || read[m - 1] >= 4 || !occurs(idx, &read[m - 1..=n], fwd);
+                let right_max =
+                    n + 1 == rlen || read[n + 1] >= 4 || !occurs(idx, &read[m..=n + 1], fwd);
+                if left_max && right_max {
+                    set.insert((m as u32, n as u32));
+                }
+            }
+        }
+        set
+    }
+
+    /// Drive the pass-1 zigzag (`min_intv = 1`) to completion over `read`,
+    /// returning the emitted SMEMs.
+    fn pass1_walk(idx: &LearnedIndex, read: &[u8], fwd: &[u8], min_seed_len: u32) -> Vec<Smem> {
+        let enc = PacEncoding::Unpacked;
+        let mut out = Vec::new();
+        let mut pivot = 0;
+        while pivot < read.len() {
+            idx.zz_step1(read, 0, &mut pivot, 1, min_seed_len, &mut out, fwd, enc);
+        }
+        out
+    }
+
+    /// `Smem` matches the C `prmi_smem_t` layout: `u32 rid,m,n` then (after the
+    /// 4-byte pad the `i64` triple's 8-byte alignment forces) `i64 k,l,s`. This
+    /// is the layout the consumer `memcpy`s into its `SMEM[]`; a drift here
+    /// silently corrupts the consumer's seed array.
+    #[test]
+    fn smem_layout_matches_c_abi() {
+        assert_eq!(size_of::<Smem>(), 40, "sizeof(Smem)");
+        assert_eq!(align_of::<Smem>(), 8, "alignof(Smem)");
+        assert_eq!(offset_of!(Smem, rid), 0);
+        assert_eq!(offset_of!(Smem, m), 4);
+        assert_eq!(offset_of!(Smem, n), 8);
+        // 4-byte pad at offset 12 here.
+        assert_eq!(
+            offset_of!(Smem, k),
+            16,
+            "k must follow the u32 triple's pad"
+        );
+        assert_eq!(offset_of!(Smem, l), 24);
+        assert_eq!(offset_of!(Smem, s), 32);
+    }
+
+    /// `Smem` is `Copy` (used in stack buffers / direct `out[]` fills).
+    #[test]
+    fn smem_is_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<Smem>();
+        assert_copy::<CollectOpts>();
+    }
+
+    proptest! {
+        // A sidecar build is costly; keep case count modest, sweep all pivots per case.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// `zz_left_span` == the independent forward-window oracle, over a real
+        /// mode-2 sidecar, for every non-N pivot of random reads. Repetitive small
+        /// refs naturally exercise occ=1 (unique) and occ>1 (ambiguous) anchors.
+        #[test]
+        fn zz_left_span_equals_oracle(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=3, 1..60),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            for pivot in 0..read.len() {
+                let got = idx.zz_left_span(&read, pivot, &fwd, enc);
+                let want = left_span_oracle(&idx, &read, pivot, &fwd);
+                prop_assert_eq!(
+                    got, want,
+                    "zz_left_span({:?}, pivot={}) = {} but oracle = {}",
+                    read, pivot, got, want
+                );
+            }
+        }
+
+        /// `zz_right_emit`: returns the maximal-match length always, emits exactly
+        /// when `match_len >= min_seed_len && occ >= min_intv`, stamps the SMEM
+        /// fields correctly, and the emitted `(k,s)` re-recovers from `read[m..=n]`
+        /// (the design §8.2 cross-check — an independent confirmation the emitted
+        /// interval is a real maximal match).
+        #[test]
+        fn zz_right_emit_gate_and_fields(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=3, 1..60),
+            min_seed_len in 1u32..20,
+            min_intv in 1i64..4,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            for pivot in 0..read.len() {
+                let qlen = fwd_qlen(&read, pivot);
+                let mut out: Vec<Smem> = Vec::new();
+                let ret_ml =
+                    idx.zz_right_emit(&read, 7, pivot, qlen, min_intv, min_seed_len, &mut out, &fwd, enc);
+
+                // Reference: a direct mem_search + gate (independent of zz_right_emit's branch).
+                let m = if qlen == 0 {
+                    MemMatch { match_len: 0, sa_start: 0, occ: 0 }
+                } else {
+                    idx.mem_search(&read[pivot..pivot + qlen], &fwd, enc)
+                };
+                prop_assert_eq!(ret_ml as u64, m.match_len, "match_len mismatch at pivot={}", pivot);
+
+                let want_emit = qlen > 0 && m.match_len >= min_seed_len as u64 && m.occ as i64 >= min_intv;
+                prop_assert_eq!(out.len(), want_emit as usize, "emit decision at pivot={}", pivot);
+
+                if want_emit {
+                    let s = out[0];
+                    prop_assert_eq!(s.rid, 7);
+                    prop_assert_eq!(s.m, pivot as u32);
+                    prop_assert_eq!(s.n, (pivot + m.match_len as usize - 1) as u32);
+                    prop_assert_eq!(s.k, m.sa_start as i64);
+                    prop_assert_eq!(s.l, 0);
+                    prop_assert_eq!(s.s, m.occ as i64);
+                    // §8.2: re-recover (k,s) from the emitted span.
+                    let recov = idx.mem_search(&read[s.m as usize..=s.n as usize], &fwd, enc);
+                    prop_assert_eq!(recov.sa_start as i64, s.k, "k re-recovery at pivot={}", pivot);
+                    prop_assert_eq!(recov.occ as i64, s.s, "s re-recovery at pivot={}", pivot);
+                }
+            }
+        }
+
+        /// Pass-1 zigzag (`min_intv=1`) emits exactly the definitional MEM set (the
+        /// maximal exact matches of length `>= min_seed_len`), as a SET. This is
+        /// independent of the zigzag control flow (the oracle enumerates windows and
+        /// tests left/right maximality directly). Every emitted SMEM must also be a
+        /// valid exact-match interval (the `(k,s)` re-recovers).
+        #[test]
+        fn zz_step1_pass1_equals_mem_set(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=4, 1..50), // 4 = N, exercises N boundaries
+            min_seed_len in 1u32..12,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let emitted = pass1_walk(&idx, &read, &fwd, min_seed_len);
+
+            // Set of emitted (m,n) == definitional MEM set.
+            let got: std::collections::BTreeSet<(u32, u32)> =
+                emitted.iter().map(|s| (s.m, s.n)).collect();
+            let want = mem_set_oracle(&idx, &read, &fwd, min_seed_len);
+            prop_assert_eq!(&got, &want, "pass-1 SMEM set != MEM set for read {:?}", read);
+
+            // Every emitted SMEM is a real exact-match interval with span >= min_seed_len.
+            for s in &emitted {
+                prop_assert!(s.n >= s.m);
+                prop_assert!(s.n - s.m + 1 >= min_seed_len);
+                prop_assert_eq!(s.l, 0);
+                let recov = idx.mem_search(&read[s.m as usize..=s.n as usize], &fwd, enc);
+                prop_assert_eq!(recov.match_len as usize, (s.n - s.m + 1) as usize);
+                prop_assert_eq!(recov.sa_start as i64, s.k);
+                prop_assert_eq!(recov.occ as i64, s.s);
+            }
+        }
+
+        /// The pre-sort driver (passes 1+2, `max_mem_intv=0`): pass-1 prefix equals
+        /// the validated pass-1 walk; the pass-2 tail equals an independent re-drive
+        /// of the reseed selection (filter transcribed in-test) + `zz_step1_reseed`;
+        /// and every pass-2 SMEM is a valid exact-match interval with `occ >= 2`
+        /// (reseed `min_intv = parent.s + 1 >= 2`).
+        #[test]
+        fn driver_pass1_pass2_pre_sort(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=3, 1..50),
+            min_seed_len in 2u32..8,
+            split_len in 2u32..12,
+            split_width in 1i64..6,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv: 0 };
+
+            let unsorted = idx.collect_smems_unsorted(&read, 0, &opts, &fwd, enc);
+
+            // Pass-1 prefix == the validated pass-1 walk.
+            let pass1 = pass1_walk(&idx, &read, &fwd, min_seed_len);
+            let num1 = pass1.len();
+            prop_assert_eq!(&unsorted[..num1], pass1.as_slice(), "pass-1 prefix mismatch");
+
+            // Independent reseed selection + re-drive == the pass-2 tail.
+            let mut expected_pass2: Vec<Smem> = Vec::new();
+            for p in &pass1 {
+                let span = p.n + 1 - p.m;
+                if span < split_len || p.s > split_width {
+                    continue;
+                }
+                let mid = ((p.m + p.n + 1) >> 1) as usize;
+                idx.zz_step1_reseed(&read, 0, mid, p.s + 1, min_seed_len, &mut expected_pass2, &fwd, enc);
+            }
+            prop_assert_eq!(&unsorted[num1..], expected_pass2.as_slice(), "pass-2 tail mismatch");
+
+            // Every pass-2 SMEM is a real exact-match interval, span >= msl, occ >= 2.
+            for s in &unsorted[num1..] {
+                prop_assert!(s.n - s.m + 1 >= min_seed_len);
+                prop_assert!(s.s >= 2, "reseed SMEM occ must be >= 2");
+                prop_assert_eq!(s.l, 0);
+                let recov = idx.mem_search(&read[s.m as usize..=s.n as usize], &fwd, enc);
+                prop_assert_eq!(recov.match_len as usize, (s.n - s.m + 1) as usize);
+                prop_assert_eq!(recov.sa_start as i64, s.k);
+                prop_assert_eq!(recov.occ as i64, s.s);
+            }
+        }
+
+        /// `collect_smems` output is the within-read two-stage sort of the unsorted
+        /// set: a permutation of it, non-decreasing in `(m, n)`, and — when all
+        /// `(m, n)` are distinct — positionally equal to the `(m ASC, n ASC)` order.
+        /// Also deterministic across runs. (`max_mem_intv == 0`: passes 1+2.)
+        #[test]
+        fn collect_smems_sorted_within_read(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=3, 1..50),
+            min_seed_len in 2u32..8,
+            split_len in 2u32..12,
+            split_width in 1i64..6,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv: 0 };
+
+            let unsorted = idx.collect_smems_unsorted(&read, 0, &opts, &fwd, enc);
+            let cap = unsorted.len() + 8;
+            let mut buf = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; cap];
+            let n = idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut buf).unwrap();
+            let sorted = &buf[..n];
+
+            // 1. Same multiset as the unsorted set.
+            let mut a: Vec<Smem> = unsorted.clone();
+            let mut b: Vec<Smem> = sorted.to_vec();
+            let key = |s: &Smem| (s.m, s.n, s.k, s.s);
+            a.sort_by_key(key);
+            b.sort_by_key(key);
+            prop_assert_eq!(&a, &b, "sorted output is not a permutation of the unsorted set");
+
+            // 2. Non-decreasing (m, n).
+            for w in sorted.windows(2) {
+                prop_assert!((w[0].m, w[0].n) <= (w[1].m, w[1].n), "not (m,n)-sorted");
+            }
+
+            // 3. Distinct (m,n) => positionally equal to (m ASC, n ASC).
+            let distinct = {
+                let mut mn: Vec<(u32, u32)> = unsorted.iter().map(|s| (s.m, s.n)).collect();
+                mn.sort_unstable();
+                let len = mn.len();
+                mn.dedup();
+                mn.len() == len
+            };
+            if distinct {
+                let mut expect = unsorted.clone();
+                expect.sort_unstable_by(|x, y| x.m.cmp(&y.m).then(x.n.cmp(&y.n)));
+                prop_assert_eq!(sorted, expect.as_slice(), "distinct (m,n) order mismatch");
+            }
+
+            // 4. Determinism.
+            let mut buf2 = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; cap];
+            let n2 = idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut buf2).unwrap();
+            prop_assert_eq!(&buf[..n], &buf2[..n2], "non-deterministic output");
+        }
+
+        /// Overflow contract: a too-small `out` returns `Err(needed)` with the exact
+        /// count; a correctly-sized `out` succeeds.
+        #[test]
+        fn collect_smems_overflow(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=3, 1..50),
+            min_seed_len in 2u32..8,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts = CollectOpts { min_seed_len, split_len: 3, split_width: 4, max_mem_intv: 0 };
+            let needed = idx.collect_smems_unsorted(&read, 0, &opts, &fwd, enc).len();
+            // Too small (when there is at least one SMEM): Err(needed).
+            if needed > 0 {
+                let mut tiny = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; needed - 1];
+                prop_assert_eq!(idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut tiny), Err(needed));
+            }
+            // Exactly sized: Ok(needed).
+            let mut ok = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; needed];
+            prop_assert_eq!(idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut ok), Ok(needed));
+        }
+    }
+
+    /// End-to-end: `collect_smems` (passes 1+2) equals the composition of the
+    /// independently oracle-validated walks — pass-1 (== MEM set) and pass-2 (reseed
+    /// selection transcribed in-test + `zz_step1_reseed`) — concatenated in that
+    /// order and run through the two-stage sort. Sweeps the reseed knobs. This
+    /// confirms the driver interleaves the passes in the right order with the right
+    /// args; the components themselves are validated by the tests above. Positional
+    /// (order included). The `(m,n)`-tie order vs the C++ unstable introsort remains
+    /// a KNOWN OPEN deferred to the consumer box-gate.
+    fn full_pipeline_reference(
+        idx: &LearnedIndex,
+        read: &[u8],
+        fwd: &[u8],
+        opts: &CollectOpts,
+    ) -> Vec<Smem> {
+        let enc = PacEncoding::Unpacked;
+        let mut expected = pass1_walk(idx, read, fwd, opts.min_seed_len);
+        // Pass 2: reseed selection (transcribed) + zz_step1_reseed.
+        let p1 = expected.clone();
+        for p in &p1 {
+            let span = p.n + 1 - p.m;
+            if span < opts.split_len || p.s > opts.split_width {
+                continue;
+            }
+            let mid = ((p.m + p.n + 1) >> 1) as usize;
+            idx.zz_step1_reseed(
+                read,
+                0,
+                mid,
+                p.s + 1,
+                opts.min_seed_len,
+                &mut expected,
+                fwd,
+                enc,
+            );
+        }
+        LearnedIndex::sort_within_read(&mut expected);
+        expected
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// `collect_smems` == the full-pipeline reference, across the opts sweep
+        /// (`max_mem_intv == 0`: passes 1+2), positionally.
+        #[test]
+        fn collect_smems_full_pipeline(
+            fwd in prop::collection::vec(0u8..=3, 40..220),
+            read in prop::collection::vec(0u8..=4, 1..60),
+            min_seed_len in 1u32..10,
+            split_len in 2u32..14,
+            split_width in 1i64..8,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv: 0 };
+
+            let expected = full_pipeline_reference(&idx, &read, &fwd, &opts);
+            let mut buf = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; expected.len() + 8];
+            let n = idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut buf).unwrap();
+            prop_assert_eq!(&buf[..n], expected.as_slice(), "collect_smems != composed reference");
+        }
+    }
+
+    /// Concurrency: many threads calling `collect_smems(&self, ...)` on a shared
+    /// index produce per-read results identical to single-threaded — locking the
+    /// "no per-read mutable shared state" design claim (the `&self` is read-only).
+    #[test]
+    fn collect_smems_thread_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // A repetitive reference so reseed (pass 2) actually fires.
+        let mut fwd = Vec::new();
+        for _ in 0..40 {
+            fwd.extend_from_slice(&[0, 1, 2, 3, 0, 1]);
+        }
+        let (_dir, idx) = build_mode2(&fwd);
+        let idx = Arc::new(idx);
+        let opts = CollectOpts {
+            min_seed_len: 4,
+            split_len: 6,
+            split_width: 8,
+            max_mem_intv: 0,
+        };
+
+        // A few distinct reads (slices of the reference + a shifted copy).
+        let reads: Vec<Vec<u8>> = vec![
+            fwd[0..30].to_vec(),
+            fwd[5..50].to_vec(),
+            fwd[10..60].to_vec(),
+            fwd[2..40].to_vec(),
+        ];
+
+        // Single-threaded baseline.
+        let baseline: Vec<Vec<Smem>> = reads
+            .iter()
+            .map(|r| {
+                let mut out = vec![
+                    Smem {
+                        rid: 0,
+                        m: 0,
+                        n: 0,
+                        k: 0,
+                        l: 0,
+                        s: 0
+                    };
+                    2 * r.len() + 8
+                ];
+                let n = idx
+                    .collect_smems(r, 0, &opts, &fwd, PacEncoding::Unpacked, &mut out)
+                    .unwrap();
+                out[..n].to_vec()
+            })
+            .collect();
+
+        // 4 threads each recompute all reads many times; every result must match.
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let idx = Arc::clone(&idx);
+            let reads = reads.clone();
+            let fwd = fwd.clone();
+            let baseline = baseline.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..50 {
+                    for (i, r) in reads.iter().enumerate() {
+                        let mut out = vec![
+                            Smem {
+                                rid: 0,
+                                m: 0,
+                                n: 0,
+                                k: 0,
+                                l: 0,
+                                s: 0
+                            };
+                            2 * r.len() + 8
+                        ];
+                        let n = idx
+                            .collect_smems(r, 0, &opts, &fwd, PacEncoding::Unpacked, &mut out)
+                            .unwrap();
+                        assert_eq!(&out[..n], baseline[i].as_slice(), "thread result diverged");
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+}

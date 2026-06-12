@@ -5,6 +5,8 @@
 //! sidecar format encodes. The `LearnedIndex` type owns mmap-backed readers
 //! for the four sidecar files and answers `lookup(key) -> (pos, err)` queries.
 
+/// Fused per-read SMEM collection (`collect_smems`) — the native zigzag driver.
+pub mod collect;
 /// §4.4 lookup math: parameterized over mmap-backed readers or in-memory slices.
 pub mod lookup;
 pub mod shm;
