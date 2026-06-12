@@ -1463,6 +1463,12 @@ pub unsafe extern "C" fn prmi_mem_search_capped(
 /// the anchor's locus (only changes probe count when valid — an invalid hint
 /// yields incorrect output), same `no_search` contract as `prmi_mem_search_backward`.
 ///
+/// Locates `L*` by the RC-downward walk
+/// (`mem_search_backward_truncated_interval_rc`): the cold (`est_hint == 0`)
+/// reseed nests the candidate intervals in RC-strand space and expands outward,
+/// avoiding the per-candidate model launch the binary-search form pays.
+/// Byte-identical output to the binary-search form.
+///
 /// Returns 0 on success; `-1` null pointer; `-2` invalid `read_len`/`pivot`,
 /// `est_hint` out of range, or `pac_num_bases` too large for this platform;
 /// `-3` internal panic.
@@ -1523,7 +1529,7 @@ pub unsafe extern "C" fn prmi_mem_search_backward_truncated_interval(
         num_bases: pac_num_bases,
     };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.idx.mem_search_backward_truncated_interval(
+        h.idx.mem_search_backward_truncated_interval_rc(
             sa_start,
             occ_count,
             anchor_len,
