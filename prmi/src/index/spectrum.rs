@@ -2062,6 +2062,109 @@ impl LearnedIndex {
         self.mem_search(window, pac, enc)
     }
 
+    /// Same contract as
+    /// [`mem_search_backward_truncated_interval`](Self::mem_search_backward_truncated_interval)
+    /// — finds the largest left span `L` in `[anchor_len, span_max]` whose
+    /// length-`L` window occurs `>= min_intv` times (floored at `anchor_len`) and
+    /// returns its EXACT forward SA interval — but locates `L*` by walking DOWN in
+    /// RC-strand space instead of re-locating each candidate length from the model.
+    ///
+    /// Forward intervals at different lengths do NOT nest, so the binary-search
+    /// twin pays a fresh model launch (the dominant cost of the reseed) per
+    /// occ-query. RC-strand prefixes DO nest: `Q[..L] = RC(read[anchor_end-L ..
+    /// anchor_end])`, so `Q[..L]`'s interval is a SUPERSET of `Q[..L+1]`'s. Starting
+    /// from the maximal extension's in-interval seed, each shorter length expands
+    /// the carried `[lo, hi)` OUTWARD by a short linear scan capped at `min_intv` —
+    /// a few `shares_prefix` probes, no model launch. `occ` is strand-symmetric
+    /// (`occ(RC(P)) == occ(P)`), so `L*` is identical to the forward oracle's. The
+    /// RC walk that finds `L*` is
+    /// [`mem_search_backward_truncated_span_rc`](Self::mem_search_backward_truncated_span_rc)
+    /// (the span-only twin, the single source of truth for the walk); this method
+    /// adds only the final `mem_search` at `L*` that recovers the returned interval.
+    ///
+    /// Byte-identical to
+    /// [`mem_search_backward_truncated_interval`](Self::mem_search_backward_truncated_interval):
+    /// same `L*`, same `mem_search(window)`. The forward recovery uses a plain
+    /// `mem_search`; the `.isa`-seeded fast path (which would skip the one cold
+    /// forward locate's model launch) lands with the seed-window core later — that
+    /// is a probe-count optimization, never the answer.
+    ///
+    /// `est_hint != 0` (the ISA path) delegates to the binary-search twin — the RC
+    /// walk is the cold (`est_hint == 0`) reseed's lever, the path the consumer's
+    /// live reseed takes.
+    ///
+    /// Verified by `mem_search_backward_truncated_interval_rc_equals_oracle`
+    /// (against both the independent `truncated_interval_oracle` and the
+    /// binary-search `mem_search_backward_truncated_interval`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mem_search_backward_truncated_interval_rc(
+        &self,
+        sa_start: u64,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        min_intv: u64,
+        est_hint: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Fail closed on an undersized packed pac (mirrors the binary-search twin).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_backward_truncated_interval_rc")
+                .is_err()
+            {
+                return zero;
+            }
+        }
+        // The anchor itself is the floor: its interval is the caller-supplied
+        // `(sa_start, occ_count)` at length `anchor_len`.
+        let anchor = MemMatch {
+            match_len: anchor_len,
+            sa_start,
+            occ: occ_count,
+        };
+        // The ISA path does not share the RC nesting; defer to the exact
+        // binary-search twin (which honors the `no_search` hint contract).
+        if est_hint != 0 {
+            return self.mem_search_backward_truncated_interval(
+                sa_start, occ_count, anchor_len, read, pivot, min_intv, est_hint, pac, enc,
+            );
+        }
+        // The RC-downward walk that finds `L*` is shared VERBATIM with the
+        // span-only twin; reuse it as the single source of truth rather than
+        // duplicating the (byte-identity-critical) q-build, in-interval seed,
+        // capped `expand`, and downward scan.
+        let lstar = self.mem_search_backward_truncated_span_rc(
+            occ_count, anchor_len, read, pivot, min_intv, pac, enc,
+        );
+        // `_span_rc` returns `L* == anchor_len` for EVERY floor case (occ_count == 0,
+        // an invalid/wrapping anchor window, no left extension, or even the anchor
+        // span failing the threshold) and `L* > anchor_len` only for a genuine
+        // crossing length. Floor -> the caller-supplied anchor interval.
+        if lstar <= anchor_len {
+            return anchor;
+        }
+        // Recover `L*`'s exact (uncapped) forward interval — the seed the caller
+        // emits. One `mem_search` (no `.isa` seed yet; see doc). `L* > anchor_len`
+        // guarantees `_span_rc` cleared its checked anchor window, so `anchor_end`
+        // is valid (the `_ => return anchor` arm is unreachable here).
+        let anchor_end = match usize::try_from(anchor_len)
+            .ok()
+            .and_then(|al| pivot.checked_add(al))
+        {
+            Some(end) if end <= read.len() => end,
+            _ => return anchor,
+        };
+        let window = &read[anchor_end - lstar as usize..anchor_end];
+        self.mem_search(window, pac, enc)
+    }
+
     /// One-shot maximal LEFT extension launched from an EXACT SA index hint —
     /// the backward twin of [`mem_search_from_hint`](Self::mem_search_from_hint),
     /// BWA-MEME's `no_search` for the left direction. `hint` is the SA index whose
@@ -3959,6 +4062,69 @@ mod keyed_tests {
                         "truncated_span_rc != oracle at pivot {} min_intv {}", pivot, min_intv
                     );
                 }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// `mem_search_backward_truncated_interval_rc` (RC-downward walk) ==
+        /// the independent `truncated_interval_oracle` AND the binary-search
+        /// `mem_search_backward_truncated_interval` it replaces in the FFI (same
+        /// `L*`, same forward interval), for length-1 reseed anchors across a spread
+        /// of `min_intv` — including 0 (no truncation -> the maximal span) and a huge
+        /// value (floor -> the anchor).
+        #[test]
+        fn mem_search_backward_truncated_interval_rc_equals_oracle(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+            read in prop::collection::vec(0u8..=3, 30..120),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for pivot in (1..read.len()).step_by(7) {
+                let a = idx.mem_search(&read[pivot..pivot + 1], &fwd, e);
+                if a.match_len == 0 {
+                    continue;
+                }
+                let (s, o, al) = (a.sa_start, a.occ, 1u64);
+                for &min_intv in &[0u64, 1, 2, 5, 20, 1_000_000] {
+                    let want =
+                        truncated_interval_oracle(&idx, s, o, al, &read, pivot, min_intv, &fwd, e);
+                    // est_hint = 0 (the reseed always model-launches the span search).
+                    let got = idx.mem_search_backward_truncated_interval_rc(
+                        s, o, al, &read, pivot, min_intv, 0, &fwd, e,
+                    );
+                    prop_assert_eq!(
+                        got, want,
+                        "truncated_interval_rc != oracle at pivot {} min_intv {}", pivot, min_intv
+                    );
+                    // Byte-identical to the binary-search twin it replaces in the FFI.
+                    let bsearch = idx.mem_search_backward_truncated_interval(
+                        s, o, al, &read, pivot, min_intv, 0, &fwd, e,
+                    );
+                    prop_assert_eq!(
+                        got, bsearch,
+                        "truncated_interval_rc != binary-search twin at pivot {} min_intv {}",
+                        pivot, min_intv
+                    );
+                }
+                // `occ_count == 0` is unreachable from a found anchor above (the
+                // assertions all require `occ >= 1`), but the FFI swap routes ALL
+                // inputs through `_rc`. Lock the byte-identity invariant at that one
+                // boundary explicitly: both forms floor to the anchor.
+                let z_rc = idx.mem_search_backward_truncated_interval_rc(
+                    s, 0, al, &read, pivot, 1, 0, &fwd, e,
+                );
+                let z_bs = idx.mem_search_backward_truncated_interval(
+                    s, 0, al, &read, pivot, 1, 0, &fwd, e,
+                );
+                prop_assert_eq!(
+                    z_rc, z_bs,
+                    "occ_count==0: truncated_interval_rc != binary-search twin at pivot {}", pivot
+                );
+                // NOTE: the `est_hint != 0` path delegates to the binary-search twin
+                // (covered by `mem_search_backward_from_hint`'s reference-lifted
+                // tests); a random read cannot supply a valid locus hint.
             }
         }
     }
