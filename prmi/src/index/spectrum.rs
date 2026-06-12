@@ -1511,6 +1511,80 @@ impl LearnedIndex {
         }
     }
 
+    /// Cap-bounded one-shot forward maximal match — BWA-MEME's `min_intv`-bounded
+    /// SMEM interval counting (gap A). The maximal `match_len` is always exact.
+    /// When the true `occ <= max_intv` the SA interval (`sa_start`, `occ`) is
+    /// **byte-identical to [`mem_search`]**; when the true `occ > max_intv` the
+    /// outward interval scan stops early and returns `occ == max_intv + 1` with
+    /// the wide-interval gallop SKIPPED (the dominant cost on the repetitive
+    /// tail), so `sa_start` is then a partial bound and the caller treats
+    /// `occ > max_intv` as "too repetitive". Uses the bracketed O(log) launch.
+    ///
+    /// Verified by `mem_search_capped_equals_uncapped_under_cap`.
+    pub fn mem_search_capped(
+        &self,
+        query: &[u8],
+        max_intv: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Fail closed on an undersized packed pac (as `mem_search` does): the
+        // O(log) path reaches `forward_maximal_len`'s `fill_doubled_chunk`, which
+        // `.unwrap()`s `pac_base_at` — a panic on an out-of-range byte.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_capped").is_err() {
+                return zero;
+            }
+        }
+        if query.is_empty() {
+            return zero;
+        }
+        let sa_num = self.sa_num();
+        let l_pac = self.l_pac();
+        let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+        let (match_len, ip) = self.forward_maximal_len(query, query_key, sa_num, pac, enc, l_pac);
+        if match_len == 0 {
+            return zero;
+        }
+        let qm = &query[..match_len as usize];
+        let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+        // In-interval seed: `ip` is the insertion point (interval edge), so the
+        // in-interval row is whichever of `{ip-1, ip}` shares the maximal prefix
+        // (see `mem_search_backward_truncated_span_rc`).
+        let seed = if ip > 0 && self.shares_prefix(qm, qm_key, ip - 1, pac, enc, l_pac) {
+            ip - 1
+        } else {
+            ip
+        };
+        // Capped outward recovery: grow `[lower, upper)` from `seed` one cell at a
+        // time, stopping the moment the interval would exceed `max_intv`. Exact
+        // when `occ <= max_intv`; otherwise `occ == max_intv + 1`, gallop skipped.
+        let mut lower = seed;
+        let mut upper = seed + 1;
+        while lower > 0
+            && upper - lower <= max_intv
+            && self.shares_prefix(qm, qm_key, lower - 1, pac, enc, l_pac)
+        {
+            lower -= 1;
+        }
+        while upper < sa_num
+            && upper - lower <= max_intv
+            && self.shares_prefix(qm, qm_key, upper, pac, enc, l_pac)
+        {
+            upper += 1;
+        }
+        MemMatch {
+            match_len,
+            sa_start: lower,
+            occ: upper - lower,
+        }
+    }
+
     /// One-shot maximal forward match launched from an EXACT SA index hint
     /// (`hint`), skipping the model lookup AND the nested interval-narrowing —
     /// BWA-MEME's `no_search=true` / `mem_search_tradeoff` fast path. `hint` MUST
@@ -3704,6 +3778,56 @@ mod keyed_tests {
                         got, want,
                         "truncated_span_rc != oracle at pivot {} min_intv {}", pivot, min_intv
                     );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// `mem_search_capped` is byte-identical to `mem_search` when the true
+        /// `occ <= max_intv`, and reports `occ > max_intv` (the gap-A short-circuit)
+        /// when the interval is wider — across reference-lifted queries of several
+        /// lengths and a spread of caps straddling the true `occ`.
+        #[test]
+        fn mem_search_capped_equals_uncapped_under_cap(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            for start in (0..fwd.len().saturating_sub(4)).step_by(11) {
+                for qlen in [1usize, 4, 12, 32] {
+                    if start + qlen > fwd.len() {
+                        continue;
+                    }
+                    let q = &fwd[start..start + qlen];
+                    let full = idx.mem_search(q, &fwd, e);
+                    if full.match_len == 0 {
+                        continue;
+                    }
+                    // Caps straddling the true occ: zero, below, at, just above, huge.
+                    for &cap in &[0u64, 1, 2, 5, full.occ, full.occ + 1, 1_000_000] {
+                        let capped = idx.mem_search_capped(q, cap, &fwd, e);
+                        // `match_len` never depends on the cap.
+                        prop_assert_eq!(
+                            capped.match_len, full.match_len,
+                            "match_len differs (qlen={} cap={})", qlen, cap
+                        );
+                        if full.occ <= cap {
+                            prop_assert_eq!(
+                                (capped.sa_start, capped.occ), (full.sa_start, full.occ),
+                                "occ<=cap: capped interval != uncapped (qlen={} cap={})", qlen, cap
+                            );
+                        } else {
+                            // The short-circuit stops one cell past the cap, so it
+                            // reports EXACTLY `cap + 1` — not merely `> cap`.
+                            prop_assert_eq!(
+                                capped.occ, cap + 1,
+                                "occ>cap: short-circuit must report exactly cap+1 (qlen={} cap={} got_occ={})",
+                                qlen, cap, capped.occ
+                            );
+                        }
+                    }
                 }
             }
         }

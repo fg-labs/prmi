@@ -11,9 +11,9 @@ use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
     prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
     prmi_bwd_task_t, prmi_close, prmi_forward_spectrum, prmi_forward_spectrum_batch,
-    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_mem_search_lean, prmi_open,
-    prmi_sa_num, prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
-    PRMI_MEM_WANT_INTERVAL,
+    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_mem_search_capped,
+    prmi_mem_search_lean, prmi_open, prmi_sa_num, prmi_sa_positions, prmi_sa_positions_strided,
+    prmi_smem_step_t, PRMI_MEM_WANT_INTERVAL,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -1239,6 +1239,95 @@ fn mem_search_lean_matches_mem_search() {
     );
     if ss > 0 && occ > 0 {
         both(&query, ss, PRMI_MEM_WANT_INTERVAL); // est_hint = in-interval SA index
+    }
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_mem_search_capped` with a cap `>=` the true occurrence count returns
+/// outputs byte-identical to `prmi_mem_search` (with `WANT_INTERVAL`); with a
+/// cap of 1 below the true occ it reports `occ > cap` (the gap-A short-circuit).
+#[test]
+fn mem_search_capped_ffi_matches_uncapped_under_cap() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pnb = pac_unpacked.len() as u64;
+    let query: Vec<u8> = pac_unpacked[8..8 + 24].to_vec();
+
+    // Uncapped reference (with interval).
+    let (mut ml, mut ss, mut occ) = (0u32, 0u64, 0u64);
+    assert_eq!(
+        unsafe {
+            prmi_mem_search(
+                handle,
+                query.as_ptr(),
+                query.len() as i32,
+                pac_packed.as_ptr(),
+                pnb,
+                0,
+                PRMI_MEM_WANT_INTERVAL,
+                &mut ml,
+                &mut ss,
+                &mut occ,
+            )
+        },
+        0
+    );
+    assert!(
+        ml > 0 && occ > 0,
+        "expected a non-empty reference-lifted match"
+    );
+
+    // cap >= occ -> byte-identical.
+    let (mut cml, mut css, mut cocc) = (0u32, 0u64, 0u64);
+    let rc = unsafe {
+        prmi_mem_search_capped(
+            handle,
+            query.as_ptr(),
+            query.len() as i32,
+            occ, // cap == true occ -> exact
+            pac_packed.as_ptr(),
+            pnb,
+            &mut cml,
+            &mut css,
+            &mut cocc,
+        )
+    };
+    assert_eq!(rc, 0, "prmi_mem_search_capped rc={rc}");
+    assert_eq!(
+        (cml, css, cocc),
+        (ml, ss, occ),
+        "cap >= occ must be byte-identical to prmi_mem_search"
+    );
+
+    // cap = occ - 1 (when occ > 1) -> short-circuit, occ > cap.
+    if occ > 1 {
+        let (mut c2ml, mut c2ss, mut c2occ) = (0u32, 0u64, 0u64);
+        let rc2 = unsafe {
+            prmi_mem_search_capped(
+                handle,
+                query.as_ptr(),
+                query.len() as i32,
+                occ - 1,
+                pac_packed.as_ptr(),
+                pnb,
+                &mut c2ml,
+                &mut c2ss,
+                &mut c2occ,
+            )
+        };
+        assert_eq!(rc2, 0);
+        assert_eq!(c2ml, ml, "match_len is cap-independent");
+        // The short-circuit returns EXACTLY `cap + 1` (here `cap = occ - 1`), not
+        // merely some value `> cap` — it stops the scan one past the cap.
+        assert_eq!(
+            c2occ, occ,
+            "occ>cap: short-circuit must report exactly cap+1 (= occ here), got {c2occ}"
+        );
     }
 
     unsafe { prmi_close(handle) };

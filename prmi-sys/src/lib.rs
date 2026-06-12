@@ -1377,6 +1377,81 @@ pub unsafe extern "C" fn prmi_mem_search_lean(
     0
 }
 
+/// Cap-bounded one-shot maximal forward match — BWA-MEME's `min_intv`-bounded
+/// SMEM interval counting (gap A). `*out_match_len`/`*out_sa_start`/`*out_occ`
+/// are ALWAYS written. When the true `occ <= max_intv` the outputs are
+/// byte-identical to `prmi_mem_search` (with `WANT_INTERVAL`); when the true
+/// `occ > max_intv`, prmi stops the outward interval scan early and writes
+/// `*out_occ == max_intv + 1` WITHOUT galloping to the exact wide interval (the
+/// dominant cost on the repetitive tail), so `*out_sa_start` is then a partial
+/// bound — the caller treats `occ > max_intv` as "too repetitive".
+///
+/// Returns 0 on success; `-1` null pointer; `-2` `query_len < 0` or
+/// `pac_num_bases` too large for this platform; `-3` internal panic.
+///
+/// # Safety
+/// `handle` valid; `query` valid for `query_len` bytes; `pac` valid for
+/// `ceil(pac_num_bases/4)` bytes; `out_match_len`/`out_sa_start`/`out_occ`
+/// writable.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn prmi_mem_search_capped(
+    handle: *const prmi_index_t,
+    query: *const u8,
+    query_len: c_int,
+    max_intv: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    out_match_len: *mut u32,
+    out_sa_start: *mut u64,
+    out_occ: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null()
+        || query.is_null()
+        || pac.is_null()
+        || out_match_len.is_null()
+        || out_sa_start.is_null()
+        || out_occ.is_null()
+    {
+        set_last_error("prmi_mem_search_capped: null pointer");
+        return -1;
+    }
+    if query_len < 0 {
+        set_last_error("prmi_mem_search_capped: query_len < 0");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    let q = unsafe { std::slice::from_raw_parts(query, query_len as usize) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_mem_search_capped: pac_num_bases too large for this platform");
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx.mem_search_capped(q, max_intv, pac_slice, enc)
+    }));
+    let m = match res {
+        Ok(m) => m,
+        Err(_) => {
+            set_last_error("prmi_mem_search_capped: internal panic");
+            return -3;
+        }
+    };
+    unsafe {
+        *out_match_len = m.match_len as u32;
+        *out_sa_start = m.sa_start;
+        *out_occ = m.occ;
+    }
+    0
+}
+
 /// One-shot maximal exact BACKWARD (leftward) match — the backward twin of
 /// `prmi_mem_search`. From the right anchor `(sa_start, occ_count, anchor_len)`
 /// matching `read[pivot..pivot+anchor_len)`, extend leftward and return the
