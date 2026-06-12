@@ -11,9 +11,10 @@ use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
     prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
     prmi_bwd_task_t, prmi_close, prmi_forward_spectrum, prmi_forward_spectrum_batch,
-    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward, prmi_mem_search_capped,
-    prmi_mem_search_lean, prmi_open, prmi_sa_num, prmi_sa_positions, prmi_sa_positions_strided,
-    prmi_smem_step_t, PRMI_MEM_WANT_INTERVAL,
+    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward,
+    prmi_mem_search_backward_truncated_interval, prmi_mem_search_capped, prmi_mem_search_lean,
+    prmi_open, prmi_sa_num, prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
+    PRMI_MEM_WANT_INTERVAL,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -1329,6 +1330,107 @@ fn mem_search_capped_ffi_matches_uncapped_under_cap() {
             "occ>cap: short-circuit must report exactly cap+1 (= occ here), got {c2occ}"
         );
     }
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_mem_search_backward_truncated_interval` FFI plumbing + contract: with
+/// `min_intv = 1` (no truncation) it equals the maximal `prmi_mem_search_backward`;
+/// with a huge `min_intv` it floors to the anchor `(span == anchor_len, sa_start,
+/// occ)`.
+#[test]
+fn mem_search_backward_truncated_interval_ffi() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pnb = pac_unpacked.len() as u64;
+    let read = &pac_unpacked;
+    let pivot = 64usize;
+
+    // Length-1 anchor at the pivot, with its interval.
+    let (mut a_ml, mut a_sa, mut a_occ) = (0u32, 0u64, 0u64);
+    assert_eq!(
+        unsafe {
+            prmi_mem_search(
+                handle,
+                read[pivot..pivot + 1].as_ptr(),
+                1,
+                pac_packed.as_ptr(),
+                pnb,
+                0,
+                PRMI_MEM_WANT_INTERVAL,
+                &mut a_ml,
+                &mut a_sa,
+                &mut a_occ,
+            )
+        },
+        0
+    );
+    assert!(a_ml > 0, "expected a length-1 anchor match");
+    let anchor_len = 1u64;
+
+    // Maximal backward extension (the min_intv=1 reference).
+    let (mut bml, mut bss, mut bocc) = (0u32, 0u64, 0u64);
+    assert_eq!(
+        unsafe {
+            prmi_mem_search_backward(
+                handle,
+                a_sa,
+                a_occ,
+                anchor_len,
+                read.as_ptr(),
+                read.len() as i32,
+                pivot as i32,
+                pac_packed.as_ptr(),
+                pnb,
+                0,
+                PRMI_MEM_WANT_INTERVAL,
+                &mut bml,
+                &mut bss,
+                &mut bocc,
+            )
+        },
+        0
+    );
+
+    // min_intv = 1: no truncation -> equals the maximal extension.
+    let trunc = |min_intv: u64| -> (u64, u64, u64) {
+        let (mut span, mut ss, mut occ) = (0u64, 0u64, 0u64);
+        let rc = unsafe {
+            prmi_mem_search_backward_truncated_interval(
+                handle,
+                a_sa,
+                a_occ,
+                anchor_len,
+                read.as_ptr(),
+                read.len() as i32,
+                pivot as i32,
+                min_intv,
+                pac_packed.as_ptr(),
+                pnb,
+                0,
+                &mut span,
+                &mut ss,
+                &mut occ,
+            )
+        };
+        assert_eq!(rc, 0, "truncated_interval rc={rc} (min_intv={min_intv})");
+        (span, ss, occ)
+    };
+
+    assert_eq!(
+        trunc(1),
+        (bml as u64, bss, bocc),
+        "min_intv=1 must equal the maximal backward extension"
+    );
+    assert_eq!(
+        trunc(u64::MAX),
+        (anchor_len, a_sa, a_occ),
+        "huge min_intv must floor to the anchor interval"
+    );
 
     unsafe { prmi_close(handle) };
     drop(dir);

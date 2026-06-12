@@ -1452,6 +1452,105 @@ pub unsafe extern "C" fn prmi_mem_search_capped(
     0
 }
 
+/// `min_intv`-truncated backward reseed returning the full interval (the
+/// consumer's `zz_left_span_reseed` seed emission). Finds the largest left span
+/// `L` in `[anchor_len, span_max]` whose length-`L` window occurs `>= min_intv`
+/// times (floored at `anchor_len`) and writes its exact forward interval:
+/// `*out_span = L`, `*out_sa_start`/`*out_occ` = the interval. `(sa_start,
+/// occ_count, anchor_len)` is the right anchor and its interval; same
+/// `read`/`pivot` convention as `prmi_mem_search_backward`. `est_hint == 0` model-
+/// launches the span search; `est_hint > 0` TRUSTS it as the inverse-SA index of
+/// the anchor's locus (only changes probe count when valid — an invalid hint
+/// yields incorrect output), same `no_search` contract as `prmi_mem_search_backward`.
+///
+/// Returns 0 on success; `-1` null pointer; `-2` invalid `read_len`/`pivot`,
+/// `est_hint` out of range, or `pac_num_bases` too large for this platform;
+/// `-3` internal panic.
+///
+/// # Safety
+/// `handle` valid; `read` valid for `read_len` bytes; `pac` valid for
+/// `ceil(pac_num_bases/4)` bytes; `out_span`/`out_sa_start`/`out_occ` writable.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn prmi_mem_search_backward_truncated_interval(
+    handle: *const prmi_index_t,
+    sa_start: u64,
+    occ_count: u64,
+    anchor_len: u64,
+    read: *const u8,
+    read_len: c_int,
+    pivot: c_int,
+    min_intv: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    est_hint: u64,
+    out_span: *mut u64,
+    out_sa_start: *mut u64,
+    out_occ: *mut u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null()
+        || read.is_null()
+        || pac.is_null()
+        || out_span.is_null()
+        || out_sa_start.is_null()
+        || out_occ.is_null()
+    {
+        set_last_error("prmi_mem_search_backward_truncated_interval: null pointer");
+        return -1;
+    }
+    if read_len <= 0 || pivot < 0 {
+        set_last_error("prmi_mem_search_backward_truncated_interval: invalid read_len or pivot");
+        return -2;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    if est_hint != 0 && est_hint >= h.idx.sa_num() {
+        set_last_error("prmi_mem_search_backward_truncated_interval: est_hint out of range");
+        return -2;
+    }
+    let r = unsafe { std::slice::from_raw_parts(read, read_len as usize) };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error(
+                "prmi_mem_search_backward_truncated_interval: pac_num_bases too large for this platform",
+            );
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx.mem_search_backward_truncated_interval(
+            sa_start,
+            occ_count,
+            anchor_len,
+            r,
+            pivot as usize,
+            min_intv,
+            est_hint,
+            pac_slice,
+            enc,
+        )
+    }));
+    match res {
+        Ok(m) => {
+            unsafe {
+                *out_span = m.match_len;
+                *out_sa_start = m.sa_start;
+                *out_occ = m.occ;
+            }
+            0
+        }
+        Err(_) => {
+            set_last_error("prmi_mem_search_backward_truncated_interval: internal panic");
+            -3
+        }
+    }
+}
+
 /// One-shot maximal exact BACKWARD (leftward) match — the backward twin of
 /// `prmi_mem_search`. From the right anchor `(sa_start, occ_count, anchor_len)`
 /// matching `read[pivot..pivot+anchor_len)`, extend leftward and return the
