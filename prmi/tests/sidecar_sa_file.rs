@@ -140,3 +140,52 @@ fn reader_rejects_bad_magic() {
     let err = SaFileReader::open(&path).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("magic"));
 }
+
+#[test]
+fn entry_equals_position_and_key_at() {
+    let dir = tempdir().unwrap();
+
+    // Mode 2: entry() returns (position, Some(key)) == (position(i), key_at(i)).
+    let m2 = dir.path().join("entry_mode2.sa");
+    let entries: [(u64, u64); 4] = [
+        (0x00, 0xAAAA_BBBB_CCCC_DDDD),
+        (0x123456, 0x1111_2222_3333_4444),
+        (0xffffffffff, 0),
+        (0x7f, u64::MAX),
+    ];
+    {
+        let mut w = SaFileWriter::create_with_mode(&m2, 4, BPE_MODE2).unwrap();
+        for &(pos, key) in &entries {
+            w.write_entry_with_key(pos, key).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    let r = SaFileReader::open(&m2).unwrap();
+    for i in 0..r.num_entries() {
+        assert_eq!(
+            r.entry(i),
+            (r.position(i), r.key_at(i)),
+            "entry({i}) != (position, key_at) in mode 2"
+        );
+    }
+
+    // Mode 1: no inline key, so entry() returns (position, None).
+    let m1 = dir.path().join("entry_mode1.sa");
+    {
+        let mut w = SaFileWriter::create(&m1, 3).unwrap();
+        for &pos in &[0x00u64, 0x123456, 0xffffffffff] {
+            w.write_position(pos).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    let r1 = SaFileReader::open(&m1).unwrap();
+    for i in 0..r1.num_entries() {
+        // Symmetric with the mode-2 loop: assert the stated equivalence directly.
+        // `key_at` is `None` in mode 1, so this also pins the no-inline-key contract.
+        assert_eq!(
+            r1.entry(i),
+            (r1.position(i), r1.key_at(i)),
+            "entry({i}) != (position, key_at) in mode 1"
+        );
+    }
+}

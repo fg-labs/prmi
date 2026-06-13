@@ -431,6 +431,35 @@ impl SaFileReader {
         Some(LittleEndian::read_u64(bytes))
     }
 
+    /// Combined read of SA entry `i`: `(position, key)`. The 5-byte position and
+    /// the (mode 2/3) 8-byte key live in one entry / cache line, so the hot
+    /// keyed-compare loop fetches both with a SINGLE bounds check and a SINGLE
+    /// offset computation instead of one each via `position` + `key_at`. `key` is
+    /// `None` in mode 1 (no inline key). Equivalent to `(position(i), key_at(i))`.
+    #[inline]
+    pub fn entry(&self, i: u64) -> (u64, Option<u64>) {
+        assert!(
+            i < self.num_entries,
+            "SaFileReader::entry index {i} out of range (len={})",
+            self.num_entries
+        );
+        let base = SA_FILE_HEADER_BYTES + (i as usize) * self.bytes_per_entry;
+        // SAFETY: `i < num_entries` and header validation checked the exact mapped
+        // length, so `[base, base + bytes_per_entry)` is within `[0, data_len)`.
+        let pos_bytes: &[u8; BPE_MODE1] =
+            unsafe { &*(self.data_ptr.add(base) as *const [u8; BPE_MODE1]) };
+        let position = unpack_position(pos_bytes);
+        let key = if self.bytes_per_entry >= BPE_MODE2 {
+            // SAFETY: key occupies bytes `[base+5, base+13)`, within the entry.
+            let key_bytes: &[u8; 8] =
+                unsafe { &*(self.data_ptr.add(base + BPE_MODE1) as *const [u8; 8]) };
+            Some(LittleEndian::read_u64(key_bytes))
+        } else {
+            None
+        };
+        (position, key)
+    }
+
     /// Return the stored ISA (inverse suffix array) value at SA index `i`, if
     /// this file was built in mode 3. Returns `None` for modes 1 and 2.
     ///

@@ -216,6 +216,14 @@ impl LearnedIndex {
         self.sa.position(i)
     }
 
+    /// Combined `(position, key)` read of SA entry `i` — one bounds check and one
+    /// offset computation for the hot keyed-compare loop (the position and key
+    /// share one cache line). Equivalent to `(sa_position_for(i), key_at(i))`.
+    #[inline]
+    pub(crate) fn sa_entry(&self, i: u64) -> (u64, Option<u64>) {
+        self.sa.entry(i)
+    }
+
     /// Software-prefetch SA entry `i` (position + key, one cache line) into L1.
     /// Advisory hint used by the boundary-search probe loops to overlap the next
     /// cold read with the current compare; never affects results. Out-of-range
