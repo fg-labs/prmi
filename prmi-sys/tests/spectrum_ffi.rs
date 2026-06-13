@@ -1882,13 +1882,14 @@ fn collect_smems_ffi_matches_rust() {
     let pnb = pac_unpacked.len() as u64;
 
     // A read lifted from the reference (so passes 1+2 actually emit on the
-    // repetitive ACGT reference).
+    // repetitive ACGT reference). `max_mem_intv > 0` exercises pass 3 too, so the
+    // FFI-vs-Rust comparison below covers the whole pipeline.
     let read: Vec<u8> = pac_unpacked[10..70].to_vec();
     let opts = CollectOpts {
         min_seed_len: 5,
         split_len: 8,
         split_width: 4,
-        max_mem_intv: 0,
+        max_mem_intv: 3,
     };
 
     // Rust reference (Unpacked pac), the byte-identity oracle.
@@ -1978,27 +1979,61 @@ fn collect_smems_ffi_matches_rust() {
     assert_eq!(rc_empty, 0, "empty read rc={rc_empty}");
     assert_eq!(empty_n, 0, "empty read must yield 0 SMEMs");
 
-    // Pass 3 (max_mem_intv > 0) is rejected with -5.
-    let copts_p3 = prmi_collect_opts_t {
-        max_mem_intv: 1,
+    // Pass 3 disabled (max_mem_intv == 0) also matches the Rust path byte-for-byte.
+    let copts_p0 = prmi_collect_opts_t {
+        max_mem_intv: 0,
         ..copts
     };
-    let mut p3_n: i32 = -1;
-    let rc_p3 = unsafe {
+    let opts_p0 = CollectOpts {
+        max_mem_intv: 0,
+        ..opts
+    };
+    let mut rust_p0 = vec![
+        Smem {
+            rid: 0,
+            m: 0,
+            n: 0,
+            k: 0,
+            l: 0,
+            s: 0,
+        };
+        2 * read.len() + 16
+    ];
+    let rn0 = idx
+        .collect_smems(
+            &read,
+            9,
+            &opts_p0,
+            &pac_unpacked,
+            PacEncoding::Unpacked,
+            &mut rust_p0,
+        )
+        .unwrap();
+    let mut p0_n: i32 = -1;
+    let rc_p0 = unsafe {
         prmi_collect_smems(
             handle,
             read.as_ptr(),
             read.len() as i32,
             9,
-            &copts_p3,
+            &copts_p0,
             pac_packed.as_ptr(),
             pnb,
             ffi_buf.as_mut_ptr(),
             ffi_buf.len() as i32,
-            &mut p3_n,
+            &mut p0_n,
         )
     };
-    assert_eq!(rc_p3, -5, "max_mem_intv > 0 must be rejected with -5");
+    assert_eq!(rc_p0, 0, "max_mem_intv == 0 rc={rc_p0}");
+    assert_eq!(p0_n as usize, rn0, "pass-3-disabled FFI count != Rust");
+    for i in 0..rn0 {
+        let (f, r) = (&ffi_buf[i], &rust_p0[i]);
+        assert_eq!(
+            (f.rid, f.m, f.n, f.k, f.l, f.s),
+            (r.rid, r.m, r.n, r.k, r.l, r.s),
+            "pass-3-disabled FFI SMEM[{i}] != Rust"
+        );
+    }
 
     // Overflow: out_cap one short -> -4, out_n set to the required count.
     let mut ovf_n: i32 = -1;
