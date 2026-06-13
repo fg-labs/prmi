@@ -899,9 +899,8 @@ impl LearnedIndex {
         enc: PacEncoding,
         l_pac: u64,
     ) {
-        let pos = self.sa_position_for(uniq);
         bump_probe();
-        let key = self.key_at(uniq);
+        let (pos, key) = self.sa_entry(uniq);
         let (_, lcp) =
             compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
         push_step(sink, prev_occ, uniq, 1, u64::from(lcp));
@@ -991,9 +990,8 @@ impl LearnedIndex {
             while a < b {
                 self.prefetch_bsearch(a, b);
                 let mid = a + (b - a) / 2;
-                let pos = self.sa_position_for(mid);
                 bump_probe();
-                let key = self.key_at(mid);
+                let (pos, key) = self.sa_entry(mid);
                 let (ref_less, _) = compare_query_vs_suffix_2x_keyed_with_mask(
                     qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
                 );
@@ -1010,9 +1008,8 @@ impl LearnedIndex {
             while c < d {
                 self.prefetch_bsearch(c, d);
                 let mid = c + (d - c) / 2;
-                let pos = self.sa_position_for(mid);
                 bump_probe();
-                let key = self.key_at(mid);
+                let (pos, key) = self.sa_entry(mid);
                 let (_, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
                     qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
                 );
@@ -1049,9 +1046,8 @@ impl LearnedIndex {
     ) -> u64 {
         while a < b {
             let mid = a + (b - a) / 2;
-            let pos = self.sa_position_for(mid);
             bump_probe();
-            let key = self.key_at(mid);
+            let (pos, key) = self.sa_entry(mid);
             let (ref_less, _) =
                 compare_query_vs_suffix_2x_keyed(qm, qm_key, key, pos, pac, enc, l_pac);
             if ref_less {
@@ -1081,9 +1077,8 @@ impl LearnedIndex {
     ) -> u64 {
         while c < d {
             let mid = c + (d - c) / 2;
-            let pos = self.sa_position_for(mid);
             bump_probe();
-            let key = self.key_at(mid);
+            let (pos, key) = self.sa_entry(mid);
             let (_, lcp) = compare_query_vs_suffix_2x_keyed(qm, qm_key, key, pos, pac, enc, l_pac);
             if (lcp as usize) >= qm.len() {
                 c = mid + 1;
@@ -1229,9 +1224,8 @@ impl LearnedIndex {
             while a < b {
                 self.prefetch_bsearch(a, b);
                 let mid = a + (b - a) / 2;
-                let pos = self.sa_position_for(mid);
                 bump_probe();
-                let key = self.key_at(mid);
+                let (pos, key) = self.sa_entry(mid);
                 let (ref_less, _) = compare_query_vs_suffix_2x_keyed_with_mask(
                     qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
                 );
@@ -1247,9 +1241,8 @@ impl LearnedIndex {
             while c < d {
                 self.prefetch_bsearch(c, d);
                 let mid = c + (d - c) / 2;
-                let pos = self.sa_position_for(mid);
                 bump_probe();
-                let key = self.key_at(mid);
+                let (pos, key) = self.sa_entry(mid);
                 let (_, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
                     qm, query_key, key, pos, pac, enc, l_pac, qm_nbases, qm_mask,
                 );
@@ -1336,8 +1329,7 @@ impl LearnedIndex {
         l_pac: u64,
     ) -> u64 {
         bump_probe();
-        let pos = self.sa_position_for(mid);
-        let key = self.key_at(mid);
+        let (pos, key) = self.sa_entry(mid);
         let (_, lcp) =
             compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
         u64::from(lcp)
@@ -1395,9 +1387,8 @@ impl LearnedIndex {
 
         // (1) Confirm the maximal match length at the hint.
         let max_len = {
-            let pos = self.sa_position_for(hint);
             bump_probe();
-            let key = self.key_at(hint);
+            let (pos, key) = self.sa_entry(hint);
             let (_, lcp) =
                 compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
             lcp as usize
@@ -1654,9 +1645,8 @@ impl LearnedIndex {
         let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
         // Confirm: the maximal match length is the LCP of the query against the
         // hinted suffix (one probe instead of the whole narrowing search).
-        let pos = self.sa_position_for(hint);
         bump_probe();
-        let key = self.key_at(hint);
+        let (pos, key) = self.sa_entry(hint);
         let (_, lcp) =
             compare_query_vs_suffix_2x_keyed(query, query_key, key, pos, pac, enc, l_pac);
         let match_len = u64::from(lcp);
@@ -2756,8 +2746,7 @@ impl LearnedIndex {
         let l_pac = self.l_pac();
         let mut s = self.bwd_stepper_new(t);
         while let Some(mid) = s.next_probe(self) {
-            let pos = self.sa_position_for(mid);
-            let key = self.key_at(mid);
+            let (pos, key) = self.sa_entry(mid);
             s.advance(self, pos, key, pac, enc, l_pac);
         }
         s.steps
@@ -2787,8 +2776,9 @@ impl LearnedIndex {
             for i in 0..steppers.len() {
                 if let Some(mid) = mids[i] {
                     any = true;
-                    posv[i] = self.sa_position_for(mid);
-                    keyv[i] = self.key_at(mid);
+                    let (p, k) = self.sa_entry(mid);
+                    posv[i] = p;
+                    keyv[i] = k;
                 }
             }
             if !any {
@@ -3150,8 +3140,7 @@ impl LearnedIndex {
         l_pac: u64,
     ) -> bool {
         bump_probe();
-        let pos = self.sa_position_for(mid);
-        let key = self.key_at(mid);
+        let (pos, key) = self.sa_entry(mid);
         let (ref_less, _) =
             compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
         ref_less
@@ -3171,8 +3160,7 @@ impl LearnedIndex {
         l_pac: u64,
     ) -> bool {
         bump_probe();
-        let pos = self.sa_position_for(mid);
-        let key = self.key_at(mid);
+        let (pos, key) = self.sa_entry(mid);
         let (_, lcp) = compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
         (lcp as usize) >= p_slice.len()
     }
@@ -3191,8 +3179,7 @@ impl LearnedIndex {
         l_pac: u64,
     ) -> u32 {
         bump_probe();
-        let pos = self.sa_position_for(mid);
-        let key = self.key_at(mid);
+        let (pos, key) = self.sa_entry(mid);
         let (_, lcp) = compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
         lcp
     }
