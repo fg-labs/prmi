@@ -142,6 +142,14 @@ impl ModelFileReader {
             path: path.to_path_buf(),
             source: e,
         })?;
+        // Hint transparent huge pages for the model array (l2 ≈6.4 GB at hg38): the
+        // lookup's L2/L1 reads are random into a multi-GB array, the same TLB-walk
+        // pattern the SA hugepage advice targets (see `SaFileReader::open`). Smaller
+        // than the SA so a smaller lever, but the mechanism is identical. Advisory,
+        // Linux-only, and requires the host to enable THP (see docs/DEPLOYMENT.md);
+        // never affects correctness, only latency.
+        #[cfg(target_os = "linux")]
+        let _ = mmap.advise(memmap2::Advice::HugePage);
         let leaf_count = validate_model_header(&mmap, path, mmap.len(), expected_layer)?;
         let data_ptr = mmap.as_ptr();
         let data_len = mmap.len();
