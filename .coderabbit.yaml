@@ -1,0 +1,84 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# CodeRabbit review configuration for prmi (learned-index SMEM seeder).
+#
+# This repo is byte-identity-critical: the learned-index search path must produce
+# SMEMs identical to FMI seeding, and it exposes a C ABI consumed by bwa-mem3. The
+# `assertive` profile + the path instructions below aim the review at the failure
+# modes that actually bite here (output divergence, FFI unsoundness, mmap bounds,
+# doc/contract drift) rather than generic style.
+
+language: en-US
+
+# Terse, technical, no praise or filler — match the codebase's review style.
+tone_instructions: >-
+  Be concise and technical. Skip praise and summaries of what the code does. Lead
+  with the concrete risk and a one-line fix. Favor correctness, soundness, and
+  byte-identity over style. Do not restate clippy/rustfmt findings — CI enforces
+  those.
+
+reviews:
+  # Surface borderline correctness/soundness findings, not just high-confidence
+  # ones. This codebase prefers a false positive to a missed output-divergence.
+  profile: assertive
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: false
+  # Review automatically on push; don't review draft PRs.
+  auto_review:
+    enabled: true
+    drafts: false
+  # Never auto-block merges on a review verdict; findings are advisory.
+  request_changes_workflow: false
+
+  # Don't spend review budget on build output, fixtures, or vendored lockfiles.
+  path_filters:
+    - "!**/target/**"
+    - "!**/*.lock"
+
+  # MAINTENANCE: these instructions name specific functions, test patterns, and
+  # code constructs in prmi/src/index, prmi-sys/src, prmi/src/sidecar, and tests/.
+  # Re-read and update them whenever those modules are refactored or renamed —
+  # stale instructions silently misdirect the reviewer.
+  path_instructions:
+    - path: "prmi/src/index/**/*.rs"
+      instructions: >-
+        This is the byte-identity-critical search core (spectrum / collect /
+        lookup). Treat ANY change to the SMEM, boundary-search, or interval-
+        recovery math as potentially output-changing: confirm an oracle/byte-
+        identity proptest covers it (e.g. `*_equals_oracle`, `*_equals_mem_set`,
+        the model-seeded-vs-`forward_spectrum` cross-checks). Flag: per-call heap
+        allocations on the hot probe loop (prefer stack buffers); missing
+        `#[inline]` on hot comparator/helper tails; `usize`/`u64` narrowing or
+        `pivot + len` arithmetic that can wrap (require checked/`try_from`);
+        off-by-one in gallop/binary-search brackets and outward scans; and any
+        public primitive that slices a caller-supplied buffer or SA-probes from a
+        caller-supplied interval without failing closed on malformed input.
+    - path: "prmi-sys/src/**/*.rs"
+      instructions: >-
+        This is the C ABI consumed by bwa-mem3. For every `extern "C"` entrypoint
+        require: null-checks on ALL pointer args (and the canonical empty-slice
+        case `NULL + len 0` handled without `slice::from_raw_parts(NULL, 0)`,
+        which is UB — build an empty slice directly); length/range validation;
+        `packed_pac_bytes` (narrowing-guarded) rather than `div_ceil(4) as usize`;
+        a `catch_unwind` boundary; and a documented, exhaustive return-code list.
+        Flag any drift between the FFI doc comment and the underlying Rust
+        contract (return codes, which args may be null, what each code means), and
+        any `#[repr(C)]` struct whose field order/size/alignment is not pinned by
+        a layout assertion or test.
+    - path: "prmi/src/sidecar/**/*.rs"
+      instructions: >-
+        This is the on-disk sidecar format and its mmap readers. Every `unsafe`
+        pointer read must carry a bounds assert (`i < num_entries`) and a SAFETY
+        comment whose invariant matches its siblings (`position` / `key_at` /
+        `entry`). Flag on-disk format or header-layout changes that are not
+        round-trip tested across all memory modes, and any reader that trusts a
+        length/offset from the file without validating it against the mapped
+        length.
+    - path: "**/tests/**/*.rs"
+      instructions: >-
+        Generate test data programmatically; do not add committed fixtures. New
+        search primitives need an INDEPENDENT oracle (a different code path than
+        the implementation under test), not just a self-consistency check. Flag
+        assertions weaker than the stated contract (e.g. asserting `occ > cap`
+        when the contract is `occ == cap + 1`).
