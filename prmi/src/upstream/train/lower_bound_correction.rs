@@ -390,8 +390,7 @@ mod tests {
     ///
     /// All iterated entries fall in one run, so `longest_run(0)` must equal the
     /// number of entries the trainer iterates. (We derive the expected count
-    /// from `data.iter()` rather than hard-coding it, since `FixDupsIter` adds a
-    /// trailing replay of the last element.)
+    /// from `data.iter()` rather than hard-coding it.)
     #[test]
     fn single_run_reports_full_length() {
         let pairs: Vec<(u64, usize)> = vec![(5u64, 0), (5u64, 1), (5u64, 2)];
