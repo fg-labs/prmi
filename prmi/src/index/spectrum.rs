@@ -1772,21 +1772,39 @@ impl LearnedIndex {
             q_start -= 1;
         }
         // Q = reverse-complement of read[q_start..anchor_end]; |Q| caps the span.
+        // Build it into a stack buffer for the common read length (no per-call heap
+        // allocation on the hot backward path — the consumer fires ~50 backward
+        // calls/read); fall back to the heap only for reads longer than the buffer
+        // (e.g. long-read tech). Mirrors the `_span_rc`/`_interval_rc` RC build.
         // Mask-and-complement (`(b & 0x3) ^ 0x3`, same semantics as
         // `reverse_complement_2bit`) rather than `3 - b`: byte-identical for the
         // 2-bit contract (0..=3) but cannot underflow if a caller passes a
         // malformed anchor byte > 3 (the `q_start` walk only validates the left
         // extension, not the anchor region).
-        let q: Vec<u8> = read[q_start..anchor_end]
-            .iter()
-            .rev()
-            .map(|&b| (b & 0x3) ^ 0x3)
-            .collect();
-        let q_key = tokenize_32mer(&q, q.len().min(KMER_LEN));
+        let rc_len = anchor_end - q_start;
+        let mut rc_stack = [0u8; 256];
+        let rc_heap;
+        let q: &[u8] = if rc_len <= rc_stack.len() {
+            for (dst, &b) in rc_stack
+                .iter_mut()
+                .zip(read[q_start..anchor_end].iter().rev())
+            {
+                *dst = (b & 0x3) ^ 0x3;
+            }
+            &rc_stack[..rc_len]
+        } else {
+            rc_heap = read[q_start..anchor_end]
+                .iter()
+                .rev()
+                .map(|&b| (b & 0x3) ^ 0x3)
+                .collect::<Vec<u8>>();
+            &rc_heap
+        };
+        let q_key = tokenize_32mer(q, q.len().min(KMER_LEN));
         // The insertion point is in RC-strand space; the forward `p_slice` interval
         // recovered below is in forward space, so it does not seed that recovery —
         // ignore it here.
-        let (match_len, _ip) = self.forward_maximal_len(&q, q_key, sa_num, pac, enc, l_pac);
+        let (match_len, _ip) = self.forward_maximal_len(q, q_key, sa_num, pac, enc, l_pac);
         // `match_len >= anchor_len` (the anchor occurs, so RC(anchor) = Q[..anchor_len]
         // does too). No left extension => the anchor itself is maximal.
         if match_len <= anchor_len {
