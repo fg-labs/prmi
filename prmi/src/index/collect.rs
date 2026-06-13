@@ -28,6 +28,48 @@
 use crate::index::smem::PacEncoding;
 use crate::index::LearnedIndex;
 
+/// `true` if the ISA reseed fast-path (`PRMI_ISA`) is enabled. Read once from the
+/// environment and cached for the process lifetime (the index/sidecar are immutable
+/// per run). When off, the reseed runs the cold model-launch path unchanged.
+fn isa_reseed_enabled() -> bool {
+    // Test-only override: the env `OnceLock` below caches the first read for the whole
+    // process, so tests can't toggle `PRMI_ISA` per case. This thread-local lets the
+    // byte-id proptest force the ISA path on/off. Compiled out of production builds.
+    #[cfg(test)]
+    if let Some(forced) = tests::isa_force_get() {
+        return forced;
+    }
+    use std::sync::OnceLock;
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("PRMI_ISA").is_some())
+}
+
+/// The ISA launch hint for a reseed of a pass-1 SMEM: the reference position
+/// `refpos` of the SMEM's first base, plus the SMEM's read span `[m_start, n_end]`.
+/// Within that span the read matches the reference contiguously, so a sub-pivot `p`
+/// matches at `refpos + (p - m_start)` and the SA index there (`isa_at`) seeds the
+/// reseed forward search directly, skipping the model launch + boundary gallop.
+///
+/// BYTE-IDENTITY INVARIANT: the hint is fed to a seed-independent WARM START
+/// (`mem_search_warmstart`), whose result is byte-identical to the cold `mem_search`
+/// for ANY hint — the hint only seeds the insertion search, and the boundary search
+/// expands on a miss to the true interval. So a hint that is NOT a maximal occurrence
+/// (the common reseed case, where `read[pivot..]` diverges from the cached occurrence
+/// past `n_end`) is still safe; it just costs a few extra probes. This is why every
+/// reseeded SMEM is hinted, not only full-match ones. Proven by
+/// `mem_search_warmstart_equals_cold` plus the `collect_smems_isa_*_equals_cold`
+/// driver gates.
+#[derive(Debug, Clone, Copy)]
+struct ReseedHint {
+    /// Reference position of the SMEM's first base (`sa_position_for(k)`).
+    refpos: u64,
+    /// Inclusive read span of the cached SMEM — the window in which `reseed_isa_hint`
+    /// projects a hint for a pivot. Not a validity constraint: warm-start is
+    /// byte-identical for any hint; this just bounds where a hint is worth projecting.
+    m_start: usize,
+    n_end: usize,
+}
+
 /// Per-primitive SA-probe attribution for the `collect_gate` harness (profiling
 /// only; compiled out without `spectrum-probe-count`). Each [`Guard`] brackets one
 /// helper's probe delta into a disjoint bucket so the per-read probe budget can be
@@ -206,18 +248,39 @@ impl LearnedIndex {
         // For each pass-1 SMEM with span >= split_len && s <= split_width, reseed at
         // the midpoint with min_intv = s + 1. (The no-ISA port omits the refpos cache.)
         let split_len = opts.split_len;
-        let mut reseeds: Vec<(usize, i64)> = Vec::new();
+        // ISA reseed cache (gap A+E): when enabled and a `.isa` is loaded, each
+        // reseeded pass-1 SMEM carries its `refpos` (a single SA read) so the reseed's
+        // forward searches warm-start from `isa_at` instead of a model lookup + gallop.
+        // Gated on `kmt.is_none()`: with a k-mer table loaded `mem_search_warmstart`
+        // ignores the hint (the tabled trace is the launch), so building the hint
+        // (`sa_position_for` + `isa_at`) would be dead per-reseed work.
+        let use_isa = isa_reseed_enabled() && self.has_isa() && self.kmt.is_none();
+        let mut reseeds: Vec<(usize, i64, Option<ReseedHint>)> = Vec::new();
         for p in &smems[..num1] {
             let span = p.n + 1 - p.m;
             if span < split_len || p.s > opts.split_width {
                 continue;
             }
             let mid = ((p.m + p.n + 1) >> 1) as usize;
-            reseeds.push((mid, p.s + 1));
+            // Hint EVERY reseeded SMEM (occ ∈ [1, split_width] by the loop filter
+            // above). The reseed's forward search warm-starts from
+            // `isa_at(refpos + offset)` — byte-identical for any hint (the search
+            // expands on a miss to the true boundary), skipping the model launch when
+            // the hint is good.
+            let hint = if use_isa {
+                Some(ReseedHint {
+                    refpos: self.sa_position_for(p.k as u64),
+                    m_start: p.m as usize,
+                    n_end: p.n as usize,
+                })
+            } else {
+                None
+            };
+            reseeds.push((mid, p.s + 1, hint));
         }
 
         // ---- Pass 2: one reseed walk per selected pivot ----
-        for (pivot, min_intv) in reseeds {
+        for (pivot, min_intv, hint) in reseeds {
             self.zz_step1_reseed(
                 read,
                 rid,
@@ -225,6 +288,7 @@ impl LearnedIndex {
                 min_intv,
                 opts.min_seed_len,
                 &mut smems,
+                hint,
                 pac,
                 enc,
             );
@@ -435,6 +499,25 @@ impl LearnedIndex {
     /// returns `(emit_len, 0, 0, lmax)` and skips the truncation interval recovery.
     /// The truncation itself is `forward_truncate_below_maximal` (forward intervals
     /// nest, so it expands the maximal interval outward — no per-length re-locate).
+    /// Resolve a [`ReseedHint`] to an SA launch index for `pivot`, or `None` to fall
+    /// back to the cold search. Projected ONLY inside the cached SMEM span `[m_start,
+    /// n_end]`: outside it the read no longer matches the reference at `refpos`, so a
+    /// projected hint would be far from the maximal interval (still byte-id-safe via
+    /// the warm start, but not worth projecting). `pivot < m_start` also guards the
+    /// `pivot - m_start` subtraction.
+    #[inline]
+    fn reseed_isa_hint(&self, pivot: usize, hint: Option<ReseedHint>) -> Option<u64> {
+        let ReseedHint {
+            refpos,
+            m_start,
+            n_end,
+        } = hint?;
+        if pivot < m_start || pivot > n_end {
+            return None;
+        }
+        self.isa_at(refpos + (pivot - m_start) as u64)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn reseed_bounded_fwd(
         &self,
@@ -443,6 +526,7 @@ impl LearnedIndex {
         qlen: usize,
         min_intv: i64,
         want_interval: bool,
+        hint: Option<ReseedHint>,
         pac: &[u8],
         enc: PacEncoding,
     ) -> (usize, u64, u64, usize) {
@@ -451,7 +535,17 @@ impl LearnedIndex {
         if qlen == 0 {
             return (0, 0, 0, 0);
         }
-        let mm = self.mem_search(&read[pivot..pivot + qlen], pac, enc);
+        // Live ISA reseed (PRMI_ISA): warm-start the forward search from the projected
+        // parent-SMEM hint. `mem_search_warmstart` is byte-identical to cold
+        // `mem_search` for ANY hint (find_boundary expands on a miss to the true
+        // boundary), so a non-maximal hint is safe — it just costs extra probes. When
+        // the hint is good the insertion search collapses to ~1-2 probes, skipping the
+        // model launch. No trust path, no maximality confirm, no fallback decision.
+        let q = &read[pivot..pivot + qlen];
+        let mm = match self.reseed_isa_hint(pivot, hint) {
+            Some(h) => self.mem_search_warmstart(q, h, pac, enc),
+            None => self.mem_search(q, pac, enc),
+        };
         let lmax = mm.match_len as usize;
         if lmax == 0 {
             return (0, 0, 0, 0);
@@ -527,6 +621,7 @@ impl LearnedIndex {
         min_intv: i64,
         min_seed_len: u32,
         out: &mut Vec<Smem>,
+        hint: Option<ReseedHint>,
         pac: &[u8],
         enc: PacEncoding,
     ) -> usize {
@@ -534,7 +629,7 @@ impl LearnedIndex {
             return 0;
         }
         let (emit_len, emit_sa, emit_occ, lmax) =
-            self.reseed_bounded_fwd(read, pivot, qlen, min_intv, true, pac, enc);
+            self.reseed_bounded_fwd(read, pivot, qlen, min_intv, true, hint, pac, enc);
         if emit_len >= min_seed_len as usize && emit_occ > 0 {
             out.push(Smem {
                 rid,
@@ -565,6 +660,7 @@ impl LearnedIndex {
         min_intv: i64,
         min_seed_len: u32,
         out: &mut Vec<Smem>,
+        hint: Option<ReseedHint>,
         pac: &[u8],
         enc: PacEncoding,
     ) {
@@ -579,7 +675,7 @@ impl LearnedIndex {
             let qlen0 = self.fwd_qlen(read, pivot);
             // next_pivot needs only the length -> span-only (skip interval recovery).
             let fwd_ext = self
-                .reseed_bounded_fwd(read, pivot, qlen0, min_intv, false, pac, enc)
+                .reseed_bounded_fwd(read, pivot, qlen0, min_intv, false, hint, pac, enc)
                 .0;
             let mut next_pivot = pivot + if fwd_ext > 0 { fwd_ext } else { 1 };
             if next_pivot > rlen {
@@ -611,6 +707,7 @@ impl LearnedIndex {
                     min_intv,
                     min_seed_len,
                     out,
+                    hint,
                     pac,
                     enc,
                 );
@@ -631,6 +728,7 @@ impl LearnedIndex {
                 min_intv,
                 min_seed_len,
                 out,
+                hint,
                 pac,
                 enc,
             );
@@ -809,6 +907,20 @@ mod tests {
     use std::io::Write;
     use std::mem::{align_of, offset_of, size_of};
 
+    thread_local! {
+        /// Per-thread override of [`super::isa_reseed_enabled`] for the byte-id
+        /// proptest (`None` = use the env gate). See `isa_force_set` / `isa_force_get`.
+        static ISA_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    /// Read the test-only ISA-enable override (called from `isa_reseed_enabled`).
+    pub(super) fn isa_force_get() -> Option<bool> {
+        ISA_FORCE.with(|c| c.get())
+    }
+    /// Force the ISA reseed path on/off for the current thread (test-only).
+    fn isa_force_set(v: Option<bool>) {
+        ISA_FORCE.with(|c| c.set(v));
+    }
+
     fn write_pac(path: &std::path::Path, bases: &[u8]) {
         let l = bases.len();
         let mut buf = vec![0u8; l / 4 + 1];
@@ -841,6 +953,30 @@ mod tests {
         )
         .unwrap();
         let idx = LearnedIndex::open(&prefix).unwrap();
+        (dir, idx)
+    }
+
+    /// Like [`build_mode2`] but emits the `.isa` inverse-suffix-array sidecar, so the
+    /// ISA reseed fast-path is available (`has_isa() == true`).
+    fn build_mode2_with_isa(fwd: &[u8]) -> (tempfile::TempDir, LearnedIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let pac = dir.path().join("r.pac");
+        write_pac(&pac, fwd);
+        let prefix = dir.path().join("r.prmi");
+        let cfg = TrainerConfig::default()
+            .with_memory_mode(MemoryMode::Mode2)
+            .with_isa(true);
+        build_sidecar_from_pac_with_config(
+            &pac,
+            &prefix,
+            None,
+            MaskConfig::default(),
+            1,
+            Some(cfg),
+        )
+        .unwrap();
+        let idx = LearnedIndex::open(&prefix).unwrap();
+        assert!(idx.has_isa(), "build_mode2_with_isa produced no .isa");
         (dir, idx)
     }
 
@@ -1204,7 +1340,7 @@ mod tests {
                     continue;
                 }
                 let mid = ((p.m + p.n + 1) >> 1) as usize;
-                idx.zz_step1_reseed(&read, 0, mid, p.s + 1, min_seed_len, &mut expected_pass2, &fwd, enc);
+                idx.zz_step1_reseed(&read, 0, mid, p.s + 1, min_seed_len, &mut expected_pass2, None, &fwd, enc);
             }
             prop_assert_eq!(&unsorted[num1..], expected_pass2.as_slice(), "pass-2 tail mismatch");
 
@@ -1382,6 +1518,7 @@ mod tests {
                 p.s + 1,
                 opts.min_seed_len,
                 &mut expected,
+                None,
                 fwd,
                 enc,
             );
@@ -1418,6 +1555,101 @@ mod tests {
             let n = idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut buf).unwrap();
             prop_assert_eq!(&buf[..n], expected.as_slice(), "collect_smems != composed reference");
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// ISA byte-identity: `collect_smems` with the live ISA reseed warm-start
+        /// ENABLED == with it disabled (the cold model-launch path), positionally,
+        /// across the full opts sweep. This is the automated gate the `seed_bench`
+        /// `PRMI_ISA` diff checks manually. Reads are REFERENCE SUBSTRINGS so they
+        /// produce long pass-1 SMEMs whose reseeds are hinted (every reseeded SMEM is
+        /// hinted, so the warm-start path is actually exercised here).
+        #[test]
+        fn collect_smems_isa_equals_cold(
+            fwd in prop::collection::vec(0u8..=3, 60..220),
+            cuts in prop::collection::vec((0usize..220, 8usize..80), 1..8),
+            min_seed_len in 1u32..10,
+            split_len in 2u32..14,
+            split_width in 1i64..8,
+            max_mem_intv in 0i64..6,
+        ) {
+            let (_dir, idx) = build_mode2_with_isa(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv };
+
+            // Reads = substrings of the reference (guaranteed full matches).
+            let reads: Vec<Vec<u8>> = cuts
+                .iter()
+                .filter_map(|&(s, l)| {
+                    let start = s % fwd.len();
+                    let end = (start + l).min(fwd.len());
+                    (end > start).then(|| fwd[start..end].to_vec())
+                })
+                .collect();
+
+            for (i, r) in reads.iter().enumerate() {
+                let mut buf_cold = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; 2 * r.len() + 8];
+                let mut buf_isa = buf_cold.clone();
+
+                isa_force_set(Some(false));
+                let nc = idx.collect_smems(r, i as u32, &opts, &fwd, enc, &mut buf_cold).unwrap();
+                isa_force_set(Some(true));
+                let ni = idx.collect_smems(r, i as u32, &opts, &fwd, enc, &mut buf_isa).unwrap();
+                isa_force_set(None);
+
+                prop_assert_eq!(nc, ni, "ISA path changed SMEM count for read {}", i);
+                prop_assert_eq!(&buf_cold[..nc], &buf_isa[..ni], "ISA path != cold for read {}", i);
+            }
+        }
+    }
+
+    /// Partial-SMEM byte-id: a reference substring with a flipped last base is NOT a
+    /// full-read match, so its long pass-1 SMEM is a PARTIAL SMEM (span < rlen). That
+    /// SMEM is still hinted and its reseed WARM-STARTS from a hint that is NOT a
+    /// maximal occurrence (the read diverges past the cached span). Byte-identity must
+    /// hold — this is the case the seed-independence of the warm start exists for.
+    #[test]
+    fn collect_smems_isa_warmstart_equals_cold_partial() {
+        let fwd: Vec<u8> = (0..400).map(|i| ((i * 7 + 3) % 4) as u8).collect();
+        let (_d, idx) = build_mode2_with_isa(&fwd);
+        let enc = PacEncoding::Unpacked;
+        let opts = CollectOpts {
+            min_seed_len: 5,
+            split_len: 6,
+            split_width: 7,
+            max_mem_intv: 0,
+        };
+        let mut r = fwd[20..180].to_vec();
+        let last = r.len() - 1;
+        r[last] = (r[last] + 1) % 4; // flip so the read does not fully match anywhere
+        let mut a = vec![
+            Smem {
+                rid: 0,
+                m: 0,
+                n: 0,
+                k: 0,
+                l: 0,
+                s: 0
+            };
+            2 * r.len() + 8
+        ];
+        let mut b = a.clone();
+        isa_force_set(Some(false));
+        let na = idx.collect_smems(&r, 0, &opts, &fwd, enc, &mut a).unwrap();
+        isa_force_set(Some(true));
+        let nb = idx.collect_smems(&r, 0, &opts, &fwd, enc, &mut b).unwrap();
+        isa_force_set(None);
+        assert_eq!(
+            na, nb,
+            "ISA warm-start changed SMEM count on a partial-match read"
+        );
+        assert_eq!(
+            &a[..na],
+            &b[..nb],
+            "ISA warm-start != cold on a partial-match read"
+        );
     }
 
     /// Concurrency: many threads calling `collect_smems(&self, ...)` on a shared

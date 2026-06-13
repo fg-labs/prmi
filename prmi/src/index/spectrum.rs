@@ -1535,6 +1535,95 @@ impl LearnedIndex {
         }
     }
 
+    /// [`mem_search`] WARM-STARTED from an approximate SA-index `hint` — the
+    /// byte-identity-safe reseed primitive (BWA-MEME's `use_cached` /
+    /// `no_search=false` path). Unlike [`mem_search_from_hint`] (which TRUSTS the
+    /// hint and is exact only for a hint guaranteed to lie in the maximal
+    /// interval), this uses `hint` ONLY to seed the insertion-point search:
+    /// [`find_boundary`](Self::find_boundary) expands on a miss to the TRUE
+    /// boundary, so the result is **byte-identical to [`mem_search`]`(query)` for
+    /// ANY `hint`** — a wrong/stale hint costs only a few extra probes, never a
+    /// wrong answer (proven by `mem_search_warmstart_equals_cold`). This is what
+    /// the reseed needs: a *projected* parent-SMEM hint
+    /// (`isa_at(refpos + offset)`) is not guaranteed to land in the reseed
+    /// window's maximal interval, so it must be confirmed, not trusted. When the
+    /// hint is near the maximal insertion point the search collapses to ~1-2
+    /// probes, skipping the model launch (the cost no model retrain could cut).
+    ///
+    /// The warm-start applies on the no-`kmt` launch (`forward_maximal_len`'s
+    /// model window); with a `kmt` loaded the tabled trace is the launch and the
+    /// hint is ignored (still byte-identical — that branch is `mem_search`'s
+    /// verbatim). `hint` may be any value; it is clamped into `[0, sa_num)` by
+    /// [`forward_maximal_len_seeded`](Self::forward_maximal_len_seeded).
+    ///
+    /// [`mem_search`]: Self::mem_search
+    /// [`mem_search_from_hint`]: Self::mem_search_from_hint
+    pub fn mem_search_warmstart(
+        &self,
+        query: &[u8],
+        hint: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // Fail closed on an undersized packed pac (as `mem_search` does): the
+        // O(log) path reaches `forward_maximal_len_seeded`'s `fill_doubled_chunk`,
+        // which `.unwrap()`s `pac_base_at` — a panic on an out-of-range byte.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_warmstart").is_err() {
+                return zero;
+            }
+        }
+        if query.is_empty() {
+            return zero;
+        }
+        // No `kmt`: warm-start the maximal-prefix launch from `hint` instead of the
+        // model lookup, then recover the interval by galloping from `ip` exactly as
+        // `mem_search` does. `find_boundary` is seed-independent, so both the
+        // maximal-prefix search and the interval recovery are byte-identical to the
+        // cold path — the seed only changes the probe count.
+        if self.kmt.is_none() {
+            let sa_num = self.sa_num();
+            let l_pac = self.l_pac();
+            let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+            let seed_win = Some((hint, hint.saturating_add(1)));
+            let (match_len, ip) = self
+                .forward_maximal_len_seeded(query, query_key, sa_num, pac, enc, l_pac, seed_win);
+            if match_len == 0 {
+                return zero;
+            }
+            let qm = &query[..match_len as usize];
+            let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+            let lower = self.find_boundary(0, sa_num, ip, ip, |mid| {
+                self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+            });
+            let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
+                self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+            });
+            return MemMatch {
+                match_len,
+                sa_start: lower,
+                occ: upper - lower,
+            };
+        }
+        // Table loaded: the tabled trace is the launch; the hint does not apply.
+        // Byte-identical to `mem_search` (this is its `kmt` branch verbatim).
+        let mut sink = LastStepSink::default();
+        self.forward_spectrum_auto_into(query, pac, enc, &mut sink);
+        match sink.last() {
+            Some(s) => MemMatch {
+                match_len: s.match_len,
+                sa_start: s.sa_start,
+                occ: s.occ_count,
+            },
+            None => zero,
+        }
+    }
+
     /// Cap-bounded one-shot forward maximal match — BWA-MEME's `min_intv`-bounded
     /// SMEM interval counting (gap A). The maximal `match_len` is always exact.
     /// When the true `occ <= max_intv` the SA interval (`sa_start`, `occ`) is
@@ -3228,12 +3317,41 @@ impl LearnedIndex {
         enc: PacEncoding,
         l_pac: u64,
     ) -> (u64, u64) {
+        self.forward_maximal_len_seeded(q, q_key, sa_num, pac, enc, l_pac, None)
+    }
+
+    /// [`forward_maximal_len`](Self::forward_maximal_len) with an optional WARM-START
+    /// seed window. `seed_win = None` is the production model launch (`lookup`) and is
+    /// byte-identical to the un-split function. `seed_win = Some((lo, hi))` skips the
+    /// model launch and seeds the insertion `find_boundary` at the caller's window
+    /// (e.g. an ISA-projected hint). The result is **byte-identical for ANY seed**:
+    /// `find_boundary` expands on a miss to the true insertion point, so the seed only
+    /// changes the probe count, never `(match_len, ip)`. This is the seam the ISA
+    /// reseed warm-start hangs on.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_maximal_len_seeded(
+        &self,
+        q: &[u8],
+        q_key: u64,
+        sa_num: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+        l_pac: u64,
+        seed_win: Option<(u64, u64)>,
+    ) -> (u64, u64) {
         if q.is_empty() {
             return (0, 0);
         }
-        let (pred, err) = self.lookup(q_key);
-        let win_lo = pred.saturating_sub(err);
-        let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
+        let (win_lo, win_hi) = match seed_win {
+            Some((lo, hi)) => (lo.min(sa_num), hi.min(sa_num)),
+            None => {
+                let (pred, err) = self.lookup(q_key);
+                (
+                    pred.saturating_sub(err),
+                    pred.saturating_add(err).saturating_add(1).min(sa_num),
+                )
+            }
+        };
         let ip = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
             self.ref_less(q, q_key, mid, pac, enc, l_pac)
         });
@@ -4744,6 +4862,42 @@ mod keyed_tests {
                     // want_interval=false must still report the same match_len.
                     let ml_only = idx.mem_search_from_hint(q, hint, false, &fwd, e);
                     prop_assert_eq!(ml_only.match_len, unhinted.match_len, "match_len-only mismatch");
+                }
+            }
+        }
+
+        /// Seed-independence contract for the forward warm start (Phase 1): the
+        /// warm-started `mem_search_warmstart(q, hint)` equals the cold
+        /// `mem_search(q)` for ANY hint — including wrong/stale/far hints, NOT just
+        /// hints inside the maximal interval (which `mem_search_hint_equals_unhinted`
+        /// covers for the TRUSTED `from_hint` path). This is what makes the live
+        /// Phase-1 reseed byte-identical regardless of whether the projected ISA
+        /// hint is a maximal occurrence.
+        #[test]
+        fn mem_search_warmstart_equals_cold(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..50), 1..6),
+            hint_raw in 0u64..u64::MAX,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let sa_num = idx.sa_num();
+            for q in &queries {
+                let cold = idx.mem_search(q, &fwd, e);
+                // Sweep a random far hint AND near-interval hints, so the test
+                // exercises both the far-hint gallop and the ~1-2-probe fast-path
+                // collapse (a random hint over a small-occ SA almost never lands
+                // near the interval). Include raw out-of-range hints (`hint_raw`
+                // unmodded + `u64::MAX`) to pin the `hint >= sa_num` clamp path.
+                let mut hints = vec![hint_raw, u64::MAX, hint_raw % sa_num.max(1)];
+                if cold.occ > 0 {
+                    hints.push(cold.sa_start);
+                    hints.push(cold.sa_start.saturating_sub(1));
+                    hints.push((cold.sa_start + cold.occ).min(sa_num.saturating_sub(1)));
+                }
+                for hint in hints {
+                    let warm = idx.mem_search_warmstart(q, hint, &fwd, e);
+                    prop_assert_eq!(warm, cold, "warmstart != cold at hint={}, query={:?}", hint, q);
                 }
             }
         }
