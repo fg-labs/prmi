@@ -1819,8 +1819,8 @@ pub struct prmi_collect_opts_t {
     pub split_len: u32,
     /// Reseed occurrence threshold: only pass-1 SMEMs with `s <= split_width`.
     pub split_width: i64,
-    /// Pass-3 `max_mem_intv` strategy. **Pass 3 is not yet supported — only `0` is
-    /// accepted; a nonzero value is rejected with `-5`.**
+    /// Pass-3 `max_mem_intv` strategy (the FMI long-MEM reseed round); `0` disables
+    /// pass 3.
     pub max_mem_intv: i64,
 }
 
@@ -1837,9 +1837,11 @@ const _: () = {
     );
 };
 
-/// Collect ALL SMEMs for ONE read (passes 1+2, sorted within-read) byte-identically
-/// to bwa-mem3 FMI seeding — the fused entrypoint that runs the whole zigzag walk in
-/// one call instead of the consumer's 91–155 per-read `prmi_mem_search*` crossings.
+/// Collect ALL SMEMs for ONE read (passes 1+2[+3], sorted within-read)
+/// byte-identically to bwa-mem3 FMI seeding — the fused entrypoint that runs the
+/// whole zigzag walk in one call instead of the consumer's 91–155 per-read
+/// `prmi_mem_search*` crossings. Pass 3 (the FMI long-MEM reseed round) is enabled
+/// when `opts.max_mem_intv > 0` and disabled when `opts.max_mem_intv == 0`.
 ///
 /// `read` is 2-bit encoded (`0..=3`, `4` = N), `read_len` bytes. `rid` is stamped
 /// into every emitted `prmi_smem_t::rid`. `pac` is the FORWARD pac (bntpac packed,
@@ -1854,8 +1856,7 @@ const _: () = {
 /// `opts`/`pac`/`out_n`, null `read` with nonzero `read_len`, or null `out` with
 /// nonzero `out_cap`); `-2` invalid `read_len`/`out_cap` or `pac_num_bases` too
 /// large for this platform; `-3` internal panic; `-4` `out` too small (`*out_n` is
-/// set to the required count — grow and retry); `-5` `max_mem_intv != 0` (pass 3
-/// not yet supported).
+/// set to the required count — grow and retry).
 ///
 /// # Safety
 /// `handle` valid; `read` valid for `read_len` bytes; `opts` valid; `pac` valid for
@@ -1898,12 +1899,6 @@ pub unsafe extern "C" fn prmi_collect_smems(
         return -1;
     }
     let o = unsafe { &*opts };
-    // Pass 3 (`max_mem_intv > 0`) is not yet ported; reject it loudly rather than
-    // emit an incomplete (passes 1+2 only) seed set.
-    if o.max_mem_intv != 0 {
-        set_last_error("prmi_collect_smems: max_mem_intv > 0 (pass 3) is not yet supported");
-        return -5;
-    }
     let h = unsafe { Handle::as_ref(handle) };
     // `from_raw_parts` requires a non-null pointer even for length 0, so build an
     // empty slice directly for the empty case (mirrors `out_slice` below); `read`

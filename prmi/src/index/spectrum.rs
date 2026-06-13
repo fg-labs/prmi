@@ -2324,6 +2324,51 @@ impl LearnedIndex {
         }
     }
 
+    /// Pass-3 forward narrowing from a MODEL-SEEDED interval: given the length-`l0`
+    /// interval `[lo0, hi0)` of `query[..l0]` (whose occ is `>= threshold`), narrow
+    /// FORWARD (increasing length, occ non-increasing) and return the first length
+    /// `L > l0` whose occ `< threshold` as `Some((L, lo, occ))` — `occ == 0` when
+    /// the interval empties at `L >` the maximal match. Returns `None` if occ stays
+    /// `>= threshold` through `query.len()`.
+    ///
+    /// Seeds the narrowing at `[lo0, hi0)` (the pass-3 fast path's `Lstart`
+    /// interval) instead of `[0, sa_num)` (the cold `forward_spectrum`) — the pass-3
+    /// analogue of the model-seeded forward locate. Byte-identical: each length-`L`
+    /// interval is the exact lower/upper-bound interval `forward_spectrum` computes
+    /// (`lower_bound_prefix`/`upper_bound_prefix` are seed-independent), so the
+    /// emitted `(L, lo, occ)` matches the cold-spectrum break point.
+    ///
+    /// Verified by `collect`'s `pass3_equals_oracle` (the model-seeded pass-3 walk
+    /// vs the `forward_spectrum` reference walk vs an independent `mem_search` walk).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_narrow_first_below(
+        &self,
+        query: &[u8],
+        l0: usize,
+        lo0: u64,
+        hi0: u64,
+        threshold: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Option<(usize, u64, u64)> {
+        let l_pac = self.l_pac();
+        let mut lo = lo0;
+        let mut hi = hi0;
+        for m in (l0 + 1)..=query.len() {
+            let qm = &query[..m];
+            let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+            let lower = self.lower_bound_prefix(qm, qm_key, pac, enc, l_pac, lo, hi);
+            let upper = self.upper_bound_prefix(qm, qm_key, pac, enc, l_pac, lower, hi);
+            let occ = upper - lower;
+            if occ < threshold {
+                return Some((m, lower, occ));
+            }
+            lo = lower;
+            hi = upper;
+        }
+        None
+    }
+
     /// One-shot maximal LEFT extension launched from an EXACT SA index hint —
     /// the backward twin of [`mem_search_from_hint`](Self::mem_search_from_hint),
     /// BWA-MEME's `no_search` for the left direction. `hint` is the SA index whose

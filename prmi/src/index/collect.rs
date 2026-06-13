@@ -16,14 +16,14 @@
 //! (MODE_NONE): every search runs at `est_hint = 0`, so the `ZzHintState`
 //! machinery is omitted. Built on the existing, byte-identity-tested per-call
 //! primitives (`mem_search`, `mem_search_backward`,
-//! `mem_search_backward_truncated_span_rc`, `forward_truncate_below_maximal`) — no
-//! new search math.
+//! `mem_search_backward_truncated_span_rc`, `forward_truncate_below_maximal`,
+//! `forward_narrow_first_below`) — no new search math.
 //!
-//! **Pass 3 (`max_mem_intv > 0`) is NOT yet ported.** It needs the model-seeded
-//! forward-narrowing primitive from the (still-unmerged) forward-routing work; the
-//! FFI rejects `max_mem_intv != 0` up front, and [`LearnedIndex::collect_smems`]
-//! documents the precondition. Passes 1+2 (`max_mem_intv == 0`) are byte-identical
-//! to FMI seeding today.
+//! Pass 3 (`max_mem_intv > 0`, the FMI long-MEM reseed round) is model-seeded: one
+//! `mem_search` locate at `Lstart`, then a forward narrowing
+//! (`forward_narrow_first_below`) from that interval to the first depth whose occ
+//! drops below `max_mem_intv` — byte-identical to the cold `forward_spectrum`
+//! reference walk (the `pass3_seed_one_pivot_spectrum` oracle).
 
 use crate::index::smem::PacEncoding;
 use crate::index::LearnedIndex;
@@ -31,8 +31,7 @@ use crate::index::LearnedIndex;
 /// Per-primitive SA-probe attribution for the `collect_gate` harness (profiling
 /// only; compiled out without `spectrum-probe-count`). Each [`Guard`] brackets one
 /// helper's probe delta into a disjoint bucket so the per-read probe budget can be
-/// split across pass-1 left/right and reseed left/forward (slot 4, `pass3`, is
-/// reserved for the deferred pass 3 and stays zero until it lands).
+/// split across pass-1 left/right, reseed left/forward, and pass 3 (slot 4).
 #[cfg(feature = "spectrum-probe-count")]
 pub mod attrib {
     use crate::index::spectrum::probe_count;
@@ -108,7 +107,7 @@ pub struct Smem {
 /// SMEM-collection parameters, mirroring the bwa-mem3 `mem_opt_t` fields the
 /// seeding walk reads. `split_len` is caller-precomputed
 /// `round(min_seed_len * split_factor)` (cpp:1700). `max_mem_intv == 0` skips
-/// pass 3 (the only currently-supported value — see the module docs).
+/// pass 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectOpts {
     /// Minimum seed length; emitted SMEMs span `>= min_seed_len`.
@@ -117,13 +116,12 @@ pub struct CollectOpts {
     pub split_len: u32,
     /// Reseed occurrence threshold: only pass-1 SMEMs with `s <= split_width`.
     pub split_width: i64,
-    /// Pass-3 `max_mem_intv` strategy; `0` disables pass 3. **Pass 3 is not yet
-    /// ported — only `0` is supported (the FFI rejects nonzero).**
+    /// Pass-3 `max_mem_intv` strategy; `0` disables pass 3.
     pub max_mem_intv: i64,
 }
 
 impl LearnedIndex {
-    /// Collect all SMEMs for ONE read (passes 1+2, sorted within-read per the
+    /// Collect all SMEMs for ONE read (passes 1+2[+3], sorted within-read per the
     /// design §4.7), byte-identical to FMI seeding.
     ///
     /// `read` is 2-bit encoded (`0..=3`, `4` = N). `rid` is stamped into every
@@ -133,12 +131,10 @@ impl LearnedIndex {
     /// Returns `Ok(count)` with the SMEMs written to `out[..count]`, or
     /// `Err(needed)` if `out` is too small (the caller grows `out` to `>= needed`
     /// and retries). A safe per-read capacity is `2 * read.len()` (passes 1+2 emit
-    /// `<= read.len()`; the reserved pass-3 budget keeps the `2 *` slack).
+    /// `<= read.len()`; pass 3 adds `<= read.len()`).
     ///
-    /// **Precondition: `opts.max_mem_intv == 0`.** Pass 3 (`max_mem_intv > 0`) is
-    /// not yet ported; the FFI rejects a nonzero value (`-5`) before reaching here,
-    /// and a direct Rust caller passing nonzero panics (rather than silently getting
-    /// a passes-1+2-only seed set). This precondition is removed when pass 3 lands.
+    /// `opts.max_mem_intv > 0` enables the pass-3 `max_mem_intv` strategy (the FMI
+    /// long-MEM reseed round); `0` disables it.
     ///
     /// Concurrency-safe: `&self` is read-only (SA/model/kmt + the init-once
     /// `base_intervals`); all scratch is stack/local, so many worker threads may
@@ -152,10 +148,6 @@ impl LearnedIndex {
         enc: PacEncoding,
         out: &mut [Smem],
     ) -> Result<usize, usize> {
-        assert_eq!(
-            opts.max_mem_intv, 0,
-            "collect_smems: pass 3 (max_mem_intv > 0) is not yet supported"
-        );
         let mut smems = self.collect_smems_unsorted(read, rid, opts, pac, enc);
         Self::sort_within_read(&mut smems);
         if smems.len() > out.len() {
@@ -180,12 +172,9 @@ impl LearnedIndex {
         smems.sort_unstable_by(|a, b| a.m.cmp(&b.m).then(a.n.cmp(&b.n)));
     }
 
-    /// The per-read walk (passes 1+2) in EMISSION order, before the within-read
+    /// The per-read walk (passes 1+2[+3]) in EMISSION order, before the within-read
     /// sort (Task 7). Returned as a `Vec` so the whole set is available to sort.
     /// Port of the `mem_collect_smem_zigzag` driver (cpp:1644-1834), no-ISA.
-    ///
-    /// Pass 3 (`max_mem_intv > 0`) is NOT run here — it is deferred (see the module
-    /// docs); the entrypoint's precondition keeps `max_mem_intv == 0`.
     fn collect_smems_unsorted(
         &self,
         read: &[u8],
@@ -241,7 +230,23 @@ impl LearnedIndex {
             );
         }
 
-        // ---- Pass 3 (max_mem_intv strategy) is deferred; see the module docs. ----
+        // ---- Pass 3: max_mem_intv strategy (gated; cpp:1793-1829) ----
+        if opts.max_mem_intv > 0 {
+            let msl1 = opts.min_seed_len as usize + 1;
+            let mut x = 0;
+            while x < rlen {
+                x = self.pass3_seed_one_pivot(
+                    read,
+                    rid,
+                    x,
+                    opts.max_mem_intv,
+                    msl1,
+                    &mut smems,
+                    pac,
+                    enc,
+                );
+            }
+        }
 
         smems
     }
@@ -631,6 +636,167 @@ impl LearnedIndex {
             );
         }
     }
+
+    /// Pass-3 (`max_mem_intv` strategy) seeding at one pivot (port of
+    /// `pass3_seed_one_pivot_learned`, cpp:457-530). Forward-only: emits <=1 SMEM at
+    /// the first length `L >= max(min_seed_len + 1, 2)` whose occ drops below
+    /// `max_mem_intv` (and `> 0`). Returns `next_pivot` (the driver sets `x = next`).
+    ///
+    /// Perf: the common case (the length-`Lstart` window already occurs `<
+    /// max_mem_intv` times) is served by ONE **model-seeded** `mem_search` locate,
+    /// skipping the cold `forward_spectrum` trace that binary-searches the whole SA
+    /// at shallow depths. Only the rare repetitive case (`occ(Lstart) >=
+    /// max_mem_intv`, needing a forward extension to the crossing) falls back to the
+    /// model-seeded forward narrow ([`forward_narrow_first_below`], seeded at the
+    /// `Lstart` interval). Byte-identical to [`pass3_seed_one_pivot_spectrum`]:
+    /// `mem_search`'s `occ` at length `L` equals `forward_spectrum`'s `occ_at(L)`,
+    /// and the forward narrow reproduces each deeper break point exactly.
+    ///
+    /// [`forward_narrow_first_below`]: LearnedIndex::forward_narrow_first_below
+    #[allow(clippy::too_many_arguments)]
+    fn pass3_seed_one_pivot(
+        &self,
+        read: &[u8],
+        rid: u32,
+        pivot: usize,
+        max_mem_intv: i64,
+        min_seed_len_plus1: usize,
+        out: &mut Vec<Smem>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> usize {
+        #[cfg(feature = "spectrum-probe-count")]
+        let _g = attrib::Guard::new(4); // pass3
+        let rlen = read.len();
+        if pivot >= rlen || read[pivot] >= 4 {
+            return pivot + 1; // N / OOB (cpp:463-466)
+        }
+        let qlen = self.fwd_qlen(read, pivot);
+        let lstart = min_seed_len_plus1.max(2);
+        let boundary = || {
+            if pivot + qlen < rlen {
+                pivot + qlen + 1 // an N stopped the window (cpp:528)
+            } else {
+                pivot + qlen
+            }
+        };
+        // The spectrum scan's loop `for L in lstart..=qlen` doesn't run when
+        // lstart > qlen → window boundary.
+        if lstart > qlen {
+            return boundary();
+        }
+        // Fast path: one model-seeded locate at Lstart. occ_at(Lstart) = occ iff the
+        // length-Lstart window fully occurs (match_len == Lstart), else 0.
+        let m = self.mem_search(&read[pivot..pivot + lstart], pac, enc);
+        let occ_lstart = if m.match_len as usize >= lstart {
+            m.occ as i64
+        } else {
+            0
+        };
+        if occ_lstart < max_mem_intv {
+            // Crossing is at Lstart (the spectrum loop's first iteration).
+            if occ_lstart > 0 {
+                out.push(Smem {
+                    rid,
+                    m: pivot as u32,
+                    n: (pivot + lstart - 1) as u32,
+                    k: m.sa_start as i64,
+                    l: 0,
+                    s: occ_lstart,
+                });
+            }
+            return pivot + lstart;
+        }
+        // occ(Lstart) >= max_mem_intv: narrow FORWARD from the model-seeded Lstart
+        // interval to the first deeper length with occ < max_mem_intv — instead of
+        // the cold forward_spectrum. (occ_lstart >= max_mem_intv > 0 ⇒ match_len ==
+        // Lstart, so [sa_start, sa_start+occ) is the exact Lstart interval.)
+        match self.forward_narrow_first_below(
+            &read[pivot..pivot + qlen],
+            lstart,
+            m.sa_start,
+            m.sa_start + m.occ,
+            max_mem_intv as u64,
+            pac,
+            enc,
+        ) {
+            Some((l, lo, occ)) => {
+                if occ > 0 {
+                    out.push(Smem {
+                        rid,
+                        m: pivot as u32,
+                        n: (pivot + l - 1) as u32,
+                        k: lo as i64,
+                        l: 0,
+                        s: occ as i64,
+                    });
+                }
+                pivot + l
+            }
+            // occ stayed >= max_mem_intv through the window: boundary, no emit.
+            None => boundary(),
+        }
+    }
+
+    /// Reference pass-3 via the full `forward_spectrum` trace (cold; binary-searches
+    /// the whole SA at shallow depths). Kept as the byte-identity oracle for the
+    /// model-seeded [`pass3_seed_one_pivot`] (fast path + forward-narrow fallback).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn pass3_seed_one_pivot_spectrum(
+        &self,
+        read: &[u8],
+        rid: u32,
+        pivot: usize,
+        max_mem_intv: i64,
+        min_seed_len_plus1: usize,
+        out: &mut Vec<Smem>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> usize {
+        let rlen = read.len();
+        if pivot >= rlen || read[pivot] >= 4 {
+            return pivot + 1; // N / OOB: SMEM block skipped, advance by 1 (cpp:463-466)
+        }
+        let qlen = self.fwd_qlen(read, pivot);
+        let boundary_is_n = pivot + qlen < rlen;
+        let steps = self.forward_spectrum(&read[pivot..pivot + qlen], pac, enc);
+
+        // occ at forward length L (first breakpoint covering L); monotone non-increasing.
+        let occ_at = |len: usize| -> (i64, i64) {
+            for s in &steps {
+                if s.match_len as usize >= len {
+                    return (s.occ_count as i64, s.sa_start as i64);
+                }
+            }
+            (0, 0) // L > maximal match: interval emptied
+        };
+
+        let lstart = min_seed_len_plus1.max(2);
+        for len in lstart..=qlen {
+            let (s, sa) = occ_at(len);
+            if s < max_mem_intv {
+                // FMI break point (cpp:509-523).
+                if s > 0 {
+                    out.push(Smem {
+                        rid,
+                        m: pivot as u32,
+                        n: (pivot + len - 1) as u32,
+                        k: sa,
+                        l: 0,
+                        s,
+                    });
+                }
+                return pivot + len;
+            }
+        }
+        // Window boundary reached without the condition firing (cpp:528).
+        if boundary_is_n {
+            pivot + qlen + 1
+        } else {
+            pivot + qlen
+        }
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +934,106 @@ mod tests {
         let mut pivot = 0;
         while pivot < read.len() {
             idx.zz_step1(read, 0, &mut pivot, 1, min_seed_len, &mut out, fwd, enc);
+        }
+        out
+    }
+
+    /// Drive the standalone pass-3 walk (model-seeded) over `read`.
+    fn pass3_walk(
+        idx: &LearnedIndex,
+        read: &[u8],
+        fwd: &[u8],
+        max_mem_intv: i64,
+        min_seed_len: u32,
+    ) -> Vec<Smem> {
+        let enc = PacEncoding::Unpacked;
+        let msl1 = min_seed_len as usize + 1;
+        let mut out = Vec::new();
+        let mut x = 0;
+        while x < read.len() {
+            x = idx.pass3_seed_one_pivot(read, 0, x, max_mem_intv, msl1, &mut out, fwd, enc);
+        }
+        out
+    }
+
+    /// Drive pass 3 via the reference `forward_spectrum` path (the byte-identity
+    /// oracle for the model-seeded fast path).
+    fn pass3_walk_spectrum(
+        idx: &LearnedIndex,
+        read: &[u8],
+        fwd: &[u8],
+        max_mem_intv: i64,
+        min_seed_len: u32,
+    ) -> Vec<Smem> {
+        let enc = PacEncoding::Unpacked;
+        let msl1 = min_seed_len as usize + 1;
+        let mut out = Vec::new();
+        let mut x = 0;
+        while x < read.len() {
+            x = idx.pass3_seed_one_pivot_spectrum(
+                read,
+                0,
+                x,
+                max_mem_intv,
+                msl1,
+                &mut out,
+                fwd,
+                enc,
+            );
+        }
+        out
+    }
+
+    /// Independent pass-3 oracle: same walk structure but `occ_at(L)` via a fresh
+    /// FORWARD `mem_search` (a different code path than pass-3's `forward_spectrum`).
+    /// Returns `(m, n, k, s)` tuples in emission order.
+    fn pass3_oracle(
+        idx: &LearnedIndex,
+        read: &[u8],
+        fwd: &[u8],
+        max_mem_intv: i64,
+        min_seed_len: u32,
+    ) -> Vec<(u32, u32, i64, i64)> {
+        let enc = PacEncoding::Unpacked;
+        let rlen = read.len();
+        let msl1 = min_seed_len as usize + 1;
+        let occ_at = |pivot: usize, len: usize| -> (i64, i64) {
+            let m = idx.mem_search(&read[pivot..pivot + len], fwd, enc);
+            if m.match_len as usize >= len {
+                (m.occ as i64, m.sa_start as i64)
+            } else {
+                (0, 0)
+            }
+        };
+        let mut out = Vec::new();
+        let mut x = 0;
+        while x < rlen {
+            let mut next_x = x + 1;
+            if read[x] < 4 {
+                let qlen = fwd_qlen(read, x);
+                let boundary_is_n = x + qlen < rlen;
+                let lstart = msl1.max(2);
+                let mut broke = false;
+                for len in lstart..=qlen {
+                    let (s, sa) = occ_at(x, len);
+                    if s < max_mem_intv {
+                        next_x = x + len;
+                        if s > 0 {
+                            out.push((x as u32, (x + len - 1) as u32, sa, s));
+                        }
+                        broke = true;
+                        break;
+                    }
+                }
+                if !broke {
+                    next_x = if boundary_is_n {
+                        x + qlen + 1
+                    } else {
+                        x + qlen
+                    };
+                }
+            }
+            x = next_x;
         }
         out
     }
@@ -1030,16 +1296,69 @@ mod tests {
             let mut ok = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; needed];
             prop_assert_eq!(idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut ok), Ok(needed));
         }
+
+        /// Pass-3 walk == the independent `mem_search`-based oracle (positional), and
+        /// the model-seeded fast path == the reference `forward_spectrum` path; every
+        /// pass-3 SMEM is a valid exact-match interval with `0 < occ < max_mem_intv`
+        /// and span `> min_seed_len`.
+        #[test]
+        fn pass3_equals_oracle(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=3, 1..50),
+            min_seed_len in 1u32..8,
+            max_mem_intv in 1i64..8,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let got = pass3_walk(&idx, &read, &fwd, max_mem_intv, min_seed_len);
+            let want = pass3_oracle(&idx, &read, &fwd, max_mem_intv, min_seed_len);
+
+            let got_tuples: Vec<(u32, u32, i64, i64)> =
+                got.iter().map(|s| (s.m, s.n, s.k, s.s)).collect();
+            prop_assert_eq!(&got_tuples, &want, "pass-3 walk != oracle for read {:?}", read);
+
+            // Model-seeded fast path == the reference forward_spectrum path, positionally.
+            let want_spectrum = pass3_walk_spectrum(&idx, &read, &fwd, max_mem_intv, min_seed_len);
+            prop_assert_eq!(&got, &want_spectrum, "model-seeded pass3 != spectrum pass3");
+
+            for s in &got {
+                prop_assert!(s.n - s.m + 1 > min_seed_len);
+                prop_assert!(s.s > 0 && s.s < max_mem_intv, "pass-3 occ must be 0 < s < max_mem_intv");
+                prop_assert_eq!(s.l, 0);
+                let recov = idx.mem_search(&read[s.m as usize..=s.n as usize], &fwd, enc);
+                prop_assert_eq!(recov.match_len as usize, (s.n - s.m + 1) as usize);
+                prop_assert_eq!(recov.sa_start as i64, s.k);
+                prop_assert_eq!(recov.occ as i64, s.s);
+            }
+        }
+
+        /// `max_mem_intv == 0` disables pass 3: the driver output equals passes 1+2
+        /// only (no extra SMEMs appended). `split_width == 0` selects no reseeds, so
+        /// this isolates the pass-3 gate against a pass-1-only baseline.
+        #[test]
+        fn pass3_disabled_when_zero(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            read in prop::collection::vec(0u8..=3, 1..50),
+            min_seed_len in 2u32..8,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts0 = CollectOpts { min_seed_len, split_len: 1000, split_width: 0, max_mem_intv: 0 };
+            let out = idx.collect_smems_unsorted(&read, 0, &opts0, &fwd, enc);
+            let pass1 = pass1_walk(&idx, &read, &fwd, min_seed_len);
+            prop_assert_eq!(out, pass1);
+        }
     }
 
-    /// End-to-end: `collect_smems` (passes 1+2) equals the composition of the
-    /// independently oracle-validated walks — pass-1 (== MEM set) and pass-2 (reseed
-    /// selection transcribed in-test + `zz_step1_reseed`) — concatenated in that
-    /// order and run through the two-stage sort. Sweeps the reseed knobs. This
-    /// confirms the driver interleaves the passes in the right order with the right
-    /// args; the components themselves are validated by the tests above. Positional
-    /// (order included). The `(m,n)`-tie order vs the C++ unstable introsort remains
-    /// a KNOWN OPEN deferred to the consumer box-gate.
+    /// End-to-end: `collect_smems` equals the composition of the independently
+    /// oracle-validated walks — pass-1 (== MEM set), pass-2 (reseed selection
+    /// transcribed in-test + `zz_step1_reseed`), and pass-3 (gated on
+    /// `max_mem_intv > 0`, via the `pass3_walk`) — concatenated in that order and
+    /// run through the two-stage sort. Sweeps the reseed knobs and `max_mem_intv`.
+    /// This confirms the driver interleaves the passes in the right order with the
+    /// right args; the components themselves are validated by the tests above.
+    /// Positional (order included). The `(m,n)`-tie order vs the C++ unstable
+    /// introsort remains a KNOWN OPEN deferred to the consumer box-gate.
     fn full_pipeline_reference(
         idx: &LearnedIndex,
         read: &[u8],
@@ -1067,6 +1386,11 @@ mod tests {
                 enc,
             );
         }
+        // Pass 3 (gated): the model-seeded walk, appended before the sort.
+        if opts.max_mem_intv > 0 {
+            let mut p3 = pass3_walk(idx, read, fwd, opts.max_mem_intv, opts.min_seed_len);
+            expected.append(&mut p3);
+        }
         LearnedIndex::sort_within_read(&mut expected);
         expected
     }
@@ -1074,8 +1398,8 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
-        /// `collect_smems` == the full-pipeline reference, across the opts sweep
-        /// (`max_mem_intv == 0`: passes 1+2), positionally.
+        /// `collect_smems` == the full-pipeline reference, across the whole opts
+        /// sweep (including pass 3), positionally.
         #[test]
         fn collect_smems_full_pipeline(
             fwd in prop::collection::vec(0u8..=3, 40..220),
@@ -1083,10 +1407,11 @@ mod tests {
             min_seed_len in 1u32..10,
             split_len in 2u32..14,
             split_width in 1i64..8,
+            max_mem_intv in 0i64..6,
         ) {
             let (_dir, idx) = build_mode2(&fwd);
             let enc = PacEncoding::Unpacked;
-            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv: 0 };
+            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv };
 
             let expected = full_pipeline_reference(&idx, &read, &fwd, &opts);
             let mut buf = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; expected.len() + 8];
