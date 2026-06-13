@@ -148,8 +148,32 @@ pub(crate) fn compare_query_vs_suffix_2x(
     enc: PacEncoding,
     l_pac: u64,
 ) -> (bool, u32) {
-    let mut lcp: u32 = 0;
-    let mut q_off: usize = 0; // bases of `query` already matched
+    compare_query_vs_suffix_2x_from(query, sa_pos, 0, pac, enc, l_pac)
+}
+
+/// [`compare_query_vs_suffix_2x`] starting from a known common-prefix length
+/// `skip`: the first `skip` bases of `query` are ASSUMED to equal the suffix at
+/// `sa_pos` and are not re-compared. Returns the same `(ref_less, lcp)` as the
+/// from-0 compare **whenever `skip <= lcp(query, suffix)`** — the Manber-Myers
+/// invariant a boundary search maintains (`skip = min(lcp_lo, lcp_hi)`), so each
+/// probe compares only the bytes beyond the already-known common prefix
+/// (`O(match_len + probes)` total instead of `O(probes × match_len)`).
+///
+/// `#[inline]` is load-bearing: the from-0 wrapper [`compare_query_vs_suffix_2x`]
+/// is on the keyed comparator's long-match tail (the decomposed hot path), where
+/// the pre-refactor body was inlined; without this the tail pays a real call and
+/// the `skip == 0` constants no longer fold.
+#[inline]
+pub(crate) fn compare_query_vs_suffix_2x_from(
+    query: &[u8],
+    sa_pos: u64,
+    skip: usize,
+    pac: &[u8],
+    enc: PacEncoding,
+    l_pac: u64,
+) -> (bool, u32) {
+    let mut lcp: u32 = skip as u32;
+    let mut q_off: usize = skip; // bases of `query` already matched (>= skip)
     let mut buf = [0u8; CHUNK_BASES];
 
     while q_off < query.len() {
@@ -4457,6 +4481,38 @@ mod keyed_tests {
                             "forward_truncate span-only != L* (qlen={} min_intv={})", qlen, min_intv
                         );
                     }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// LCP-skip foundation: `compare_query_vs_suffix_2x_from(skip)` returns the
+        /// SAME `(ref_less, lcp)` as the from-0 compare for every `skip <= lcp` (the
+        /// Manber-Myers invariant). This guarantees a boundary search may skip
+        /// `min(lcp_lo, lcp_hi)` known-common bases without changing the boundary.
+        #[test]
+        fn compare_from_equals_full_mode2(
+            fwd in prop::collection::vec(0u8..=3, 40..220),
+            query in prop::collection::vec(0u8..=3, 1..64),
+            mid_fracs in prop::collection::vec(0.0f64..=1.0, 16),
+        ) {
+            let l_pac = fwd.len() as u64;
+            let (_dir, idx) = build_mode2(&fwd);
+            let sa_num = idx.sa_num();
+            let e = PacEncoding::Unpacked;
+            for frac in &mid_fracs {
+                let mid = ((sa_num.saturating_sub(1)) as f64 * frac).round() as u64;
+                let pos = idx.sa_position_for(mid);
+                let (rl0, lcp0) = compare_query_vs_suffix_2x_from(&query, pos, 0, &fwd, e, l_pac);
+                for skip in 0..=(lcp0 as usize).min(query.len()) {
+                    let got = compare_query_vs_suffix_2x_from(&query, pos, skip, &fwd, e, l_pac);
+                    prop_assert_eq!(
+                        got, (rl0, lcp0),
+                        "compare_from(skip={}) != from(0) at mid={} pos={}",
+                        skip, mid, pos
+                    );
                 }
             }
         }
