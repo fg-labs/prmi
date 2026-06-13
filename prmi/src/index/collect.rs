@@ -518,6 +518,39 @@ impl LearnedIndex {
         self.isa_at(refpos + (pivot - m_start) as u64)
     }
 
+    /// RC-strand launch hint for the LEFT reseed — the reverse-complement twin of
+    /// [`reseed_isa_hint`](Self::reseed_isa_hint). Same `[m_start, n_end]` span guard;
+    /// the formula is `2*l_pac − refpos − (pivot − m_start) − 1` (the doubled-text
+    /// complement-mirror of the forward position `refpos + off`, matching BWA-MEME
+    /// `LearnedIndex_seeding.cpp:1535`). Base is `2*l_pac` (BWA-MEME's
+    /// `suffix_array_num`), NOT prmi's `sa_num() == 2*l_pac + 1` — the `+1` is the
+    /// sentinel, and using it here is off by one (it points one past the RC
+    /// occurrence, so the warm-start would gallop back; caught by
+    /// `reseed_rc_hint_reduces_probes`). Returns `None` outside the span or on
+    /// coordinate over/underflow (the `2*l_pac` base and each mirror subtraction
+    /// are checked). Fed as the `seed_hint` of
+    /// `mem_search_backward_span_rc_warmstart` (a WARM-START, so a wrong projection is
+    /// byte-id-safe — it only costs probes).
+    #[inline]
+    fn reseed_rc_hint(&self, pivot: usize, hint: Option<ReseedHint>) -> Option<u64> {
+        let ReseedHint {
+            refpos,
+            m_start,
+            n_end,
+        } = hint?;
+        if pivot < m_start || pivot > n_end {
+            return None;
+        }
+        let off = (pivot - m_start) as u64;
+        let rc = self
+            .l_pac()
+            .checked_mul(2)?
+            .checked_sub(refpos)?
+            .checked_sub(off)?
+            .checked_sub(1)?;
+        self.isa_at(rc)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn reseed_bounded_fwd(
         &self,
@@ -586,17 +619,26 @@ impl LearnedIndex {
         read: &[u8],
         pivot: usize,
         min_intv: i64,
+        hint: Option<ReseedHint>,
         pac: &[u8],
         enc: PacEncoding,
     ) -> usize {
         #[cfg(feature = "spectrum-probe-count")]
         let _g = attrib::Guard::new(2); // rs_left
-        let span = self.mem_search_backward_truncated_span_rc(
+
+        // Live ISA reseed (PRMI_ISA): warm-start the RC walk from the projected
+        // RC-strand hint. Byte-identical to the cold walk for ANY hint (the warm
+        // start only seeds the internal insertion search), so a None/garbage
+        // projection is safe — it just costs probes. Mirrors the forward reseed in
+        // `reseed_bounded_fwd`.
+        let seed = self.reseed_rc_hint(pivot, hint);
+        let span = self.mem_search_backward_span_rc_warmstart(
             1, // occ_count: unit sentinel (nonzero); the RC floor handles non-occurrence
             1, // anchor_len
             read,
             pivot,
             min_intv as u64,
+            seed,
             pac,
             enc,
         );
@@ -693,7 +735,7 @@ impl LearnedIndex {
                     }
                     continue;
                 }
-                let left = self.zz_left_span_reseed(read, pivot, min_intv, pac, enc);
+                let left = self.zz_left_span_reseed(read, pivot, min_intv, hint, pac, enc);
                 pivot = pivot + 1 - left;
                 if next_pivot - pivot < msl {
                     break; // cpp:1324
@@ -1649,6 +1691,114 @@ mod tests {
             &a[..na],
             &b[..nb],
             "ISA warm-start != cold on a partial-match read"
+        );
+    }
+
+    /// Left/RC byte-id: a partial-match read (reference substring with an INTERIOR
+    /// flip) forces reseed steps with left context, so the reseed-left RC warm-start
+    /// fires from a stale/non-maximal RC hint. ISA-on (left+fwd warm-start) must equal
+    /// ISA-off (cold). Guards the RC wiring's byte-identity.
+    #[test]
+    fn collect_smems_isa_left_warmstart_equals_cold_partial() {
+        // Low-occurrence reference (same generator as `reseed_rc_hint_reduces_probes`):
+        // a 4-periodic `(i * a + b) % 4` reference repeats every exact block ~len/4
+        // times, so the long blocks around the interior flip exceed `split_width` and
+        // get filtered out of pass-2 — the test would then pass without ever reaching
+        // the RC left-warmstart path. The hashed generator keeps occurrences low so a
+        // reseed candidate survives the filter (asserted below under the probe-count
+        // feature).
+        let fwd: Vec<u8> = (0..400)
+            .map(|i| (((i as u64 * 2654435761) >> 11) % 4) as u8)
+            .collect();
+        let (_d, idx) = build_mode2_with_isa(&fwd);
+        let enc = PacEncoding::Unpacked;
+        let opts = CollectOpts {
+            min_seed_len: 5,
+            split_len: 6,
+            split_width: 7,
+            max_mem_intv: 0,
+        };
+        let mut r = fwd[30..210].to_vec(); // long internal substring → reseeds with left context
+        let mid = r.len() / 2;
+        r[mid] = (r[mid] + 2) % 4; // interior flip → partial; reseed fires both directions
+        let mut a = vec![
+            Smem {
+                rid: 0,
+                m: 0,
+                n: 0,
+                k: 0,
+                l: 0,
+                s: 0
+            };
+            2 * r.len() + 8
+        ];
+        let mut b = a.clone();
+        isa_force_set(Some(false));
+        let na = idx.collect_smems(&r, 0, &opts, &fwd, enc, &mut a).unwrap();
+        isa_force_set(Some(true));
+        let nb = idx.collect_smems(&r, 0, &opts, &fwd, enc, &mut b).unwrap();
+        isa_force_set(None);
+        assert_eq!(na, nb, "left/RC warm-start changed SMEM count");
+        assert_eq!(&a[..na], &b[..nb], "left/RC warm-start != cold");
+
+        // Coverage guard: prove the fixture actually reaches the RC left-reseed path
+        // (pass-2). `rs_left` (bucket 2) counts probes issued inside
+        // `zz_left_span_reseed`; a non-periodic reference must leave a reseed candidate
+        // under `split_width`, so this byte-id test cannot silently pass without
+        // exercising the new warm-start.
+        #[cfg(feature = "spectrum-probe-count")]
+        {
+            attrib::reset();
+            isa_force_set(Some(true));
+            let mut c = a.clone();
+            let _ = idx.collect_smems(&r, 0, &opts, &fwd, enc, &mut c).unwrap();
+            isa_force_set(None);
+            assert!(
+                attrib::snapshot()[2] > 0,
+                "fixture never reached the RC left-reseed path (rs_left=0)"
+            );
+        }
+    }
+
+    /// PROJECTION-CORRECTNESS gate (the load-bearing one): the RC reseed-left
+    /// warm-start with the CORRECT RC projection must touch STRICTLY FEWER SA probes
+    /// than the cold RC search on a deep left extension. A wrong RC formula yields a
+    /// seed far from the interval → no probe reduction, failing this — which neither
+    /// the byte-id proptest nor the on==off gate can catch (a garbage projection
+    /// passes both). `reseed_rc_hint`'s formula is exercised inline here.
+    #[cfg(feature = "spectrum-probe-count")]
+    #[test]
+    fn reseed_rc_hint_reduces_probes() {
+        use crate::index::spectrum::probe_count as pc;
+        // Pseudo-random reference (low-occ) long enough for a deep left extension.
+        let fwd: Vec<u8> = (0..4000)
+            .map(|i| (((i * 2654435761u64) >> 11) % 4) as u8)
+            .collect();
+        let (_d, idx) = build_mode2_with_isa(&fwd);
+        let enc = PacEncoding::Unpacked;
+        // A reference-substring SMEM [m_start, ...]; a left reseed at a deep interior pivot.
+        let m_start = 1000usize;
+        let pivot = 1300usize; // 300 bp of left context → deep maximal RC extension
+        let refpos = m_start as u64; // first-base ref pos of the full-substring SMEM
+
+        // cold span + probes:
+        pc::reset();
+        let cold = idx.mem_search_backward_truncated_span_rc(1, 1, &fwd, pivot, 2, &fwd, enc);
+        let cold_probes = pc::get();
+        // CORRECT RC projection (same formula as `reseed_rc_hint`): base `2*l_pac`.
+        let off = (pivot - m_start) as u64;
+        let rc = 2 * idx.l_pac() - refpos - off - 1;
+        let seed = idx.isa_at(rc);
+        pc::reset();
+        let warm = idx.mem_search_backward_span_rc_warmstart(1, 1, &fwd, pivot, 2, seed, &fwd, enc);
+        let warm_probes = pc::get();
+        assert!(seed.is_some(), "RC projection produced no SA index");
+        assert_eq!(warm, cold, "RC warm-start changed the span");
+        assert!(
+            warm_probes < cold_probes,
+            "RC projection did not reduce probes ({} vs cold {}) — projection wrong / no-op",
+            warm_probes,
+            cold_probes
         );
     }
 
