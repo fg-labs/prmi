@@ -4,17 +4,18 @@
 //! FFI tests for `prmi_forward_spectrum`, `prmi_backward_spectrum`,
 //! `prmi_smem_step_t`, `prmi_sa_positions_strided`, and the batch variants.
 
+use prmi::index::collect::{CollectOpts, Smem};
 use prmi::index::smem::PacEncoding;
 use prmi::index::LearnedIndex;
 use prmi::train::build_sidecar_with_config;
 use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
     prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
-    prmi_bwd_task_t, prmi_close, prmi_forward_spectrum, prmi_forward_spectrum_batch,
-    prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward,
+    prmi_bwd_task_t, prmi_close, prmi_collect_opts_t, prmi_collect_smems, prmi_forward_spectrum,
+    prmi_forward_spectrum_batch, prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward,
     prmi_mem_search_backward_truncated_interval, prmi_mem_search_capped, prmi_mem_search_lean,
     prmi_open, prmi_sa_num, prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
-    PRMI_MEM_WANT_INTERVAL,
+    prmi_smem_t, PRMI_MEM_WANT_INTERVAL,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -1862,6 +1863,223 @@ fn backward_spectrum_batch_out_of_arena_returns_minus_two() {
     assert_eq!(
         rc, -2,
         "out-of-arena read window should return -2, got {rc}"
+    );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_collect_smems` plumbs to `LearnedIndex::collect_smems` and returns the
+/// same SMEMs byte-for-byte; plus the empty-read, pass-3-rejection, and overflow
+/// contracts.
+#[test]
+fn collect_smems_ffi_matches_rust() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str.clone()).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pnb = pac_unpacked.len() as u64;
+
+    // A read lifted from the reference (so passes 1+2 actually emit on the
+    // repetitive ACGT reference).
+    let read: Vec<u8> = pac_unpacked[10..70].to_vec();
+    let opts = CollectOpts {
+        min_seed_len: 5,
+        split_len: 8,
+        split_width: 4,
+        max_mem_intv: 0,
+    };
+
+    // Rust reference (Unpacked pac), the byte-identity oracle.
+    let idx = LearnedIndex::open(std::path::Path::new(&prefix_str)).unwrap();
+    let mut rust_buf = vec![
+        Smem {
+            rid: 0,
+            m: 0,
+            n: 0,
+            k: 0,
+            l: 0,
+            s: 0,
+        };
+        2 * read.len() + 16
+    ];
+    let rust_n = idx
+        .collect_smems(
+            &read,
+            9,
+            &opts,
+            &pac_unpacked,
+            PacEncoding::Unpacked,
+            &mut rust_buf,
+        )
+        .unwrap();
+    assert!(rust_n > 0, "expected the lifted read to emit SMEMs");
+
+    // FFI (Packed pac) into a prmi_smem_t buffer.
+    let copts = prmi_collect_opts_t {
+        min_seed_len: opts.min_seed_len,
+        split_len: opts.split_len,
+        split_width: opts.split_width,
+        max_mem_intv: opts.max_mem_intv,
+    };
+    let mut ffi_buf: Vec<prmi_smem_t> = (0..2 * read.len() + 16)
+        .map(|_| prmi_smem_t {
+            rid: 0,
+            m: 0,
+            n: 0,
+            k: 0,
+            l: 0,
+            s: 0,
+        })
+        .collect();
+    let mut out_n: i32 = -1;
+    let rc = unsafe {
+        prmi_collect_smems(
+            handle,
+            read.as_ptr(),
+            read.len() as i32,
+            9,
+            &copts,
+            pac_packed.as_ptr(),
+            pnb,
+            ffi_buf.as_mut_ptr(),
+            ffi_buf.len() as i32,
+            &mut out_n,
+        )
+    };
+    assert_eq!(rc, 0, "prmi_collect_smems rc={rc}");
+    assert_eq!(out_n as usize, rust_n, "FFI SMEM count != Rust count");
+    for i in 0..rust_n {
+        let (f, r) = (&ffi_buf[i], &rust_buf[i]);
+        assert_eq!(
+            (f.rid, f.m, f.n, f.k, f.l, f.s),
+            (r.rid, r.m, r.n, r.k, r.l, r.s),
+            "FFI SMEM[{i}] != Rust SMEM[{i}]"
+        );
+    }
+
+    // Empty read -> 0 SMEMs, rc 0.
+    let mut empty_n: i32 = -1;
+    let rc_empty = unsafe {
+        prmi_collect_smems(
+            handle,
+            read.as_ptr(),
+            0,
+            9,
+            &copts,
+            pac_packed.as_ptr(),
+            pnb,
+            ffi_buf.as_mut_ptr(),
+            ffi_buf.len() as i32,
+            &mut empty_n,
+        )
+    };
+    assert_eq!(rc_empty, 0, "empty read rc={rc_empty}");
+    assert_eq!(empty_n, 0, "empty read must yield 0 SMEMs");
+
+    // Pass 3 (max_mem_intv > 0) is rejected with -5.
+    let copts_p3 = prmi_collect_opts_t {
+        max_mem_intv: 1,
+        ..copts
+    };
+    let mut p3_n: i32 = -1;
+    let rc_p3 = unsafe {
+        prmi_collect_smems(
+            handle,
+            read.as_ptr(),
+            read.len() as i32,
+            9,
+            &copts_p3,
+            pac_packed.as_ptr(),
+            pnb,
+            ffi_buf.as_mut_ptr(),
+            ffi_buf.len() as i32,
+            &mut p3_n,
+        )
+    };
+    assert_eq!(rc_p3, -5, "max_mem_intv > 0 must be rejected with -5");
+
+    // Overflow: out_cap one short -> -4, out_n set to the required count.
+    let mut ovf_n: i32 = -1;
+    let rc_ovf = unsafe {
+        prmi_collect_smems(
+            handle,
+            read.as_ptr(),
+            read.len() as i32,
+            9,
+            &copts,
+            pac_packed.as_ptr(),
+            pnb,
+            ffi_buf.as_mut_ptr(),
+            (rust_n - 1) as i32,
+            &mut ovf_n,
+        )
+    };
+    assert_eq!(rc_ovf, -4, "too-small out must return -4");
+    assert_eq!(ovf_n as usize, rust_n, "-4 must report the required count");
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi_collect_smems` accepts the canonical C empty-slice representation
+/// (`read == NULL`, `read_len == 0`) — the documented empty-read contract — and
+/// yields 0 SMEMs rather than a `-1` null-pointer error.
+#[test]
+fn collect_smems_ffi_null_empty_read() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pnb = pac_unpacked.len() as u64;
+    let copts = prmi_collect_opts_t {
+        min_seed_len: 5,
+        split_len: 8,
+        split_width: 4,
+        max_mem_intv: 0,
+    };
+    let mut out_n: i32 = -1;
+    let rc = unsafe {
+        prmi_collect_smems(
+            handle,
+            ptr::null(), // NULL read with read_len == 0: a valid empty slice in C.
+            0,
+            0,
+            &copts,
+            pac_packed.as_ptr(),
+            pnb,
+            ptr::null_mut(), // out may be null when out_cap == 0.
+            0,
+            &mut out_n,
+        )
+    };
+    assert_eq!(
+        rc, 0,
+        "NULL read with read_len==0 must be accepted, got rc={rc}"
+    );
+    assert_eq!(out_n, 0, "empty read must yield 0 SMEMs");
+
+    // A NULL read with a NONZERO read_len is still a -1 null-pointer error.
+    let mut bad_n: i32 = -1;
+    let rc_bad = unsafe {
+        prmi_collect_smems(
+            handle,
+            ptr::null(),
+            5,
+            0,
+            &copts,
+            pac_packed.as_ptr(),
+            pnb,
+            ptr::null_mut(),
+            0,
+            &mut bad_n,
+        )
+    };
+    assert_eq!(
+        rc_bad, -1,
+        "NULL read with nonzero read_len must be rejected"
     );
 
     unsafe { prmi_close(handle) };
