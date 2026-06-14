@@ -186,6 +186,10 @@ impl<K: TrainingKey> RMITrainingDataIteratorProvider for Vec<(K, usize)> {
     }
 }
 
+/// Iterator adapter over `(key, offset)` pairs that collapses each run of
+/// duplicate keys onto the offset of the run's *first* occurrence (lower-bound
+/// semantics for the CDF). It must yield exactly as many items as the
+/// underlying iterator — one per input pair.
 struct FixDupsIter<K, T: Iterator<Item = (K, usize)>> {
     iter: T,
     last_item: Option<(K, usize)>,
@@ -225,7 +229,12 @@ where
                         return Some(nxt);
                     }
                 }
-                None => self.last_item.take(),
+                // Underlying iterator exhausted: stop. Previously this returned
+                // `self.last_item.take()`, which re-emitted the already-yielded
+                // final row, so `iter()` produced len()+1 items and every
+                // `slr` leaf/routing fit (and the CDF trainers) double-weighted
+                // the last point.
+                None => None,
             },
         }
     }
@@ -846,5 +855,40 @@ mod training_key_epsilon_tests {
         );
         assert_eq!(5u32.minus_epsilon(), 4);
         assert_eq!(5u32.plus_epsilon(), 6);
+    }
+}
+
+#[cfg(test)]
+mod fix_dups_iter_tests {
+    use super::*;
+
+    /// `iter()` must yield exactly one item per input pair. A prior bug in
+    /// `FixDupsIter`'s terminal branch re-emitted the final row, producing
+    /// len()+1 items and double-weighting the last point in every `slr` fit.
+    #[test]
+    fn iter_yields_one_item_per_input_row() {
+        let pairs: Vec<(u64, usize)> = vec![(0, 0), (1, 1), (3, 2), (100, 3)];
+        let data = RMITrainingData::<u64>::new(Box::new(pairs.clone()));
+
+        let iterated: Vec<(u64, usize)> = data.iter().collect();
+        assert_eq!(
+            iterated, pairs,
+            "iter() must reproduce the input one-to-one, with no trailing replay"
+        );
+    }
+
+    /// A run of duplicate keys collapses onto the first occurrence's offset, and
+    /// still yields exactly `len()` items (one per input row, no replay).
+    #[test]
+    fn iter_collapses_duplicate_keys_to_first_offset() {
+        let pairs: Vec<(u64, usize)> = vec![(5, 0), (5, 1), (5, 2), (7, 3)];
+        let data = RMITrainingData::<u64>::new(Box::new(pairs));
+
+        let iterated: Vec<(u64, usize)> = data.iter().collect();
+        assert_eq!(
+            iterated,
+            vec![(5, 0), (5, 0), (5, 0), (7, 3)],
+            "duplicate keys map to the first occurrence's offset; length is unchanged"
+        );
     }
 }
