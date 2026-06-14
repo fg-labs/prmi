@@ -1952,7 +1952,11 @@ impl LearnedIndex {
     /// variant.
     ///
     /// Byte-identical to the brute-force `truncated_span_oracle` — verified by
-    /// `mem_search_backward_truncated_span_rc_equals_oracle`.
+    /// `mem_search_backward_truncated_span_rc_equals_oracle`. The cold (no
+    /// warm-start) entry point; [`mem_search_backward_span_rc_warmstart`] is the
+    /// `.isa`-seeded twin.
+    ///
+    /// [`mem_search_backward_span_rc_warmstart`]: Self::mem_search_backward_span_rc_warmstart
     #[allow(clippy::too_many_arguments)]
     pub fn mem_search_backward_truncated_span_rc(
         &self,
@@ -1964,8 +1968,65 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
     ) -> u64 {
+        self.span_rc_walk(occ_count, anchor_len, read, pivot, min_intv, None, pac, enc)
+    }
+
+    /// [`mem_search_backward_truncated_span_rc`]'s RC walk WARM-STARTED from an
+    /// RC-strand SA-index hint (the reseed-LEFT lever). Byte-identical to the cold
+    /// walk for ANY hint — the hint only seeds the internal `forward_maximal_len`
+    /// insertion search, which expands on a miss to the true boundary (same
+    /// seed-independence as [`mem_search_warmstart`]). `seed_hint = None` ≡ the cold
+    /// walk. This is NOT the TRUST path (`mem_search_backward_from_hint`), which is
+    /// byte-id-UNSAFE for a sub-maximal hint; this warm-start is safe for any hint
+    /// (proven by `mem_search_backward_warmstart_equals_cold`).
+    ///
+    /// [`mem_search_backward_truncated_span_rc`]: Self::mem_search_backward_truncated_span_rc
+    /// [`mem_search_warmstart`]: Self::mem_search_warmstart
+    #[allow(clippy::too_many_arguments)]
+    pub fn mem_search_backward_span_rc_warmstart(
+        &self,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        min_intv: u64,
+        seed_hint: Option<u64>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> u64 {
+        let seed_win = seed_hint.map(|h| (h, h.saturating_add(1)));
+        self.span_rc_walk(
+            occ_count, anchor_len, read, pivot, min_intv, seed_win, pac, enc,
+        )
+    }
+
+    /// Shared RC-walk body of the cold and warm-started span_rc entry points.
+    /// `seed_win` warm-starts the maximal-extension insertion search (`None` = cold
+    /// model launch); it only seeds the search, so the span is identical for any
+    /// value (or `None`) — proven by `mem_search_backward_warmstart_equals_cold`.
+    #[allow(clippy::too_many_arguments)]
+    fn span_rc_walk(
+        &self,
+        occ_count: u64,
+        anchor_len: u64,
+        read: &[u8],
+        pivot: usize,
+        min_intv: u64,
+        seed_win: Option<(u64, u64)>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> u64 {
         if occ_count == 0 {
-            return 0;
+            return anchor_len;
+        }
+        // Both public entry points (cold and warm-started) route here and slice the
+        // caller-supplied `pac`; an undersized `Packed` must fail closed to the anchor
+        // floor BEFORE any `forward_maximal_len_seeded` probe reaches a packed-decode
+        // `.unwrap()` (mirrors the guarded one-shot entrypoints).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "span_rc_walk").is_err() {
+                return anchor_len;
+            }
         }
         let sa_num = self.sa_num();
         let l_pac = self.l_pac();
@@ -2007,8 +2068,10 @@ impl LearnedIndex {
             &rc_heap
         };
         let q_key = tokenize_32mer(q, q.len().min(KMER_LEN));
-        // Maximal left-extension span + `q`'s insertion point.
-        let (span_max, ip) = self.forward_maximal_len(q, q_key, sa_num, pac, enc, l_pac);
+        // Maximal left-extension span + `q`'s insertion point. `seed_win` warm-starts
+        // the insertion search (None = cold model launch); byte-identical either way.
+        let (span_max, ip) =
+            self.forward_maximal_len_seeded(q, q_key, sa_num, pac, enc, l_pac, seed_win);
         if span_max <= anchor_len {
             return anchor_len;
         }
@@ -4399,6 +4462,47 @@ mod keyed_tests {
         }
     }
 
+    /// `occ_count == 0` (the anchor does not occur) must floor to `anchor_len`, not
+    /// `0`, for BOTH the cold and warm-started `_span_rc` entry points. The
+    /// oracle-equality proptest above filters non-occurring anchors (`match_len != 0`),
+    /// so it never reaches the zero-occ floor; this pins it directly. Matches the
+    /// floor `truncated_span_oracle` returns for `o == 0` (`span_max == 0 <= al -> al`)
+    /// and the anchor floor `mem_search_backward_truncated_interval` returns for the
+    /// same input — without this, the direct `_span_rc` calls would diverge from both.
+    #[test]
+    fn span_rc_zero_occ_floors_to_anchor_len() {
+        let fwd: Vec<u8> = (0..120).map(|i| ((i * 7 + 3) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let read = fwd.clone();
+        for &anchor_len in &[1u64, 4, 9] {
+            for pivot in [1usize, 17, 40] {
+                for &min_intv in &[0u64, 1, 5, 1_000_000] {
+                    // occ_count == 0 -> the anchor does not occur; the documented floor
+                    // is `anchor_len` regardless of `min_intv` or warm-start hint.
+                    let cold = idx.mem_search_backward_truncated_span_rc(
+                        0, anchor_len, &read, pivot, min_intv, &fwd, e,
+                    );
+                    assert_eq!(
+                        cold, anchor_len,
+                        "cold zero-occ span_rc floored to {cold}, want anchor_len={anchor_len} \
+                         (pivot={pivot}, min_intv={min_intv})"
+                    );
+                    for seed_hint in [None, Some(0u64), Some(7u64)] {
+                        let warm = idx.mem_search_backward_span_rc_warmstart(
+                            0, anchor_len, &read, pivot, min_intv, seed_hint, &fwd, e,
+                        );
+                        assert_eq!(
+                            warm, anchor_len,
+                            "warm zero-occ span_rc floored to {warm}, want anchor_len={anchor_len} \
+                             (pivot={pivot}, min_intv={min_intv}, hint={seed_hint:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
         /// `mem_search_backward_truncated_interval_rc` (RC-downward walk) ==
@@ -4688,6 +4792,44 @@ mod keyed_tests {
         }
     }
 
+    /// Both public RC-span entry points (`mem_search_backward_truncated_span_rc` and
+    /// its `..._warmstart` twin) route through `span_rc_walk`, which slices the
+    /// caller-supplied `pac`. An undersized `Packed` must fail closed to the anchor
+    /// floor (`anchor_len`) BEFORE any `forward_maximal_len_seeded` probe reaches a
+    /// packed-decode `.unwrap()` — the RC twin of
+    /// `forward_truncate_below_maximal_fails_closed_on_bad_input`.
+    #[test]
+    fn span_rc_walk_fails_closed_on_undersized_packed_pac() {
+        let fwd: Vec<u8> = (0..120u32).map(|i| (i % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        // A real left-extension setup: pivot mid-read, occ_count > 0 so the walk runs.
+        let pivot = 30usize;
+        let anchor_len = 1u64;
+        // `num_bases` claims far more bases than the empty `pac` holds.
+        let packed = PacEncoding::Packed { num_bases: 1 << 20 };
+        assert_eq!(
+            idx.mem_search_backward_truncated_span_rc(1, anchor_len, &fwd, pivot, 1, &[], packed),
+            anchor_len,
+            "cold span_rc with undersized packed pac must fail closed to anchor_len"
+        );
+        for seed_hint in [None, Some(0u64), Some(u64::MAX)] {
+            assert_eq!(
+                idx.mem_search_backward_span_rc_warmstart(
+                    1,
+                    anchor_len,
+                    &fwd,
+                    pivot,
+                    1,
+                    seed_hint,
+                    &[],
+                    packed
+                ),
+                anchor_len,
+                "warm span_rc (hint={seed_hint:?}) with undersized packed pac must fail closed"
+            );
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
         /// `mem_search_backward` == the maximal step of the INDEPENDENT model-free
@@ -4886,6 +5028,34 @@ mod keyed_tests {
                     let warm = idx.mem_search_warmstart(q, hint, &fwd, e);
                     prop_assert_eq!(warm, cold, "warmstart != cold at hint={}, query={:?}", hint, q);
                 }
+            }
+        }
+
+        /// Seed-independence contract for the BACKWARD/RC warm start (the left twin of
+        /// `mem_search_warmstart_equals_cold`): the RC-walk span warm-started from ANY
+        /// hint equals the cold (`seed_hint = None`) RC-walk span. Proves byte-identity;
+        /// says NOTHING about whether a projection is correct (a garbage hint passes
+        /// too — projection-correctness is gated separately in collect.rs).
+        #[test]
+        fn mem_search_backward_warmstart_equals_cold(
+            fwd in prop::collection::vec(0u8..=3, 40..200),
+            cut in (2usize..200, 2usize..50),
+            min_intv in 1u64..6,
+            hint_raw in 0u64..u64::MAX,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let sa_num = idx.sa_num();
+            // pivot in [1, len): a left extension exists (read[pivot-1] is a real base).
+            let pivot = (cut.0 % fwd.len()).max(1);
+            let cold = idx.mem_search_backward_truncated_span_rc(1, 1, &fwd, pivot, min_intv, &fwd, e);
+            // Sweep the documented "ANY hint" contract: the cold `None` launch, a raw
+            // out-of-range `Some(hint_raw)` (exercises the `seed_win` clamp), and a
+            // near-interval `Some(hint_raw % sa_num)` — all must match the cold walk.
+            for seed_hint in [None, Some(hint_raw), Some(hint_raw % sa_num.max(1))] {
+                let warm = idx.mem_search_backward_span_rc_warmstart(
+                    1, 1, &fwd, pivot, min_intv, seed_hint, &fwd, e);
+                prop_assert_eq!(warm, cold, "rc warmstart != cold at pivot={}, hint={:?}", pivot, seed_hint);
             }
         }
 
