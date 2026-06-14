@@ -1,8 +1,11 @@
 // Copyright (C) 2026 Fulcrum Genomics LLC
 // SPDX-License-Identifier: MIT
 //
-// C++ driver that exercises the full prmi C ABI.  Its only job is to catch FFI
-// shape regressions — it is NOT a usage example for real workloads.
+// C++ driver that exercises the full prmi C ABI.  Its primary job is to catch
+// FFI shape regressions — it is NOT a tuned harness for real workloads — but the
+// final `prmi_collect_smems` block additionally demonstrates the idiomatic C
+// calling pattern for the fused per-read SMEM collector (opts setup, the
+// grow-on-(-4) overflow retry, and iterating the returned SMEMs).
 //
 // Usage:
 //   cpp_caller <sidecar_prefix> <32mer_hex_key> <query_2bit_file> \
@@ -306,6 +309,88 @@ int main(int argc, char** argv) {
         }
     }
     // --- end spectrum smoke ---------------------------------------------------
+
+    // --- prmi_collect_smems usage --------------------------------------------
+    // The fused per-read SMEM collector: one call returns all SMEMs for a read,
+    // byte-identical to FMI seeding. This block shows the idiomatic C calling
+    // pattern — opts setup, the grow-on-(-4) retry, and iterating the result.
+    {
+        const int READ_LEN = 60;  // 60 bases of ACGT×1024 reference => full match
+        std::vector<uint8_t> read(READ_LEN);
+        for (int i = 0; i < READ_LEN && static_cast<uint64_t>(i) < pac_num_bases; ++i) {
+            uint8_t byte  = pac_packed[i / 4];
+            int     shift = 6 - 2 * (i % 4);
+            read[i] = (byte >> shift) & 0x3;
+        }
+
+        prmi_collect_opts_t opts;
+        opts.min_seed_len  = 19;
+        opts.split_len     = 28;
+        opts.split_width   = 10;
+        opts.max_mem_intv  = 20;  // > 0 => pass 3 (the long-MEM reseed round) enabled
+        const uint32_t rid = 7;
+
+        // Size-probe: out_cap=0 returns -4 with *out_n set to the required count
+        // (a caller that prefers to size the buffer exactly before allocating).
+        int needed = -1;
+        int rc_probe = prmi_collect_smems(idx, read.data(), READ_LEN, rid, &opts,
+                                          pac_packed.data(), pac_num_bases,
+                                          nullptr, 0, &needed);
+        std::printf("collect_smems size-probe rc=%d needed=%d\n", rc_probe, needed);
+        if (rc_probe != 0 && rc_probe != -4) {
+            std::fprintf(stderr, "prmi_collect_smems probe failed rc=%d: %s\n",
+                         rc_probe, prmi_last_error_message());
+            prmi_close(idx);
+            return 1;
+        }
+
+        // Idiomatic call: start from a guess and grow to the reported count on -4.
+        std::vector<prmi_smem_t> out(8);
+        int n = 0;
+        for (;;) {
+            int rc = prmi_collect_smems(idx, read.data(), READ_LEN, rid, &opts,
+                                        pac_packed.data(), pac_num_bases,
+                                        out.data(), static_cast<int>(out.size()), &n);
+            if (rc == -4) {                 // out too small: *n is the required count
+                out.resize(static_cast<std::size_t>(n));
+                continue;
+            }
+            if (rc != 0) {
+                std::fprintf(stderr, "prmi_collect_smems failed rc=%d: %s\n",
+                             rc, prmi_last_error_message());
+                prmi_close(idx);
+                return 1;
+            }
+            break;
+        }
+        std::printf("collect_smems n=%d", n);
+        if (n > 0) {
+            const prmi_smem_t& s = out[0];
+            std::printf(" first=(rid=%u m=%u n=%u k=%lld s=%lld)",
+                s.rid, s.m, s.n,
+                static_cast<long long>(s.k), static_cast<long long>(s.s));
+        }
+        std::printf("\n");
+        if (n < 1) {
+            std::fprintf(stderr,
+                "prmi_collect_smems: expected >=1 SMEM for a reference-derived read\n");
+            prmi_close(idx);
+            return 1;
+        }
+        // Every emitted SMEM must carry the requested rid and a valid span/interval.
+        for (int i = 0; i < n; ++i) {
+            const prmi_smem_t& s = out[static_cast<std::size_t>(i)];
+            if (s.rid != rid || s.n < s.m || s.s < 1) {
+                std::fprintf(stderr,
+                    "prmi_collect_smems: malformed SMEM[%d] (rid=%u m=%u n=%u s=%lld)\n",
+                    i, s.rid, s.m, s.n, static_cast<long long>(s.s));
+                prmi_close(idx);
+                return 1;
+            }
+        }
+        std::printf("collect_smems: all %d SMEMs well-formed — OK\n", n);
+    }
+    // --- end prmi_collect_smems usage ----------------------------------------
 
     // --- prmi_close ----------------------------------------------------------
     prmi_close(idx);
