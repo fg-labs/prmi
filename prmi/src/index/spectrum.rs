@@ -2087,18 +2087,22 @@ impl LearnedIndex {
             ip
         };
         // Outward expansion of `[lo, hi)` at depth `l`, capped at `min_intv`.
+        // Reuse the full-32 `q_key` (computed above) at every depth: the keyed
+        // comparator masks it to `p.len() == l`, so it is byte-identical to
+        // re-tokenizing `q[..l]` (bases beyond `l` are masked off; for `l > 32` the
+        // >32 tail reads the `p` slice). Hoisting it out of the per-depth scan drops
+        // a `tokenize_32mer` per length step — the dominant instruction cost here.
         let expand = |l: u64, lo: &mut u64, hi: &mut u64| {
             let p = &q[..l as usize];
-            let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
             while *lo > 0
                 && *hi - *lo < min_intv
-                && self.shares_prefix(p, p_key, *lo - 1, pac, enc, l_pac)
+                && self.shares_prefix(p, q_key, *lo - 1, pac, enc, l_pac)
             {
                 *lo -= 1;
             }
             while *hi < sa_num
                 && *hi - *lo < min_intv
-                && self.shares_prefix(p, p_key, *hi, pac, enc, l_pac)
+                && self.shares_prefix(p, q_key, *hi, pac, enc, l_pac)
             {
                 *hi += 1;
             }
@@ -2430,20 +2434,24 @@ impl LearnedIndex {
         let mut hi = hi0;
         let mut best_len = 0usize;
         let mut l = lmax;
+        // Hoist the full-32 query key out of the per-length-step carry: the keyed
+        // comparator masks it to `p.len() == l`, so reusing it is byte-identical to
+        // re-tokenizing `query[..l]` (bases beyond `l` are masked off; for `l > 32`
+        // the >32 tail reads the `p` slice). Drops a `tokenize_32mer` per length step.
+        let q_key = tokenize_32mer(query, query.len().min(KMER_LEN));
         while l > 1 {
             l -= 1;
             let p = &query[..l];
-            let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
             // Expand outward to interval(l), capped at min_intv (mirrors the RC walk).
             while lo > 0
                 && hi - lo < min_intv
-                && self.shares_prefix(p, p_key, lo - 1, pac, enc, l_pac)
+                && self.shares_prefix(p, q_key, lo - 1, pac, enc, l_pac)
             {
                 lo -= 1;
             }
             while hi < sa_num
                 && hi - lo < min_intv
-                && self.shares_prefix(p, p_key, hi, pac, enc, l_pac)
+                && self.shares_prefix(p, q_key, hi, pac, enc, l_pac)
             {
                 hi += 1;
             }
