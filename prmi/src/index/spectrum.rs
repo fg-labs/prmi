@@ -73,6 +73,81 @@ pub(crate) fn compare_query_vs_suffix_2x_scalar(
 /// loop consumes whole `u64` lanes with at most one short tail per chunk.
 const CHUNK_BASES: usize = 32;
 
+/// Byte → four unpacked bases, for word-level decode of a `Packed` (`bntpac`)
+/// reference. Entry `b` holds the byte's four 2-bit fields (MSB-first: base 0 in
+/// bits 6-7 … base 3 in bits 0-1) expanded one-per-byte, in position order, as a
+/// little-endian `u32` — so `UNPACK_LUT[b].to_le_bytes()` is `[base0, base1,
+/// base2, base3]` (each `0..=3`). A fixed 1 KiB constant, independent of the
+/// reference size: it replaces the per-base shift/mask/bounds-check of
+/// [`pac_base_at`] with one table load + one 4-byte store, without adding any
+/// resident per-reference memory.
+static UNPACK_LUT: [u32; 256] = build_unpack_lut();
+
+/// Build [`UNPACK_LUT`] at compile time (see its docs for the layout).
+const fn build_unpack_lut() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let byte = b as u32;
+        let base0 = (byte >> 6) & 0x3;
+        let base1 = (byte >> 4) & 0x3;
+        let base2 = (byte >> 2) & 0x3;
+        let base3 = byte & 0x3;
+        table[b] = base0 | (base1 << 8) | (base2 << 16) | (base3 << 24);
+        b += 1;
+    }
+    table
+}
+
+/// Unpack `out.len()` FORWARD reference bases (each `0..=3`) of a `Packed`
+/// (`bntpac`) `pac`, starting at base position `start`, writing into `out`. The
+/// caller guarantees `[start, start + out.len())` lies within the packed bases,
+/// so every byte read is in range (Rust still bounds-checks, but never panics).
+///
+/// Decodes a `u64` worth (8 bytes = 32 bases) per step through [`UNPACK_LUT`]
+/// once the cursor is byte-aligned, with at most a ≤3-base scalar lead-in (to
+/// reach a byte boundary) and a ≤3-base scalar tail — instead of one
+/// shift/mask/bounds-check per base via [`pac_base_at`]. Pure decode: it produces
+/// exactly the bytes the per-base path produced.
+#[inline]
+fn unpack_packed_forward(pac: &[u8], start: u64, out: &mut [u8]) {
+    let n = out.len();
+    let mut i = 0usize;
+    // Checked once per call (not per base): the caller's base position must fit
+    // `usize`. Holds trivially on 64-bit; fails closed on a 32-bit target rather
+    // than silently truncating into an out-of-range packed-byte index.
+    let mut pos = usize::try_from(start).expect("base position exceeds usize::MAX");
+    // Lead-in: scalar bases until `pos` reaches a 4-base (1-byte) boundary.
+    while i < n && pos % 4 != 0 {
+        out[i] = (pac[pos >> 2] >> (6 - 2 * (pos as u32 & 3))) & 0x3;
+        i += 1;
+        pos += 1;
+    }
+    // Word-at-a-time middle: 8 packed bytes = 32 bases per step (`pos` is aligned).
+    while i + 32 <= n {
+        let base = pos >> 2;
+        let word = u64::from_le_bytes(pac[base..base + 8].try_into().unwrap());
+        for j in 0..8 {
+            let byte = (word >> (8 * j)) as u8;
+            out[i + 4 * j..i + 4 * j + 4].copy_from_slice(&UNPACK_LUT[byte as usize].to_le_bytes());
+        }
+        i += 32;
+        pos += 32;
+    }
+    // 4-base (1-byte) steps for the remaining whole bytes.
+    while i + 4 <= n {
+        out[i..i + 4].copy_from_slice(&UNPACK_LUT[pac[pos >> 2] as usize].to_le_bytes());
+        i += 4;
+        pos += 4;
+    }
+    // Tail: scalar bases of a final partial byte.
+    while i < n {
+        out[i] = (pac[pos >> 2] >> (6 - 2 * (pos as u32 & 3))) & 0x3;
+        i += 1;
+        pos += 1;
+    }
+}
+
 /// Fill up to `out.len()` unpacked reference bases (each `0..=3`) of the doubled
 /// `[Fwd || RC]` text starting at doubled position `q`, writing into `out[..n]`.
 /// Returns the count `n` actually filled. `n < out.len()` iff the fill stopped
@@ -81,8 +156,11 @@ const CHUNK_BASES: usize = 32;
 /// or treats a short fill at the sentinel as the reference being exhausted.
 ///
 /// Vectorized common cases (`Unpacked` forward / RC) copy or mirror contiguous
-/// byte runs; `Packed` decodes per base. A single call never crosses the
-/// `l_pac` boundary — it fills only within the region containing `q`.
+/// byte runs; `Packed` forward/RC bulk-decode via [`unpack_packed_forward`] (a
+/// `u64`/32-base word step), the RC run unpacked ascending then reversed and
+/// XORed by 3. A single call never crosses the `l_pac` boundary — it fills only
+/// within the region containing `q`.
+#[inline]
 fn fill_doubled_chunk(pac: &[u8], enc: PacEncoding, l_pac: u64, q: u64, out: &mut [u8]) -> usize {
     if out.is_empty() || q >= 2 * l_pac {
         return 0;
@@ -97,10 +175,8 @@ fn fill_doubled_chunk(pac: &[u8], enc: PacEncoding, l_pac: u64, q: u64, out: &mu
                 out[..n].copy_from_slice(&pac[start..start + n]);
             }
             PacEncoding::Packed { .. } => {
-                for (i, slot) in out[..n].iter_mut().enumerate() {
-                    // In-bounds by construction: q + i < l_pac <= num_bases.
-                    *slot = pac_base_at(pac, q + i as u64, enc).unwrap();
-                }
+                // In-bounds by construction: [q, q+n) ⊂ [0, l_pac) ⊂ packed bases.
+                unpack_packed_forward(pac, q, &mut out[..n]);
             }
         }
         n
@@ -122,9 +198,21 @@ fn fill_doubled_chunk(pac: &[u8], enc: PacEncoding, l_pac: u64, q: u64, out: &mu
                 }
             }
             PacEncoding::Packed { .. } => {
+                // RC base at doubled pos p is `fwd(2*l_pac-1-p) ^ 3`. As p ascends
+                // over [q, q+n) the forward source positions DESCEND over the
+                // contiguous run [lo, hi] = [2*l_pac-n-q, 2*l_pac-1-q]. Word-unpack
+                // that forward run ascending, then emit it reversed and XORed by 3 —
+                // the bulk decode replaces the per-base shift/mask, and the reverse +
+                // `^3` are cheap byte ops. The forward run is staged in a fixed
+                // `CHUNK_BASES` buffer; the sole caller caps `out.len()` (hence `n`)
+                // at `CHUNK_BASES`, asserted below.
+                let hi = 2 * l_pac - 1 - q; // forward source of out[0]
+                let lo = hi + 1 - n as u64; // forward source of out[n-1]
+                debug_assert!(n <= CHUNK_BASES, "RC fill n={n} exceeds CHUNK_BASES");
+                let mut fwd = [0u8; CHUNK_BASES];
+                unpack_packed_forward(pac, lo, &mut fwd[..n]);
                 for (i, slot) in out[..n].iter_mut().enumerate() {
-                    let fwd_pos = 2 * l_pac - 1 - (q + i as u64);
-                    *slot = pac_base_at(pac, fwd_pos, enc).unwrap() ^ 3;
+                    *slot = fwd[n - 1 - i] ^ 3;
                 }
             }
         }
@@ -944,7 +1032,7 @@ impl LearnedIndex {
         // sentinel and yield a wrong interval. (`pac_base_at` is hardened to
         // return `None`, but truncation must not silently extend.)
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "forward_spectrum").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "forward_spectrum").is_err() {
                 return;
             }
         }
@@ -1110,6 +1198,17 @@ impl LearnedIndex {
         assert!((1..=16).contains(&k), "k-mer table k must be in 1..=16");
         let sa_num = self.sa_num();
         let l_pac = self.l_pac();
+        // Fail closed on a packed pac whose declared base count disagrees with the
+        // index (or is too short to hold it): the bulk decoder would otherwise read
+        // out of range — or silently decode garbage past the true reference — while
+        // bounding the prefix intervals. Emit a same-shape table of empty intervals
+        // (every `lo == hi`) so no caller can derive a seed from a malformed
+        // reference. Computed once; the per-mer closure short-circuits below.
+        let packed_invalid = matches!(
+            enc,
+            PacEncoding::Packed { num_bases }
+                if validate_packed_pac(pac, num_bases, l_pac, "build_kmer_table").is_err()
+        );
         let mut lo: Vec<Vec<u64>> = Vec::with_capacity(k as usize);
         let mut hi: Vec<Vec<u64>> = Vec::with_capacity(k as usize);
         for m in 1..=k {
@@ -1117,6 +1216,9 @@ impl LearnedIndex {
             let pairs: Vec<(u64, u64)> = (0..nm)
                 .into_par_iter()
                 .map(|w| {
+                    if packed_invalid {
+                        return (0u64, 0u64); // empty interval: fail closed
+                    }
                     let mut bases = [0u8; 16];
                     for (j, slot) in bases.iter_mut().enumerate().take(m as usize) {
                         *slot = ((w >> (2 * (m as usize - 1 - j))) & 0b11) as u8;
@@ -1169,7 +1271,8 @@ impl LearnedIndex {
         // any walk (the `_tabled` entry point is reachable directly, not only via
         // `_auto`).
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "forward_spectrum_tabled").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "forward_spectrum_tabled").is_err()
+            {
                 return;
             }
         }
@@ -1378,6 +1481,16 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
     ) -> Vec<SmemStep> {
+        // Fail closed before any SA probe / decode: a packed pac whose declared
+        // base count disagrees with the index would be misread by the bulk
+        // decoder (mirrors `forward_spectrum_into`).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "forward_spectrum_from_hint")
+                .is_err()
+            {
+                return Vec::new();
+            }
+        }
         let sa_num = self.sa_num();
         if query.is_empty() || hint == 0 || hint >= sa_num {
             return self.forward_spectrum(query, pac, enc);
@@ -1470,7 +1583,7 @@ impl LearnedIndex {
         // returns `None` on an out-of-range byte and is `.unwrap()`ed — a panic.
         // The `forward_spectrum_*` paths guard this; the one-shot must too.
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "mem_search").is_err() {
                 return zero;
             }
         }
@@ -1565,7 +1678,7 @@ impl LearnedIndex {
         // O(log) path reaches `forward_maximal_len_seeded`'s `fill_doubled_chunk`,
         // which `.unwrap()`s `pac_base_at` — a panic on an out-of-range byte.
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_warmstart").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "mem_search_warmstart").is_err() {
                 return zero;
             }
         }
@@ -1641,7 +1754,7 @@ impl LearnedIndex {
         // O(log) path reaches `forward_maximal_len`'s `fill_doubled_chunk`, which
         // `.unwrap()`s `pac_base_at` — a panic on an out-of-range byte.
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_capped").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "mem_search_capped").is_err() {
                 return zero;
             }
         }
@@ -1723,7 +1836,7 @@ impl LearnedIndex {
         // truncated buffer would otherwise be misread inside the compare helpers
         // (a missing sentinel byte → wrong LCP, or an out-of-bounds unwrap).
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_from_hint").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "mem_search_from_hint").is_err() {
                 return zero;
             }
         }
@@ -1803,7 +1916,7 @@ impl LearnedIndex {
         // `pac_base_at(..)` is `.unwrap()`ed — a panic. Guard once up front so
         // both the occ==1 hint delegate and the occ>1 search fail closed.
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_backward").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "mem_search_backward").is_err() {
                 return MemMatch {
                     match_len: 0,
                     sa_start: 0,
@@ -2024,7 +2137,7 @@ impl LearnedIndex {
         // floor BEFORE any `forward_maximal_len_seeded` probe reaches a packed-decode
         // `.unwrap()` (mirrors the guarded one-shot entrypoints).
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "span_rc_walk").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "span_rc_walk").is_err() {
                 return anchor_len;
             }
         }
@@ -2205,8 +2318,13 @@ impl LearnedIndex {
         // Fail closed on an undersized packed pac (the inner one-shots would each
         // do so anyway, but guard once up front for a clean result).
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_backward_truncated_interval")
-                .is_err()
+            if validate_packed_pac(
+                pac,
+                num_bases,
+                self.l_pac(),
+                "mem_search_backward_truncated_interval",
+            )
+            .is_err()
             {
                 return zero;
             }
@@ -2336,8 +2454,13 @@ impl LearnedIndex {
         };
         // Fail closed on an undersized packed pac (mirrors the binary-search twin).
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_backward_truncated_interval_rc")
-                .is_err()
+            if validate_packed_pac(
+                pac,
+                num_bases,
+                self.l_pac(),
+                "mem_search_backward_truncated_interval_rc",
+            )
+            .is_err()
             {
                 return zero;
             }
@@ -2441,7 +2564,14 @@ impl LearnedIndex {
         // on this index that would already have validated the pac, so the guard is
         // load-bearing here.
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "forward_truncate_below_maximal").is_err() {
+            if validate_packed_pac(
+                pac,
+                num_bases,
+                self.l_pac(),
+                "forward_truncate_below_maximal",
+            )
+            .is_err()
+            {
                 return zero;
             }
         }
@@ -2630,7 +2760,14 @@ impl LearnedIndex {
         // Fail closed on an undersized packed pac (as the non-hint paths do): a
         // truncated buffer would otherwise be misread inside `doubled_base_at`.
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_backward_from_hint").is_err() {
+            if validate_packed_pac(
+                pac,
+                num_bases,
+                self.l_pac(),
+                "mem_search_backward_from_hint",
+            )
+            .is_err()
+            {
                 return zero;
             }
         }
@@ -2743,6 +2880,13 @@ impl LearnedIndex {
         }
         let sa_num = self.sa_num();
         let l_pac = self.l_pac();
+        // Fail closed on a packed pac whose declared base count disagrees with the
+        // index before any decode/probe (mirrors `backward_spectrum_inner_into`).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, l_pac, "backward_spectrum_tabled").is_err() {
+                return steps;
+            }
+        }
         // Checked: a large caller-provided `anchor_len` must not wrap when
         // narrowed to usize or added to `pivot` (the `read[p_start..anchor_end]`
         // slice below would otherwise panic on an out-of-range bound). Fail
@@ -2844,6 +2988,13 @@ impl LearnedIndex {
             return steps;
         }
         let l_pac = self.l_pac();
+        // Fail closed on a packed pac whose declared base count disagrees with the
+        // index before any decode/probe (mirrors `backward_spectrum_inner_into`).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, l_pac, "backward_spectrum_from_hint").is_err() {
+                return steps;
+            }
+        }
         let p_anchor = self.sa_position_for(hint);
 
         let mut left_ext: u64 = 0;
@@ -2966,6 +3117,14 @@ impl LearnedIndex {
         enc: PacEncoding,
     ) -> Vec<Vec<SmemStep>> {
         let l_pac = self.l_pac();
+        // Fail closed on a packed pac whose declared base count disagrees with the
+        // index before any decode/probe: one empty trace per task, matching the
+        // per-task `backward_spectrum` contract (mirrors `backward_spectrum_inner_into`).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, l_pac, "backward_spectrum_lockstep").is_err() {
+                return tasks.iter().map(|_| Vec::new()).collect();
+            }
+        }
         let mut steppers: Vec<BwdStepper> = tasks.iter().map(|t| self.bwd_stepper_new(t)).collect();
         let mut mids: Vec<Option<u64>> = steppers.iter_mut().map(|s| s.next_probe(self)).collect();
         // Per-round scratch buffers, allocated ONCE and reused (entries for
@@ -3192,7 +3351,7 @@ impl LearnedIndex {
             _ => return,
         }
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "backward_spectrum").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "backward_spectrum").is_err() {
                 return;
             }
         }
@@ -3529,7 +3688,7 @@ impl LearnedIndex {
             _ => return steps,
         }
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "backward_spectrum").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "backward_spectrum").is_err() {
                 return steps;
             }
         }
@@ -3774,6 +3933,93 @@ mod compare_tests {
         q.push(0);
         let (ref_less, lcp) = check_both_encodings(&fwd, &q, 0);
         assert_eq!((ref_less, lcp), (true, text.len() as u32));
+    }
+
+    /// Targets the word-level `Packed` decode (`unpack_packed_forward`): for a
+    /// reference long enough to drive the 32-base `u64` middle step, walk EVERY
+    /// sub-byte start offset (`sa_pos % 4 ∈ {0,1,2,3}`) across the forward region,
+    /// the forward→RC crossing, the RC region, and the near-sentinel tail, at
+    /// query lengths straddling the 32-base chunk boundary (31..=35). Through
+    /// [`fill_doubled_chunk`] the fill buffer caps `n` at [`CHUNK_BASES`] (32), so
+    /// an aligned start (offset 0, `qlen >= 32`) drives one full `u64` word step
+    /// while unaligned starts exercise the scalar lead-in, the 4-base step, the
+    /// scalar tail, and the RC reverse/`^3` path; the unaligned lead-in → `u64`
+    /// word-step combination is out of reach here and is covered directly by
+    /// [`unpack_packed_forward_unaligned_word_step_equals_scalar`] below. The
+    /// vectorized compare must equal the scalar oracle for every combination,
+    /// independent of the random proptest's luck.
+    #[test]
+    fn packed_word_decode_all_offsets_equals_scalar() {
+        // 50 forward bases → doubled text of 100 bases; long enough that a 32-base
+        // query starting in the first ~18 forward positions exercises the full
+        // 8-byte word step plus a sub-byte lead-in.
+        let fwd: Vec<u8> = (0..50u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let l_pac = fwd.len() as u64;
+        let (packed, num_bases) = pack_bntpac(&fwd);
+        let enc = PacEncoding::Packed { num_bases };
+        let text = doubled_text(&fwd);
+
+        for sa_pos in 0..=2 * l_pac {
+            for &qlen in &[31usize, 32, 33, 34, 35] {
+                // Exact-match query (drives the longest decode), plus one mutated
+                // a few bases in (forces an early-mismatch return mid-decode).
+                // Mutate FROM the generated base so the twist is guaranteed to
+                // differ — a fixed value could equal the original and be a no-op.
+                for force_mismatch in [false, true] {
+                    let mut q = query_from(&text, sa_pos as usize, qlen, None);
+                    if force_mismatch {
+                        q[5] = (q[5] + 1) & 0x3;
+                    }
+                    let got = compare_query_vs_suffix_2x(&q, sa_pos, &packed, enc, l_pac);
+                    let want = compare_query_vs_suffix_2x_scalar(&q, sa_pos, &packed, enc, l_pac);
+                    assert_eq!(
+                        got, want,
+                        "packed word-decode != scalar (sa_pos={sa_pos}, qlen={qlen}, force_mismatch={force_mismatch})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Directly exercise [`unpack_packed_forward`]'s unaligned-lead-in →
+    /// `u64` word-step path, which the public
+    /// [`packed_word_decode_all_offsets_equals_scalar`] gate cannot reach:
+    /// [`fill_doubled_chunk`] caps `out.len()` (hence `n`) at
+    /// [`CHUNK_BASES`] (32), so after any sub-byte lead-in (`i >= 1`) the
+    /// `i + 32 <= n` word loop never runs. Call the unpacker directly with
+    /// `out.len() >= 35` at sub-byte start offsets so the lead-in is followed
+    /// by a full 32-base `u64` step plus a 4-base step and a scalar tail, and
+    /// compare every base against the per-base shift/mask oracle.
+    #[test]
+    fn unpack_packed_forward_unaligned_word_step_equals_scalar() {
+        // Decode a single forward base the per-base way (the path
+        // `unpack_packed_forward` replaces), serving as the oracle.
+        fn scalar_base_at(packed: &[u8], pos: usize) -> u8 {
+            (packed[pos >> 2] >> (6 - 2 * (pos as u32 & 3))) & 0x3
+        }
+
+        // 96 forward bases → 24 packed bytes; long enough that start offsets up
+        // to 3 plus out lengths up to 45 stay in range.
+        let fwd: Vec<u8> = (0..96u32).map(|i| ((i * 5 + 2) % 4) as u8).collect();
+        let (packed, _num_bases) = pack_bntpac(&fwd);
+
+        // Lengths that span the lead-in, the 32-base word step, the 4-base step,
+        // and the scalar tail. 35..=45 guarantees the word loop runs even after
+        // a 1- to 3-base lead-in (and >= 39 leaves room for a trailing 4-base
+        // step plus a partial-byte tail).
+        for start in 0u64..4 {
+            for out_len in [35usize, 36, 38, 39, 40, 43, 45] {
+                let mut got = vec![0u8; out_len];
+                unpack_packed_forward(&packed, start, &mut got);
+                let want: Vec<u8> = (0..out_len)
+                    .map(|i| scalar_base_at(&packed, start as usize + i))
+                    .collect();
+                assert_eq!(
+                    got, want,
+                    "unpack_packed_forward != scalar (start={start}, out_len={out_len})"
+                );
+            }
+        }
     }
 
     proptest! {
@@ -5458,6 +5704,159 @@ mod keyed_tests {
         assert!(idx
             .backward_spectrum_tabled(1, 1, u64::MAX, read, 24, &fwd, e, &table)
             .is_empty());
+    }
+
+    /// Every public method that accepts a `PacEncoding::Packed` and reaches the
+    /// bulk compare/decode helpers must fail closed on a packed pac whose declared
+    /// `num_bases` disagrees with the index's `l_pac` — not just the handful of
+    /// entry points hardened earlier. This pins the guard on the remaining paths
+    /// (`build_kmer_table`, `forward_spectrum_from_hint`, `backward_spectrum_tabled`,
+    /// `backward_spectrum_from_hint`, `backward_spectrum_lockstep`).
+    ///
+    /// The pac buffer is correctly sized for `l_pac`, so the length check passes
+    /// and the *count* check (`num_bases != l_pac`) is the gate under test: without
+    /// the guard each method decodes the real (in-range) reference and returns a
+    /// non-empty result; with it they fail closed to an empty trace/interval.
+    #[test]
+    fn packed_pac_guard_covers_all_public_pac_paths() {
+        let fwd: Vec<u8> = (0..200u32).map(|i| ((i * 7 + 3) % 4) as u8).collect();
+        let (_dir, idx) = build_mode2(&fwd);
+        let l_pac = idx.l_pac();
+        assert_eq!(l_pac, fwd.len() as u64);
+        // Pack `fwd` into the BWA bntpac MSB-first 2-bit form (4 bases/byte).
+        let mut packed = vec![0u8; fwd.len().div_ceil(4)];
+        for (i, &b) in fwd.iter().enumerate() {
+            packed[i / 4] |= (b & 0x3) << (6 - 2 * ((i % 4) as u32));
+        }
+        let good = PacEncoding::Packed { num_bases: l_pac };
+        // Correctly sized buffer, but the declared base count disagrees with the
+        // index: the length check passes, so only the `num_bases == l_pac` gate
+        // can reject it.
+        let bad = PacEncoding::Packed {
+            num_bases: l_pac - 1,
+        };
+
+        // (1) build_kmer_table — valid encoding yields at least one non-empty band;
+        // the count mismatch must yield only empty intervals.
+        let k = 4u32;
+        let good_tbl = idx.build_kmer_table(k, &packed, good);
+        let (_, glo, ghi) = good_tbl.parts();
+        let good_band_non_empty = glo
+            .iter()
+            .zip(ghi)
+            .any(|(lm, hm)| lm.iter().zip(hm).any(|(l, h)| h > l));
+        assert!(
+            good_band_non_empty,
+            "valid packed pac must yield a non-empty band"
+        );
+        let bad_tbl = idx.build_kmer_table(k, &packed, bad);
+        let (_, blo, bhi) = bad_tbl.parts();
+        let bad_band_non_empty = blo
+            .iter()
+            .zip(bhi)
+            .any(|(lm, hm)| lm.iter().zip(hm).any(|(l, h)| h > l));
+        assert!(
+            !bad_band_non_empty,
+            "count-mismatch packed pac must yield only empty k-mer bands (fail closed)"
+        );
+
+        // (2) forward_spectrum_from_hint — launch from a real interior hint.
+        let q = &fwd[20..40];
+        let maximal = idx.mem_search(q, &packed, good);
+        assert!(
+            maximal.match_len > 0 && maximal.occ > 0,
+            "lifted query must match"
+        );
+        let hint = maximal.sa_start.max(1); // interior (non-zero) launch hint
+        assert!(
+            !idx.forward_spectrum_from_hint(q, hint, &packed, good)
+                .is_empty(),
+            "valid hinted forward spectrum must be non-empty"
+        );
+        assert!(
+            idx.forward_spectrum_from_hint(q, hint, &packed, bad)
+                .is_empty(),
+            "count-mismatch packed pac must fail closed in forward_spectrum_from_hint"
+        );
+
+        // Shared backward setup: a reference-lifted read whose right-anchored
+        // match extends leftward.
+        let w = 50usize;
+        let s = 30usize;
+        let read = &fwd[s..s + w];
+        let pivot = 24usize;
+        let anchor = idx.mem_search(&read[pivot..], &packed, good);
+        assert!(anchor.match_len > 0 && anchor.occ > 0, "anchor must match");
+
+        // (3) backward_spectrum_tabled — table built from the valid encoding; the
+        // bad encoding must fail closed before consulting it.
+        let table = idx.build_kmer_table(5, &packed, good);
+        assert!(
+            !idx.backward_spectrum_tabled(
+                anchor.sa_start,
+                anchor.occ,
+                anchor.match_len,
+                read,
+                pivot,
+                &packed,
+                good,
+                &table,
+            )
+            .is_empty(),
+            "valid tabled backward spectrum must be non-empty"
+        );
+        assert!(
+            idx.backward_spectrum_tabled(
+                anchor.sa_start,
+                anchor.occ,
+                anchor.match_len,
+                read,
+                pivot,
+                &packed,
+                bad,
+                &table,
+            )
+            .is_empty(),
+            "count-mismatch packed pac must fail closed in backward_spectrum_tabled"
+        );
+
+        // (4) backward_spectrum_from_hint — hint at the maximal-extension locus.
+        let sa_num = idx.sa_num();
+        let refpos = (s + pivot) as u64;
+        let hint = (0..sa_num)
+            .find(|&i| idx.sa_position_for(i) == refpos)
+            .unwrap();
+        assert!(
+            !idx.backward_spectrum_from_hint(read, pivot, anchor.match_len, hint, &packed, good)
+                .is_empty(),
+            "valid hinted backward spectrum must be non-empty"
+        );
+        assert!(
+            idx.backward_spectrum_from_hint(read, pivot, anchor.match_len, hint, &packed, bad)
+                .is_empty(),
+            "count-mismatch packed pac must fail closed in backward_spectrum_from_hint"
+        );
+
+        // (5) backward_spectrum_lockstep — one task; bad encoding fails closed to
+        // one empty trace per task.
+        let task = BwdTask {
+            sa_start: anchor.sa_start,
+            occ_count: anchor.occ,
+            anchor_len: anchor.match_len,
+            read,
+            pivot,
+        };
+        let good_lock = idx.backward_spectrum_lockstep(std::slice::from_ref(&task), &packed, good);
+        assert_eq!(good_lock.len(), 1);
+        assert!(
+            !good_lock[0].is_empty(),
+            "valid lockstep backward spectrum must be non-empty"
+        );
+        assert_eq!(
+            idx.backward_spectrum_lockstep(std::slice::from_ref(&task), &packed, bad),
+            vec![Vec::<SmemStep>::new()],
+            "count-mismatch packed pac must fail closed in backward_spectrum_lockstep"
+        );
     }
 
     #[test]

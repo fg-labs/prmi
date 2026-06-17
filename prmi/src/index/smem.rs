@@ -61,17 +61,30 @@ pub fn pac_base_at(pac: &[u8], pos: u64, enc: PacEncoding) -> Option<u8> {
     }
 }
 
-/// Validate that a 2-bit packed `pac` slice is long enough to hold `num_bases`
-/// bases (4 per byte). Returns `Err(Error::Internal)` rather than letting a
-/// short slice panic on an out-of-bounds byte access inside the spectrum walk.
-/// `ctx` names the calling entry point for the error.
-pub(crate) fn validate_packed_pac(pac: &[u8], num_bases: u64, ctx: &str) -> Result<()> {
+/// Validate that a 2-bit packed `pac` slice is a well-formed encoding of the
+/// `l_pac`-base reference it will be queried against: its declared base count
+/// must match the index (`num_bases == l_pac`) and the slice must be long enough
+/// to hold them (4 per byte). Returns `Err(Error::InvalidInput)` (the buffer is
+/// caller-supplied, so a mismatch is the caller's input to fix, not a prmi bug)
+/// rather than letting a mismatched count or a short slice surface later inside
+/// the spectrum walk,
+/// whose bulk decoder bounds its reads by `l_pac` (not `num_bases`) and would
+/// otherwise silently decode bytes past `num_bases` or panic on an
+/// out-of-bounds access. `ctx` names the calling entry point for the error.
+pub(crate) fn validate_packed_pac(pac: &[u8], num_bases: u64, l_pac: u64, ctx: &str) -> Result<()> {
+    if num_bases != l_pac {
+        return Err(crate::error::Error::InvalidInput {
+            detail: format!(
+                "{ctx}: packed num_bases={num_bases} does not match the index l_pac={l_pac}"
+            ),
+        });
+    }
     let required =
-        usize::try_from(num_bases.div_ceil(4)).map_err(|_| crate::error::Error::Internal {
+        usize::try_from(num_bases.div_ceil(4)).map_err(|_| crate::error::Error::InvalidInput {
             detail: format!("{ctx}: num_bases={num_bases} is too large for this platform"),
         })?;
     if pac.len() < required {
-        return Err(crate::error::Error::Internal {
+        return Err(crate::error::Error::InvalidInput {
             detail: format!(
                 "{ctx}: pac.len()={} is smaller than the required packed length {required} \
                  for num_bases={num_bases}",
@@ -212,9 +225,33 @@ mod tests {
 
     #[test]
     fn validate_packed_pac_rejects_short_slice() {
-        // num_bases=8 needs ceil(8/4)=2 bytes; a 1-byte slice is too short.
-        assert!(validate_packed_pac(&[0u8], 8, "test").is_err());
-        // Exactly enough bytes is accepted.
-        assert!(validate_packed_pac(&[0u8, 0u8], 8, "test").is_ok());
+        // num_bases=8 needs ceil(8/4)=2 bytes; a 1-byte slice is too short. The
+        // buffer is caller-supplied, so the rejection is `InvalidInput`, not the
+        // bug-signalling `Internal`.
+        assert!(matches!(
+            validate_packed_pac(&[0u8], 8, 8, "test"),
+            Err(crate::error::Error::InvalidInput { .. })
+        ));
+        // Exactly enough bytes (and a matching l_pac) is accepted.
+        assert!(validate_packed_pac(&[0u8, 0u8], 8, 8, "test").is_ok());
+    }
+
+    #[test]
+    fn validate_packed_pac_rejects_count_mismatch() {
+        // The slice is large enough for num_bases, but num_bases disagrees with
+        // the index's l_pac: the walk bounds its reads by l_pac, so an oversized
+        // buffer with too few declared bases must fail closed rather than letting
+        // the bulk decoder read past num_bases. num_bases=8 needs 2 bytes; supply
+        // 4 bytes (room for l_pac=16) but declare only 8 bases. The mismatch is
+        // caller-supplied input, so it is reported as `InvalidInput`.
+        assert!(matches!(
+            validate_packed_pac(&[0u8; 4], 8, 16, "test"),
+            Err(crate::error::Error::InvalidInput { .. })
+        ));
+        // Symmetric mismatch (more declared than the index expects) also fails.
+        assert!(matches!(
+            validate_packed_pac(&[0u8; 4], 16, 8, "test"),
+            Err(crate::error::Error::InvalidInput { .. })
+        ));
     }
 }
