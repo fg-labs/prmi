@@ -162,6 +162,35 @@ pub struct CollectOpts {
     pub max_mem_intv: i64,
 }
 
+/// Reusable per-read scratch for [`LearnedIndex::collect_smems_into`], letting a
+/// caller amortize the two per-read heap allocations the walk needs — the emitted
+/// SMEM buffer and the reseed work-list — across many reads. bwa-mem3 invokes the
+/// collector once per read over millions of reads; constructing one `CollectScratch`
+/// per worker thread and passing it by `&mut` to every call replaces those two
+/// allocate/free pairs per read with a `clear()` (capacity is retained, not freed).
+///
+/// The buffers are an internal detail with no observable effect on output: each call
+/// clears them before use, so a fresh `CollectScratch` and a reused one produce
+/// byte-identical SMEMs. The plain [`LearnedIndex::collect_smems`] entry point keeps
+/// its old behavior by allocating a throwaway `CollectScratch` per call.
+#[derive(Debug, Default)]
+pub struct CollectScratch {
+    /// Emitted SMEMs in walk order, before the within-read sort (grows to the
+    /// per-read SMEM count, then is cleared for the next read).
+    smems: Vec<Smem>,
+    /// Reseed work-list (pivot, `min_intv`, optional ISA hint) selected from pass 1
+    /// and consumed by pass 2.
+    reseeds: Vec<(usize, i64, Option<ReseedHint>)>,
+}
+
+impl CollectScratch {
+    /// A scratch with no preallocated capacity. The first read grows the buffers;
+    /// subsequent reads reuse that capacity.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 impl LearnedIndex {
     /// Collect all SMEMs for ONE read (passes 1+2[+3], sorted within-read per the
     /// design §4.7), byte-identical to FMI seeding.
@@ -190,12 +219,43 @@ impl LearnedIndex {
         enc: PacEncoding,
         out: &mut [Smem],
     ) -> Result<usize, usize> {
-        let mut smems = self.collect_smems_unsorted(read, rid, opts, pac, enc);
-        Self::sort_within_read(&mut smems);
+        // Thin wrapper: allocate a throwaway scratch and delegate. Callers that run
+        // the collector per read over many reads should hold a `CollectScratch` and
+        // call `collect_smems_into` to amortize these allocations.
+        let mut scratch = CollectScratch::new();
+        self.collect_smems_into(read, rid, opts, pac, enc, out, &mut scratch)
+    }
+
+    /// Like [`collect_smems`](Self::collect_smems), but reuses the caller-held
+    /// `scratch` for the two per-read buffers (emitted SMEMs and reseed work-list)
+    /// instead of allocating fresh ones. Byte-identical to `collect_smems` for any
+    /// `scratch` state — the buffers are cleared on entry, so prior contents do not
+    /// leak into the result; the only effect is amortizing the allocations across
+    /// reads. Intended for the hot per-read loop (e.g. bwa-mem3 over millions of
+    /// reads): construct one `CollectScratch` per worker thread and pass it to every
+    /// call.
+    ///
+    /// `out` and the return value behave exactly as in `collect_smems`: `Ok(count)`
+    /// with the sorted SMEMs in `out[..count]`, or `Err(needed)` if `out` is too
+    /// small.
+    #[allow(clippy::too_many_arguments)]
+    pub fn collect_smems_into(
+        &self,
+        read: &[u8],
+        rid: u32,
+        opts: &CollectOpts,
+        pac: &[u8],
+        enc: PacEncoding,
+        out: &mut [Smem],
+        scratch: &mut CollectScratch,
+    ) -> Result<usize, usize> {
+        self.collect_smems_unsorted_into(read, rid, opts, pac, enc, scratch);
+        let smems = &mut scratch.smems;
+        Self::sort_within_read(smems);
         if smems.len() > out.len() {
             return Err(smems.len());
         }
-        out[..smems.len()].copy_from_slice(&smems);
+        out[..smems.len()].copy_from_slice(smems);
         Ok(smems.len())
     }
 
@@ -214,9 +274,10 @@ impl LearnedIndex {
         smems.sort_unstable_by(|a, b| a.m.cmp(&b.m).then(a.n.cmp(&b.n)));
     }
 
-    /// The per-read walk (passes 1+2[+3]) in EMISSION order, before the within-read
-    /// sort (Task 7). Returned as a `Vec` so the whole set is available to sort.
-    /// Port of the `mem_collect_smem_zigzag` driver (cpp:1644-1834), no-ISA.
+    /// Allocating convenience used by the byte-identity oracles/proptests: runs the
+    /// walk into a fresh scratch and returns the emitted SMEMs. Production code goes
+    /// through [`collect_smems_into`](Self::collect_smems_into) with a reused scratch.
+    #[cfg(test)]
     fn collect_smems_unsorted(
         &self,
         read: &[u8],
@@ -225,22 +286,36 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
     ) -> Vec<Smem> {
+        let mut scratch = CollectScratch::new();
+        self.collect_smems_unsorted_into(read, rid, opts, pac, enc, &mut scratch);
+        scratch.smems
+    }
+
+    /// The per-read walk (passes 1+2[+3]) in EMISSION order, before the within-read
+    /// sort (Task 7). Port of the `mem_collect_smem_zigzag` driver (cpp:1644-1834),
+    /// no-ISA. Fills the caller-held `scratch.smems` (cleared on entry) and reuses
+    /// `scratch.reseeds` as the pass-2 work-list, allocating nothing per read once
+    /// the buffers have grown; the emitted SMEMs are left in `scratch.smems`.
+    fn collect_smems_unsorted_into(
+        &self,
+        read: &[u8],
+        rid: u32,
+        opts: &CollectOpts,
+        pac: &[u8],
+        enc: PacEncoding,
+        scratch: &mut CollectScratch,
+    ) {
         let rlen = read.len();
-        let mut smems: Vec<Smem> = Vec::new();
+        // Split the borrow so the emit buffer and the reseed work-list can be held as
+        // disjoint `&mut Vec` (pass 2 drains `reseeds` while pushing into `smems`).
+        let CollectScratch { smems, reseeds } = scratch;
+        smems.clear();
+        reseeds.clear();
 
         // ---- Pass 1: zigzag walk over all positions (min_intv = 1) ----
         let mut x = 0;
         while x < rlen {
-            self.zz_step1(
-                read,
-                rid,
-                &mut x,
-                1,
-                opts.min_seed_len,
-                &mut smems,
-                pac,
-                enc,
-            );
+            self.zz_step1(read, rid, &mut x, 1, opts.min_seed_len, smems, pac, enc);
         }
         let num1 = smems.len();
 
@@ -255,7 +330,6 @@ impl LearnedIndex {
         // ignores the hint (the tabled trace is the launch), so building the hint
         // (`sa_position_for` + `isa_at`) would be dead per-reseed work.
         let use_isa = isa_reseed_enabled() && self.has_isa() && self.kmt.is_none();
-        let mut reseeds: Vec<(usize, i64, Option<ReseedHint>)> = Vec::new();
         for p in &smems[..num1] {
             let span = p.n + 1 - p.m;
             if span < split_len || p.s > opts.split_width {
@@ -280,14 +354,15 @@ impl LearnedIndex {
         }
 
         // ---- Pass 2: one reseed walk per selected pivot ----
-        for (pivot, min_intv, hint) in reseeds {
+        // Drain (not consume-by-value) so `reseeds` keeps its capacity for the next read.
+        for (pivot, min_intv, hint) in reseeds.drain(..) {
             self.zz_step1_reseed(
                 read,
                 rid,
                 pivot,
                 min_intv,
                 opts.min_seed_len,
-                &mut smems,
+                smems,
                 hint,
                 pac,
                 enc,
@@ -305,14 +380,12 @@ impl LearnedIndex {
                     x,
                     opts.max_mem_intv,
                     msl1,
-                    &mut smems,
+                    smems,
                     pac,
                     enc,
                 );
             }
         }
-
-        smems
     }
 
     /// Maximal LEFT exact-match span INCLUDING the pivot base — the analogue of
@@ -1596,6 +1669,51 @@ mod tests {
             let mut buf = vec![Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 }; expected.len() + 8];
             let n = idx.collect_smems(&read, 0, &opts, &fwd, enc, &mut buf).unwrap();
             prop_assert_eq!(&buf[..n], expected.as_slice(), "collect_smems != composed reference");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Scratch-reuse byte-identity: `collect_smems_into` with a REUSED scratch
+        /// (already dirtied by a longer prior read) produces output identical to the
+        /// fresh-allocating `collect_smems`, for every read in a batch and across the
+        /// full opts sweep. Running a long read first then shorter ones is what would
+        /// expose a stale-tail bug if the `_into` path forgot to clear the buffers.
+        #[test]
+        fn collect_smems_into_equals_collect_smems(
+            fwd in prop::collection::vec(0u8..=3, 40..220),
+            reads in prop::collection::vec(prop::collection::vec(0u8..=4, 1..60), 1..6),
+            min_seed_len in 1u32..10,
+            split_len in 2u32..14,
+            split_width in 1i64..8,
+            max_mem_intv in 0i64..6,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv };
+
+            // One scratch reused across the whole batch (the production usage).
+            let mut scratch = CollectScratch::new();
+            for (rid, read) in reads.iter().enumerate() {
+                let cap = 2 * read.len() + 8;
+                let zero = Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 };
+                let mut buf_fresh = vec![zero; cap];
+                let mut buf_reuse = vec![zero; cap];
+                let n_fresh = idx
+                    .collect_smems(read, rid as u32, &opts, &fwd, enc, &mut buf_fresh)
+                    .unwrap();
+                let n_reuse = idx
+                    .collect_smems_into(read, rid as u32, &opts, &fwd, enc, &mut buf_reuse, &mut scratch)
+                    .unwrap();
+                prop_assert_eq!(n_fresh, n_reuse, "scratch reuse changed SMEM count (read {})", rid);
+                prop_assert_eq!(
+                    &buf_fresh[..n_fresh],
+                    &buf_reuse[..n_reuse],
+                    "scratch reuse != fresh alloc (read {})",
+                    rid
+                );
+            }
         }
     }
 
