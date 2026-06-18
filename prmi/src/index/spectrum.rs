@@ -4737,6 +4737,57 @@ mod keyed_tests {
         }
     }
 
+    /// Deterministic neighbor-scan boundary cases the random corpus does not reliably
+    /// hit (adversarial review of #48): (a) `lmax == 1` cannot truncate below itself
+    /// (`lcap = 0`) → zero; (b) SA-end exhaustion — `min_intv` exceeds any achievable
+    /// occ, so the scan walks both neighbors off the SA ends and breaks with
+    /// `occ < min_intv` → zero (the `llo == 0 && lhi == 0` path, not the `lmax` cap).
+    /// Both checked in `want_interval` true and false, and against the oracle.
+    #[test]
+    fn forward_truncate_boundary_cases() {
+        let e = PacEncoding::Unpacked;
+        let fwd: Vec<u8> = (0..120u32).map(|i| ((i * 7 + 3) % 4) as u8).collect();
+        let (_d, idx) = build_mode2(&fwd);
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+
+        // (a) lmax == 1: a length-1 maximal has nothing below it to truncate to.
+        let q1 = &fwd[..1];
+        let m1 = idx.mem_search(q1, &fwd, e);
+        assert_eq!(
+            m1.match_len, 1,
+            "expected a length-1 maximal for a single base"
+        );
+        for want_iv in [true, false] {
+            assert_eq!(
+                idx.forward_truncate_below_maximal(q1, m1, 2, want_iv, &fwd, e),
+                zero,
+                "lmax==1 must truncate to zero (want_interval={want_iv})"
+            );
+        }
+
+        // (b) SA-end exhaustion: min_intv beyond any achievable occ.
+        let q = &fwd[10..26];
+        let maximal = idx.mem_search(q, &fwd, e);
+        assert!(maximal.match_len >= 2, "need lmax>=2 to exercise the scan");
+        let impossible = idx.sa_num() + 1;
+        for want_iv in [true, false] {
+            assert_eq!(
+                idx.forward_truncate_below_maximal(q, maximal, impossible, want_iv, &fwd, e),
+                zero,
+                "min_intv beyond total occ must return zero (want_interval={want_iv})"
+            );
+        }
+        assert_eq!(
+            idx.forward_truncate_below_maximal(q, maximal, impossible, true, &fwd, e),
+            forward_truncate_oracle(&idx, q, maximal, impossible, &fwd, e),
+            "SA-end-exhaustion boundary case must match the oracle"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
         /// `forward_truncate_below_maximal` (capped outward FORWARD walk) ==
