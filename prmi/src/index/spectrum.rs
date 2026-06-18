@@ -469,6 +469,14 @@ pub struct BwdTask<'a> {
     pub pivot: usize,
 }
 
+/// One forward-spectrum batch task: the query whose full breakpoint trace is
+/// produced (the lockstep analogue of the serial `forward_spectrum` argument).
+/// `query` is borrowed for the driver's lifetime.
+pub struct FwdTask<'a> {
+    /// The query (2-bit bases 0..=3); its forward spectrum is computed.
+    pub query: &'a [u8],
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum FbSub {
     GallopLeft,
@@ -700,6 +708,368 @@ impl<'a> BwdStepper<'a> {
                     return false;
                 }
                 true
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FwdPhase {
+    /// `hi - lo == 1`: a single direct compare yields the unique suffix's tail
+    /// (`push_unique_suffix_tail`), then the task finishes.
+    UniqueTail,
+    /// Lower-bound bisection of `qm = query[..m]` within `[lo, hi)`.
+    Lower,
+    /// Upper-bound bisection (full-prefix share) within `[k, hi)`.
+    Upper,
+}
+
+/// [`LearnedIndex::forward_spectrum`] re-expressed as a probe-driven state
+/// machine, so N queries can be driven in lockstep for memory-level parallelism.
+/// Reproduces `forward_spectrum_into`'s control flow exactly — the nested
+/// `m`-loop, the `occ == 1` unique-tail fast path, the per-`m` keyed mask, and
+/// `push_step`'s occ-dedup coalescing — so `steps` is byte-identical to serial
+/// `forward_spectrum(query)`. The bisections are plain (no gallop): the full
+/// trace's model launch stays deferred, exactly as the serial path.
+struct FwdStepper<'a> {
+    query: &'a [u8],
+    query_key: u64,
+    /// Current interval `[lo, hi)` = the length-`(m-1)` prefix's SA interval.
+    lo: u64,
+    hi: u64,
+    /// Current prefix length being resolved (`1..=query.len()`).
+    m: usize,
+    /// Last emitted occurrence count, for `push_step`'s coalescing.
+    prev_occ: u64,
+    /// Active bisection bounds (Lower searches `[lo, hi)`, then Upper `[k, hi)`).
+    a: u64,
+    b: u64,
+    /// Lower-bound result: start of the current prefix's interval.
+    k: u64,
+    /// Loop-invariant keyed-compare mask for the current `m`.
+    qm_nbases: usize,
+    qm_mask: u64,
+    phase: FwdPhase,
+    steps: Vec<SmemStep>,
+    finished: bool,
+}
+
+impl<'a> FwdStepper<'a> {
+    /// Set up the bisection (or unique-tail / finish) for the current `m`. Mirrors
+    /// the top of `forward_spectrum_into`'s `for m in 1..=len` body: end when `m`
+    /// passes the query length, take the unique-tail fast path when the interval is
+    /// a single suffix, else prime the Lower bisection with this `m`'s mask.
+    #[inline]
+    fn begin_m(&mut self) {
+        if self.m > self.query.len() {
+            self.finished = true;
+            return;
+        }
+        if self.hi - self.lo == 1 {
+            self.phase = FwdPhase::UniqueTail;
+            return;
+        }
+        let (nbases, mask) = keyed_compare_mask(self.m);
+        self.qm_nbases = nbases;
+        self.qm_mask = mask;
+        self.a = self.lo;
+        self.b = self.hi;
+        self.phase = FwdPhase::Lower;
+    }
+
+    /// The SA index to probe next, or `None` if the whole task is finished. Drives
+    /// across the deterministic (no-probe) handoffs — Lower→Upper, Upper→next-`m`
+    /// (with `push_step` + narrowing) — exactly as `BwdStepper::next_probe` loops
+    /// through `advance_boundary`.
+    #[inline]
+    fn next_probe(&mut self) -> Option<u64> {
+        loop {
+            if self.finished {
+                return None;
+            }
+            match self.phase {
+                FwdPhase::UniqueTail => return Some(self.lo),
+                FwdPhase::Lower => {
+                    if self.a < self.b {
+                        return Some(self.a + (self.b - self.a) / 2);
+                    }
+                    // Lower resolved: `k = a` (the lower bound). `a` already holds
+                    // it, so the Upper search over `[k, hi)` only needs `b = hi`.
+                    self.k = self.a;
+                    self.b = self.hi;
+                    self.phase = FwdPhase::Upper;
+                }
+                FwdPhase::Upper => {
+                    if self.a < self.b {
+                        return Some(self.a + (self.b - self.a) / 2);
+                    }
+                    // Upper resolved: `c = a`, `occ = c - k`.
+                    let c = self.a;
+                    let occ = c - self.k;
+                    if occ == 0 {
+                        // No suffix matches this prefix; maximal match was `m-1`.
+                        self.finished = true;
+                    } else {
+                        push_step(
+                            &mut self.steps,
+                            &mut self.prev_occ,
+                            self.k,
+                            occ,
+                            self.m as u64,
+                        );
+                        self.lo = self.k;
+                        self.hi = c;
+                        self.m += 1;
+                        self.begin_m();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Feed back the keyed-compare result of probing SA entry `(pos, key)` (the
+    /// index `next_probe` last returned); calls `bump_probe()` once, matching the
+    /// serial path's one-probe-per-SA-read accounting.
+    #[inline]
+    fn advance(&mut self, pos: u64, key: Option<u64>, pac: &[u8], enc: PacEncoding, l_pac: u64) {
+        bump_probe();
+        match self.phase {
+            FwdPhase::UniqueTail => {
+                // `push_unique_suffix_tail`: full-query (unmasked) keyed compare;
+                // the step's `match_len` is the LCP, occ is 1.
+                let (_, lcp) = compare_query_vs_suffix_2x_keyed(
+                    self.query,
+                    self.query_key,
+                    key,
+                    pos,
+                    pac,
+                    enc,
+                    l_pac,
+                );
+                push_step(
+                    &mut self.steps,
+                    &mut self.prev_occ,
+                    self.lo,
+                    1,
+                    u64::from(lcp),
+                );
+                self.finished = true;
+            }
+            FwdPhase::Lower => {
+                let qm = &self.query[..self.m];
+                let (ref_less, _) = compare_query_vs_suffix_2x_keyed_with_mask(
+                    qm,
+                    self.query_key,
+                    key,
+                    pos,
+                    pac,
+                    enc,
+                    l_pac,
+                    self.qm_nbases,
+                    self.qm_mask,
+                );
+                let mid = self.a + (self.b - self.a) / 2;
+                if ref_less {
+                    self.a = mid + 1;
+                } else {
+                    self.b = mid;
+                }
+            }
+            FwdPhase::Upper => {
+                let qm = &self.query[..self.m];
+                let (_, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
+                    qm,
+                    self.query_key,
+                    key,
+                    pos,
+                    pac,
+                    enc,
+                    l_pac,
+                    self.qm_nbases,
+                    self.qm_mask,
+                );
+                let mid = self.a + (self.b - self.a) / 2;
+                if (lcp as usize) >= self.m {
+                    self.a = mid + 1;
+                } else {
+                    self.b = mid;
+                }
+            }
+        }
+    }
+}
+
+/// One maximal-match forward-locate task (the lockstep analogue of `mem_search`'s
+/// `query` argument). `seed_hint = Some(h)` warm-starts the insertion search at
+/// `h` (the reseed/`mem_search_warmstart` path); `None` uses the model launch.
+pub struct MsTask<'a> {
+    /// The query (2-bit bases 0..=3); direction/RC already applied by the caller.
+    pub query: &'a [u8],
+    /// Optional warm-start SA index for the insertion search (byte-identical for
+    /// any value — `find_boundary` expands on a miss to the true boundary).
+    pub seed_hint: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MsPhase {
+    /// Insertion-point `find_boundary` (model- or hint-seeded).
+    Insertion,
+    /// The two interstitial `lcp_at` probes at `ip-1` / `ip`.
+    Lcp,
+    /// Lower-bound `find_boundary` of the maximal-match slice `qm`.
+    Lower,
+    /// Upper-bound `find_boundary` of `qm`.
+    Upper,
+}
+
+/// What `advance` should do with the next probe result: feed the active `FbState`,
+/// or fold an interstitial `lcp_at` into `match_len`.
+#[derive(Clone, Copy, PartialEq)]
+enum MsPending {
+    Fb,
+    Lcp,
+}
+
+/// [`LearnedIndex::mem_search`]'s `kmt.is_none()` maximal-match locate
+/// (`forward_maximal_len_seeded` + interval recovery) re-expressed as a probe-driven
+/// state machine, so N queries can be driven in lockstep for memory-level
+/// parallelism. Sequences three `FbState` searches (insertion / lower / upper) plus
+/// two conditional interstitial `lcp_at` probes, byte-identical to serial
+/// `mem_search`. ALL phase transitions live in `next_probe`; `advance` only feeds the
+/// active `FbState` or folds an `lcp_at` into `match_len` (so the `ip==0` /
+/// `ip==sa_num` skip cases transition correctly instead of stalling).
+struct MemSearchStepper<'a> {
+    query: &'a [u8],
+    query_key: u64,
+    q_nbases: usize,
+    q_mask: u64,
+    sa_num: u64,
+    ip: u64,
+    match_len: u32,
+    lcp_left_done: bool,
+    lcp_right_done: bool,
+    qm_key: u64,
+    qm_nbases: usize,
+    qm_mask: u64,
+    lower: u64,
+    fb: FbState,
+    phase: MsPhase,
+    pending: MsPending,
+    result: MemMatch,
+    finished: bool,
+}
+
+impl<'a> MemSearchStepper<'a> {
+    /// The SA index to probe next, or `None` if finished. Drives through every
+    /// deterministic no-probe handoff (the `BwdStepper::next_probe` contract):
+    /// never returns `None` while unfinished.
+    #[inline]
+    fn next_probe(&mut self) -> Option<u64> {
+        loop {
+            if self.finished {
+                return None;
+            }
+            match self.phase {
+                MsPhase::Insertion => {
+                    if let Some(mid) = self.fb.next_probe() {
+                        self.pending = MsPending::Fb;
+                        return Some(mid);
+                    }
+                    self.ip = self.fb.result().expect("insertion FbState resolved");
+                    self.phase = MsPhase::Lcp;
+                }
+                MsPhase::Lcp => {
+                    // Interstitial `lcp_at(ip-1)` then `lcp_at(ip)`, each conditional
+                    // on the same guard the serial path uses.
+                    if !self.lcp_left_done {
+                        self.lcp_left_done = true;
+                        if self.ip > 0 {
+                            self.pending = MsPending::Lcp;
+                            return Some(self.ip - 1);
+                        }
+                        continue;
+                    }
+                    if !self.lcp_right_done {
+                        self.lcp_right_done = true;
+                        if self.ip < self.sa_num {
+                            self.pending = MsPending::Lcp;
+                            return Some(self.ip);
+                        }
+                        continue;
+                    }
+                    // Both LCP probes resolved: `match_len` is final.
+                    if self.match_len == 0 {
+                        self.result = MemMatch {
+                            match_len: 0,
+                            sa_start: 0,
+                            occ: 0,
+                        };
+                        self.finished = true;
+                        continue;
+                    }
+                    let qm = &self.query[..self.match_len as usize];
+                    self.qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+                    let (nb, mask) = keyed_compare_mask(qm.len());
+                    self.qm_nbases = nb;
+                    self.qm_mask = mask;
+                    self.fb = FbState::new(0, self.sa_num, self.ip, self.ip);
+                    self.phase = MsPhase::Lower;
+                }
+                MsPhase::Lower => {
+                    if let Some(mid) = self.fb.next_probe() {
+                        self.pending = MsPending::Fb;
+                        return Some(mid);
+                    }
+                    self.lower = self.fb.result().expect("lower FbState resolved");
+                    self.fb = FbState::new(self.lower, self.sa_num, self.lower, self.lower);
+                    self.phase = MsPhase::Upper;
+                }
+                MsPhase::Upper => {
+                    if let Some(mid) = self.fb.next_probe() {
+                        self.pending = MsPending::Fb;
+                        return Some(mid);
+                    }
+                    let upper = self.fb.result().expect("upper FbState resolved");
+                    self.result = MemMatch {
+                        match_len: u64::from(self.match_len),
+                        sa_start: self.lower,
+                        occ: upper - self.lower,
+                    };
+                    self.finished = true;
+                }
+            }
+        }
+    }
+
+    /// Feed the result of probing SA entry `(pos, key)` back. Only mutates data
+    /// (`FbState` bracket or `match_len`); all transitions are in `next_probe`.
+    #[inline]
+    fn advance(&mut self, pos: u64, key: Option<u64>, pac: &[u8], enc: PacEncoding, l_pac: u64) {
+        bump_probe();
+        // Insertion + the two LCP probes compare against the FULL query; lower/upper
+        // compare against the maximal-match slice `qm = query[..match_len]`.
+        let (slice, slice_key, nb, mask) = match self.phase {
+            MsPhase::Lower | MsPhase::Upper => (
+                &self.query[..self.match_len as usize],
+                self.qm_key,
+                self.qm_nbases,
+                self.qm_mask,
+            ),
+            _ => (self.query, self.query_key, self.q_nbases, self.q_mask),
+        };
+        let (ref_less, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
+            slice, slice_key, key, pos, pac, enc, l_pac, nb, mask,
+        );
+        match self.pending {
+            MsPending::Fb => {
+                let go_right = match self.phase {
+                    MsPhase::Upper => (lcp as usize) >= self.match_len as usize,
+                    _ => ref_less,
+                };
+                self.fb.feed(go_right);
+            }
+            MsPending::Lcp => {
+                self.match_len = self.match_len.max(lcp);
             }
         }
     }
@@ -2473,7 +2843,14 @@ impl LearnedIndex {
         // naive oracle on the repeats/ties corpus); O(min_intv) probes vs O(lmax-L*).
         // Neighbors outside the maximal interval share < lmax, so cap LCPs at lmax-1
         // (also makes lmax<2 fall through to the zero return, matching the old walk).
-        let lcap = (lmax as u32).saturating_sub(1);
+        // `lmax <= query.len()`, so this narrowing only fails for an absurd >4Gbase
+        // query; fail closed (return zero) rather than wrap silently. `saturating_sub`
+        // (not `checked_sub`) keeps the lmax==0 path byte-identical to the old walk:
+        // lcap stays 0, the scan does not early-return here.
+        let lcap = match u32::try_from(lmax.saturating_sub(1)) {
+            Ok(v) => v,
+            Err(_) => return zero,
+        };
         let mut lo = maximal.sa_start;
         let mut hi = hi0;
         let mut occ = hi - lo;
@@ -2996,6 +3373,282 @@ impl LearnedIndex {
             }
         }
         steppers.into_iter().map(|s| s.steps).collect()
+    }
+
+    /// Start a forward stepper. Tokenizes the query once; finishes immediately on
+    /// an empty query (serial `forward_spectrum` returns no steps), else primes the
+    /// first `m`.
+    fn fwd_stepper_new<'a>(&self, t: &FwdTask<'a>) -> FwdStepper<'a> {
+        let sa_num = self.sa_num();
+        let query_key = tokenize_32mer(t.query, t.query.len().min(KMER_LEN));
+        let mut s = FwdStepper {
+            query: t.query,
+            query_key,
+            lo: 0,
+            hi: sa_num,
+            m: 1,
+            prev_occ: u64::MAX,
+            a: 0,
+            b: 0,
+            k: 0,
+            qm_nbases: 0,
+            qm_mask: 0,
+            phase: FwdPhase::Lower,
+            steps: Vec::with_capacity(SPECTRUM_STEPS_HINT),
+            finished: false,
+        };
+        if t.query.is_empty() {
+            s.finished = true;
+        } else {
+            s.begin_m();
+        }
+        s
+    }
+
+    /// Drive ONE forward stepper to completion serially. Equivalent to
+    /// [`forward_spectrum`](Self::forward_spectrum); exists to prove the stepper is
+    /// byte-identical before lockstepping (the analogue of
+    /// [`backward_spectrum_via_stepper`](Self::backward_spectrum_via_stepper)).
+    #[allow(dead_code)]
+    fn forward_spectrum_via_stepper(
+        &self,
+        t: &FwdTask,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<SmemStep> {
+        // Fail closed on a bad packed pac, exactly as serial `forward_spectrum`.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "forward_spectrum_via_stepper").is_err() {
+                return Vec::new();
+            }
+        }
+        let l_pac = self.l_pac();
+        let mut s = self.fwd_stepper_new(t);
+        while let Some(mid) = s.next_probe() {
+            let (pos, key) = self.sa_entry(mid);
+            s.advance(pos, key, pac, enc, l_pac);
+        }
+        s.steps
+    }
+
+    /// Drive N forward steppers in lockstep. Each round batch-loads every active
+    /// task's current probe (`sa_position_for` + `key_at` — independent loads the
+    /// CPU keeps in flight = MLP), then advances every task. Output[i] is
+    /// byte-identical to `forward_spectrum(tasks[i].query)`.
+    pub fn forward_spectrum_lockstep(
+        &self,
+        tasks: &[FwdTask],
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<Vec<SmemStep>> {
+        // Fail closed on a bad packed pac, exactly as serial `forward_spectrum`:
+        // every task yields an empty trace (preserving per-task byte-identity).
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "forward_spectrum_lockstep").is_err() {
+                return tasks.iter().map(|_| Vec::new()).collect();
+            }
+        }
+        let l_pac = self.l_pac();
+        let mut steppers: Vec<FwdStepper> = tasks.iter().map(|t| self.fwd_stepper_new(t)).collect();
+        // Active set: (stepper index, current probe) for every task still issuing
+        // probes — iterated each round instead of all N, so per-round cost is
+        // O(active) not O(batch). Byte-identical (per-stepper sequences independent;
+        // compaction preserves relative order).
+        let mut active: Vec<(usize, u64)> = Vec::with_capacity(steppers.len());
+        for (i, st) in steppers.iter_mut().enumerate() {
+            if let Some(mid) = st.next_probe() {
+                active.push((i, mid));
+            }
+        }
+        let mut posv: Vec<u64> = vec![0; active.len()];
+        let mut keyv: Vec<Option<u64>> = vec![None; active.len()];
+        while !active.is_empty() {
+            // Phase 1: batch the cold loads (independent -> memory-level parallelism).
+            for (r, &(_, mid)) in active.iter().enumerate() {
+                let (p, k) = self.sa_entry(mid);
+                posv[r] = p;
+                keyv[r] = k;
+            }
+            // Phase 2: advance every active task, fetch its next probe, compact.
+            let mut w = 0;
+            for r in 0..active.len() {
+                let idx = active[r].0;
+                steppers[idx].advance(posv[r], keyv[r], pac, enc, l_pac);
+                if let Some(mid) = steppers[idx].next_probe() {
+                    active[w] = (idx, mid);
+                    w += 1;
+                }
+            }
+            active.truncate(w);
+        }
+        steppers.into_iter().map(|s| s.steps).collect()
+    }
+
+    /// Build a `MemSearchStepper` for `t.query` (already validated non-empty). Seeds
+    /// the insertion `FbState` from `t.seed_hint` (warm-start) or the model lookup,
+    /// matching `forward_maximal_len_seeded`'s window arithmetic exactly.
+    fn ms_stepper_new<'a>(&self, t: &MsTask<'a>) -> MemSearchStepper<'a> {
+        let sa_num = self.sa_num();
+        let query_key = tokenize_32mer(t.query, t.query.len().min(KMER_LEN));
+        let (q_nbases, q_mask) = keyed_compare_mask(t.query.len());
+        let (win_lo, win_hi) = match t.seed_hint {
+            Some(h) => (h.min(sa_num), h.saturating_add(1).min(sa_num)),
+            None => {
+                let (pred, err) = self.lookup(query_key);
+                (
+                    pred.saturating_sub(err),
+                    pred.saturating_add(err).saturating_add(1).min(sa_num),
+                )
+            }
+        };
+        MemSearchStepper {
+            query: t.query,
+            query_key,
+            q_nbases,
+            q_mask,
+            sa_num,
+            ip: 0,
+            match_len: 0,
+            lcp_left_done: false,
+            lcp_right_done: false,
+            qm_key: 0,
+            qm_nbases: 0,
+            qm_mask: 0,
+            lower: 0,
+            fb: FbState::new(0, sa_num, win_lo, win_hi),
+            phase: MsPhase::Insertion,
+            pending: MsPending::Fb,
+            result: MemMatch {
+                match_len: 0,
+                sa_start: 0,
+                occ: 0,
+            },
+            finished: false,
+        }
+    }
+
+    /// Drive ONE `MemSearchStepper` to completion serially. Byte-identical to
+    /// [`mem_search`](Self::mem_search): the stepper reproduces the `kmt.is_none()`
+    /// path, and with a `kmt` loaded it falls back to `mem_search` directly (whose
+    /// tabled trace the stepper does NOT model), so the result is correct for ANY
+    /// index — the stepper is just the no-kmt fast path.
+    ///
+    /// Exists to prove the stepper byte-identical before lockstepping (the analogue
+    /// of [`backward_spectrum_via_stepper`](Self::backward_spectrum_via_stepper)).
+    #[allow(dead_code)]
+    fn mem_search_via_stepper(&self, t: &MsTask, pac: &[u8], enc: PacEncoding) -> MemMatch {
+        // A loaded k-mer table makes `mem_search` take the tabled trace, which the
+        // stepper does not reproduce; fall back to it (byte-identical, no MLP)
+        // rather than silently diverging in release (where a debug_assert is gone).
+        if self.kmt.is_some() {
+            return self.mem_search(t.query, pac, enc);
+        }
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_via_stepper").is_err() {
+                return zero;
+            }
+        }
+        if t.query.is_empty() {
+            return zero;
+        }
+        let l_pac = self.l_pac();
+        let mut s = self.ms_stepper_new(t);
+        while let Some(mid) = s.next_probe() {
+            let (pos, key) = self.sa_entry(mid);
+            s.advance(pos, key, pac, enc, l_pac);
+        }
+        s.result
+    }
+
+    /// Drive N `MemSearchStepper`s in lockstep — each round batch-loads every active
+    /// task's current probe (independent cold SA reads kept in flight = MLP), then
+    /// advances all. Output[i] is byte-identical to `mem_search(tasks[i].query)` for
+    /// ANY index: the lockstep stepper serves the `kmt.is_none()` path, and a loaded
+    /// `kmt` falls back to per-task `mem_search` (correct, no MLP). Empty queries / a
+    /// bad packed pac yield `{0,0,0}`.
+    pub fn mem_search_lockstep(
+        &self,
+        tasks: &[MsTask],
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> Vec<MemMatch> {
+        let zero = MemMatch {
+            match_len: 0,
+            sa_start: 0,
+            occ: 0,
+        };
+        // With a k-mer table loaded `mem_search` takes the tabled trace (not modeled
+        // by the stepper); fall back to per-task serial calls so the result stays
+        // byte-identical for ANY index, in release too (no debug_assert reliance).
+        if self.kmt.is_some() {
+            return tasks
+                .iter()
+                .map(|t| self.mem_search(t.query, pac, enc))
+                .collect();
+        }
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, "mem_search_lockstep").is_err() {
+                return tasks.iter().map(|_| zero).collect();
+            }
+        }
+        let l_pac = self.l_pac();
+        // Empty queries never enter the stepper (mirroring `mem_search`'s
+        // short-circuit); their result is the zero match, filled in at the end.
+        let mut steppers: Vec<Option<MemSearchStepper>> = tasks
+            .iter()
+            .map(|t| {
+                if t.query.is_empty() {
+                    None
+                } else {
+                    Some(self.ms_stepper_new(t))
+                }
+            })
+            .collect();
+        // Active set: (stepper index, current probe) for every task still issuing
+        // probes. Iterating only the active set keeps each round O(active), not
+        // O(batch) — without this, cheap queries (few rounds) on a large batch are
+        // dominated by the per-round full scan over already-finished steppers.
+        // Byte-identical: per-stepper probe sequences are independent, and the
+        // compaction preserves their relative order, so skipping finished steppers
+        // changes nothing but wall time.
+        let mut active: Vec<(usize, u64)> = Vec::with_capacity(steppers.len());
+        for (i, s) in steppers.iter_mut().enumerate() {
+            if let Some(mid) = s.as_mut().and_then(|st| st.next_probe()) {
+                active.push((i, mid));
+            }
+        }
+        let mut posv: Vec<u64> = vec![0; active.len()];
+        let mut keyv: Vec<Option<u64>> = vec![None; active.len()];
+        while !active.is_empty() {
+            // Phase 1: batch the cold loads (independent -> memory-level parallelism).
+            for (r, &(_, mid)) in active.iter().enumerate() {
+                let (p, k) = self.sa_entry(mid);
+                posv[r] = p;
+                keyv[r] = k;
+            }
+            // Phase 2: advance every active task, fetch its next probe, and compact
+            // (drop finished steppers) in place, preserving relative order.
+            let mut w = 0;
+            for r in 0..active.len() {
+                let idx = active[r].0;
+                let st = steppers[idx].as_mut().expect("active stepper present");
+                st.advance(posv[r], keyv[r], pac, enc, l_pac);
+                if let Some(mid) = st.next_probe() {
+                    active[w] = (idx, mid);
+                    w += 1;
+                }
+            }
+            active.truncate(w);
+        }
+        steppers
+            .into_iter()
+            .map(|s| s.map(|st| st.result).unwrap_or(zero))
+            .collect()
     }
 
     /// Backward spectrum: refine the right-anchored interval `[sa_start,
@@ -5159,6 +5812,219 @@ mod keyed_tests {
             let got = idx.backward_spectrum_lockstep(&tasks, &fwd, e);
             prop_assert_eq!(got, want, "lockstep batch != serial");
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// `forward_spectrum_lockstep` over a batch of queries == per-query serial
+        /// `forward_spectrum`, element for element — and each equals the single-task
+        /// `forward_spectrum_via_stepper` (the stepper is byte-identical before any
+        /// interleaving). Queries include length 0 (empty) and lengths exceeding
+        /// `fwd`, exercising the empty, unique-tail, and occ==0 break paths.
+        #[test]
+        fn fwd_lockstep_equals_serial(
+            fwd in prop::collection::vec(0u8..=3, 60..240),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 0..120), 1..6),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let tasks: Vec<FwdTask> = queries.iter().map(|q| FwdTask { query: q }).collect();
+            let want: Vec<Vec<SmemStep>> =
+                queries.iter().map(|q| idx.forward_spectrum(q, &fwd, e)).collect();
+            // Single-task stepper drive == serial, for every query.
+            for (q, w) in queries.iter().zip(&want) {
+                let via = idx.forward_spectrum_via_stepper(&FwdTask { query: q }, &fwd, e);
+                prop_assert_eq!(&via, w, "fwd via_stepper != serial");
+            }
+            let got = idx.forward_spectrum_lockstep(&tasks, &fwd, e);
+            prop_assert_eq!(got, want, "fwd lockstep batch != serial");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        /// `MemSearchStepper` (serial drive and lockstep batch) == serial `mem_search`,
+        /// element for element, for random refs/queries (incl. empty queries).
+        #[test]
+        fn mem_search_lockstep_equals_serial(
+            fwd in prop::collection::vec(0u8..=3, 40..220),
+            queries in prop::collection::vec(prop::collection::vec(0u8..=3, 0..80), 1..6),
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let e = PacEncoding::Unpacked;
+            let sa_num = idx.sa_num();
+            let want: Vec<MemMatch> = queries.iter().map(|q| idx.mem_search(q, &fwd, e)).collect();
+            // The warm-start (`seed_hint = Some`) is byte-identical for ANY hint
+            // (`find_boundary` expands on a miss), so cover the cold path plus
+            // out-of-range / interior / boundary hints against the same cold oracle.
+            let hints = [None, Some(0u64), Some(sa_num / 2), Some(sa_num), Some(u64::MAX)];
+            for (q, w) in queries.iter().zip(&want) {
+                for &seed_hint in &hints {
+                    let via = idx.mem_search_via_stepper(&MsTask { query: q, seed_hint }, &fwd, e);
+                    prop_assert_eq!(via, *w, "via_stepper != mem_search (hint={:?})", seed_hint);
+                }
+            }
+            let tasks: Vec<MsTask> =
+                queries.iter().map(|q| MsTask { query: q, seed_hint: None }).collect();
+            let got = idx.mem_search_lockstep(&tasks, &fwd, e);
+            prop_assert_eq!(got, want.clone(), "lockstep != mem_search");
+            // Lockstep with a fixed in-range hint on every task is still cold-identical.
+            let hinted: Vec<MsTask> = queries
+                .iter()
+                .map(|q| MsTask { query: q, seed_hint: Some(sa_num / 2) })
+                .collect();
+            prop_assert_eq!(idx.mem_search_lockstep(&hinted, &fwd, e), want, "hinted lockstep != cold");
+        }
+    }
+
+    /// Deterministic edge cases the random proptest will not reliably hit (review
+    /// Finding 5): empty query, a non-empty query with no match (`match_len==0`),
+    /// `ip==0` (sorts first), and `ip==sa_num` (sorts last). Each must be
+    /// byte-identical via both the serial stepper drive and the lockstep batch.
+    #[test]
+    fn mem_search_stepper_edge_cases() {
+        let e = PacEncoding::Unpacked;
+        let check = |idx: &LearnedIndex, fwd: &[u8], q: &[u8]| {
+            let want = idx.mem_search(q, fwd, e);
+            let via = idx.mem_search_via_stepper(
+                &MsTask {
+                    query: q,
+                    seed_hint: None,
+                },
+                fwd,
+                e,
+            );
+            assert_eq!(via, want, "via_stepper != mem_search for {q:?}");
+            let got = idx.mem_search_lockstep(
+                &[MsTask {
+                    query: q,
+                    seed_hint: None,
+                }],
+                fwd,
+                e,
+            );
+            assert_eq!(got[0], want, "lockstep != mem_search for {q:?}");
+        };
+        // Independent scalar oracle for the insertion point: the first SA index whose
+        // suffix is NOT strictly less than the query (lower-bound semantics), else
+        // `sa_num`. Asserting it on the boundary fixtures guards that they genuinely
+        // exercise the ip==0 / ip==sa_num probe paths rather than silently degrading
+        // into plain byte-identity checks if a future fixture change shifts them.
+        let scalar_ip = |idx: &LearnedIndex, fwd: &[u8], q: &[u8]| -> u64 {
+            let l_pac = idx.l_pac();
+            (0..idx.sa_num())
+                .find(|&i| {
+                    let pos = idx.sa_position_for(i);
+                    let (ref_less, _) = compare_query_vs_suffix_2x_scalar(q, pos, fwd, e, l_pac);
+                    !ref_less
+                })
+                .unwrap_or_else(|| idx.sa_num())
+        };
+        // (a) empty query — the genuine ip==0 / left-LCP-skip case: it sorts before
+        // every real suffix, so its insertion point is 0. (A non-empty query can never
+        // reach ip==0: the empty sentinel suffix always occupies SA index 0 and is
+        // strictly less than any non-empty query.)
+        // Use bases {1,2} only: in the 2x (forward+RC) SA, base 0 (A) complements
+        // to base 3 (T), so a {0,1,2} ref would still contain base 3 in the RC half.
+        // {1,2} → {2,1} under RC, so bases 0 AND 3 are absent from the 2x text.
+        let fwd_abc: Vec<u8> = (0..200u32).map(|i| (i % 2) as u8 + 1).collect(); // bases {1,2}
+        let (_d0, idx_abc) = build_mode2(&fwd_abc);
+        assert_eq!(
+            scalar_ip(&idx_abc, &fwd_abc, &[]),
+            0,
+            "empty query must exercise ip==0"
+        );
+        check(&idx_abc, &fwd_abc, &[]);
+        // (b) non-empty query whose first base (3) never occurs -> match_len==0.
+        // Guard that the fixture genuinely exercises the no-match path: the maximal
+        // LCP of the query against any suffix must be 0, else this silently degrades
+        // into another plain byte-identity check if a future fixture change lets it
+        // start matching.
+        let q_nomatch = [3u8, 1, 2, 1];
+        let max_lcp = (0..idx_abc.sa_num())
+            .map(|i| {
+                let pos = idx_abc.sa_position_for(i);
+                compare_query_vs_suffix_2x_scalar(&q_nomatch, pos, &fwd_abc, e, idx_abc.l_pac()).1
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(max_lcp, 0, "no-match fixture must exercise match_len==0");
+        check(&idx_abc, &fwd_abc, &q_nomatch);
+        // (c) all-0 query sorts at the front: ip==1, immediately after the sentinel,
+        // so the left-LCP probe lands on SA index 0 (the front-neighbor path).
+        let fwd_mix: Vec<u8> = (0..200u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let (_d1, idx_mix) = build_mode2(&fwd_mix);
+        let q_front = [0u8; 24];
+        assert_eq!(
+            scalar_ip(&idx_mix, &fwd_mix, &q_front),
+            1,
+            "front fixture must sort immediately after the sentinel (ip==1)"
+        );
+        check(&idx_mix, &fwd_mix, &q_front);
+        // (d) all-3 query sorts at the end (exercises ip==sa_num / right skip).
+        let q_back = [3u8; 24];
+        assert_eq!(
+            scalar_ip(&idx_mix, &fwd_mix, &q_back),
+            idx_mix.sa_num(),
+            "back fixture must exercise ip==sa_num"
+        );
+        check(&idx_mix, &fwd_mix, &q_back);
+    }
+
+    /// Cover the loaded-`.kmt` fallback branch of `mem_search_lockstep` (line ~3588):
+    /// when a k-mer table is present the stepper does not model the tabled trace, so
+    /// the batch routes every task through serial `mem_search`. Assert that both the
+    /// unhinted and hinted lockstep batches stay byte-identical to serial `mem_search`
+    /// for a `.kmt`-loaded index — the other tests only build indexes without a `.kmt`.
+    #[test]
+    fn mem_search_lockstep_with_kmt_equals_serial() {
+        let fwd: Vec<u8> = (0..200u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let pac = dir.path().join("r.pac");
+        write_pac(&pac, &fwd);
+        let prefix = dir.path().join("r.prmi");
+        let cfg = TrainerConfig::default()
+            .with_memory_mode(MemoryMode::Mode2)
+            .with_kmer_table_k(6);
+        build_sidecar_from_pac_with_config(&pac, &prefix, None, MaskConfig::default(), 1, Some(cfg))
+            .unwrap();
+        let idx = LearnedIndex::open(&prefix).unwrap();
+        assert!(idx.kmt.is_some(), ".kmt fallback branch must be exercised");
+
+        let e = PacEncoding::Unpacked;
+        let queries = [
+            vec![1u8, 2, 3, 0, 1, 2, 3],
+            vec![0u8, 0, 1],
+            vec![3u8, 3, 3, 3, 2, 1, 0, 2],
+            vec![], // empty query short-circuits to the zero match
+        ];
+        let want: Vec<MemMatch> = queries.iter().map(|q| idx.mem_search(q, &fwd, e)).collect();
+
+        let unhinted: Vec<MsTask> = queries
+            .iter()
+            .map(|q| MsTask {
+                query: q,
+                seed_hint: None,
+            })
+            .collect();
+        assert_eq!(
+            idx.mem_search_lockstep(&unhinted, &fwd, e),
+            want,
+            "unhinted .kmt lockstep != serial mem_search"
+        );
+
+        let hinted: Vec<MsTask> = queries
+            .iter()
+            .map(|q| MsTask {
+                query: q,
+                seed_hint: Some(idx.sa_num() / 2),
+            })
+            .collect();
+        assert_eq!(
+            idx.mem_search_lockstep(&hinted, &fwd, e),
+            want,
+            "hinted .kmt lockstep != serial mem_search"
+        );
     }
 
     proptest! {

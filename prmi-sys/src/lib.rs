@@ -742,9 +742,11 @@ pub struct prmi_bwd_task_t {
     pub max_steps: u32,
 }
 
-/// Run `ntasks` forward spectra (correctness-first loop; lockstep
-/// predict→prefetch→compare is a deferred perf optimization — see the design
-/// spec). `queries_arena` holds all task query bytes (2-bit 0..3, caller-owned,
+/// Run `ntasks` forward spectra with the correctness-first SERIAL strategy (one
+/// kmt-accelerated `forward_spectrum` per task). For the memory-level-parallelism
+/// variant, see `prmi_forward_spectrum_batch_lockstep` — byte-identical output,
+/// faster on high-DRAM-latency microarchitectures, slower on low-latency ones
+/// (measure). `queries_arena` holds all task query bytes (2-bit 0..3, caller-owned,
 /// NOT copied); `queries_arena_len` is its size in bytes. Task i reads
 /// `query_len` bytes at `query_off`. `steps_arena` is a shared caller-owned
 /// output arena; `steps_arena_len` is its capacity in `prmi_smem_step_t`
@@ -753,7 +755,10 @@ pub struct prmi_bwd_task_t {
 /// `pac` is the FORWARD pac (packed); `pac_num_bases` = l_pac.
 ///
 /// Returns 0 on success. Error codes:
-///   - `-1` — null pointer (with ntasks>0).
+///   - `-1` — a required pointer is null: `handle`, `pac`, or (with `ntasks > 0`)
+///     `tasks` / `out_nsteps`, or a `queries_arena` / `steps_arena` declared with a
+///     non-zero length. A NULL arena with a zero declared length is accepted as the
+///     canonical empty slice.
 ///   - `-2` — a task descriptor's query or steps window falls outside its arena,
 ///     or `ntasks` / a task's `query_off` / the packed pac length does not fit
 ///     `usize` on this target
@@ -782,6 +787,148 @@ pub unsafe extern "C" fn prmi_forward_spectrum_batch(
     steps_arena_len: u64,
     out_nsteps: *mut u64,
 ) -> c_int {
+    unsafe {
+        forward_spectrum_batch_impl(
+            handle,
+            queries_arena,
+            queries_arena_len,
+            tasks,
+            ntasks,
+            pac,
+            pac_num_bases,
+            steps_arena,
+            steps_arena_len,
+            out_nsteps,
+            false,
+        )
+    }
+}
+
+/// Run `ntasks` forward spectra with the LOCKSTEP strategy: all tasks are driven
+/// in parallel, batching their cold SA probe loads each round so the memory
+/// latency overlaps (memory-level parallelism). Byte-identical output to
+/// `prmi_forward_spectrum_batch` — same breakpoints, same order — differing only
+/// in execution strategy. Faster on high-DRAM-latency microarchitectures (server
+/// x86 / Graviton); can be SLOWER on low-latency ones (e.g. Apple Silicon, which
+/// already hides the latency). A/B both entry points on the target hardware and
+/// pick the winner. Same arguments and arena contract as
+/// `prmi_forward_spectrum_batch`.
+///
+/// Drives the table-free forward search (it does not consult a loaded `.kmt`);
+/// the MLP win is on the cold deep-probe path, which is also the byte-identity-
+/// critical production path. Output still equals the kmt-accelerated serial entry.
+///
+/// Returns 0 on success. Error codes (identical to `prmi_forward_spectrum_batch`,
+/// listed in full here so this entrypoint's contract is self-contained):
+///   - `-1` — a required pointer is null: `handle`, `pac`, or (with `ntasks > 0`)
+///     `tasks` / `out_nsteps`, or a `queries_arena` / `steps_arena` declared with a
+///     non-zero length. A NULL arena with a zero declared length is accepted as the
+///     canonical empty slice.
+///   - `-2` — a task descriptor's query or steps window falls outside its arena, or
+///     `ntasks` / a task's `query_off` / the packed pac length does not fit `usize`
+///     on this target; `prmi_last_error_message` names the offending task index and
+///     which window violated the bound. The whole batch is aborted on the first
+///     violation; no arena memory is read or written for the violating task.
+///   - `-3` — internal/panic.
+///   - `-4` — a task's produced nsteps exceeds its `max_steps`; that task's
+///     `out_nsteps[i]` is set to the needed count; its steps region is left
+///     unwritten/partial — caller should re-run that task with a larger buffer.
+///
+/// # Safety
+/// All pointers valid for their declared sizes; arenas at least as large as
+/// declared; `out_nsteps` has `ntasks` u64 slots.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_forward_spectrum_batch_lockstep(
+    handle: *const prmi_index_t,
+    queries_arena: *const u8,
+    queries_arena_len: u64,
+    tasks: *const prmi_fwd_task_t,
+    ntasks: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    steps_arena: *mut prmi_smem_step_t,
+    steps_arena_len: u64,
+    out_nsteps: *mut u64,
+) -> c_int {
+    unsafe {
+        forward_spectrum_batch_impl(
+            handle,
+            queries_arena,
+            queries_arena_len,
+            tasks,
+            ntasks,
+            pac,
+            pac_num_bases,
+            steps_arena,
+            steps_arena_len,
+            out_nsteps,
+            true,
+        )
+    }
+}
+
+/// Write one forward task's steps into the shared `steps_arena`, setting
+/// `*out_ns_i` to the step count. Returns `true` if the count exceeded
+/// `t.max_steps` (the task's arena region is then left unwritten for the caller
+/// to retry with a larger buffer). Used by the lockstep arm, whose
+/// `forward_spectrum_lockstep` returns owned step vectors; the serial arm fills
+/// the arena directly via `forward_spectrum_auto_fill` instead.
+///
+/// # Safety
+/// `steps_arena` must have at least `t.steps_off + steps.len()` slots.
+#[inline]
+unsafe fn write_fwd_task_steps(
+    steps_arena: *mut prmi_smem_step_t,
+    t: &prmi_fwd_task_t,
+    steps: &[prmi::index::spectrum::SmemStep],
+    out_ns_i: &mut u64,
+) -> bool {
+    *out_ns_i = steps.len() as u64;
+    if steps.len() as u64 > u64::from(t.max_steps) {
+        return true;
+    }
+    if steps.is_empty() {
+        // Canonical empty: nothing to write. Return before touching `steps_arena`,
+        // which a caller may pass as `NULL + 0` (so `from_raw_parts_mut(NULL, 0)`
+        // — UB — is never reached).
+        return false;
+    }
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
+    };
+    for (slot, s) in dst.iter_mut().zip(steps.iter()) {
+        *slot = prmi_smem_step_t {
+            sa_start: s.sa_start,
+            occ_count: s.occ_count,
+            match_len: s.match_len,
+        };
+    }
+    false
+}
+
+/// Shared impl for the two forward-batch entry points. `lockstep == false` runs
+/// the correctness-first serial loop (one kmt-accelerated `forward_spectrum` per
+/// task); `lockstep == true` drives all tasks through `forward_spectrum_lockstep`
+/// (memory-level parallelism via batched probe loads). Output is byte-identical
+/// between the two strategies — they differ only in execution order and timing.
+///
+/// # Safety
+/// All pointers valid for their declared sizes; arenas at least as large as
+/// declared; `out_nsteps` has `ntasks` u64 slots.
+#[allow(clippy::too_many_arguments)]
+unsafe fn forward_spectrum_batch_impl(
+    handle: *const prmi_index_t,
+    queries_arena: *const u8,
+    queries_arena_len: u64,
+    tasks: *const prmi_fwd_task_t,
+    ntasks: u64,
+    pac: *const u8,
+    pac_num_bases: u64,
+    steps_arena: *mut prmi_smem_step_t,
+    steps_arena_len: u64,
+    out_nsteps: *mut u64,
+    lockstep: bool,
+) -> c_int {
     clear_last_error();
     if handle.is_null() || pac.is_null() {
         set_last_error("prmi_forward_spectrum_batch: null pointer");
@@ -790,8 +937,24 @@ pub unsafe extern "C" fn prmi_forward_spectrum_batch(
     if ntasks == 0 {
         return 0;
     }
-    if queries_arena.is_null() || tasks.is_null() || steps_arena.is_null() || out_nsteps.is_null() {
-        set_last_error("prmi_forward_spectrum_batch: null arena/tasks/out with ntasks > 0");
+    // `tasks` and `out_nsteps` have length `ntasks > 0`, so they must be non-null.
+    if tasks.is_null() || out_nsteps.is_null() {
+        set_last_error("prmi_forward_spectrum_batch: null tasks/out with ntasks > 0");
+        return -1;
+    }
+    // A NULL arena is the canonical empty slice ONLY with a declared length of 0
+    // (C callers pass empty buffers as `NULL + 0`); building such a slice from the
+    // raw NULL pointer would be UB, so the per-task slices below branch to `&[]` /
+    // `&mut []` for zero-length windows. Reject NULL when the caller declares a
+    // non-empty arena.
+    if queries_arena.is_null() && queries_arena_len != 0 {
+        set_last_error(
+            "prmi_forward_spectrum_batch: null queries_arena with queries_arena_len > 0",
+        );
+        return -1;
+    }
+    if steps_arena.is_null() && steps_arena_len != 0 {
+        set_last_error("prmi_forward_spectrum_batch: null steps_arena with steps_arena_len > 0");
         return -1;
     }
     let h = unsafe { Handle::as_ref(handle) };
@@ -855,26 +1018,88 @@ pub unsafe extern "C" fn prmi_forward_spectrum_batch(
         }
     }
 
+    // `forward_spectrum_lockstep` materializes the full step trace of EVERY task
+    // up front (its per-stepper `Vec<SmemStep>` grows unconditionally), whereas the
+    // serial arm fills the caller's bounded arena directly and never allocates a
+    // per-task vector. A sizing probe — a C caller passing no steps buffer to learn
+    // the required `nsteps` before allocating — is exactly `steps_arena_len == 0`
+    // (the bounds check above then forces every `max_steps == 0`). Route that case
+    // through the bounded serial fill path so a probe cannot drive the unbounded
+    // transient materialization just to be answered with `-4`. Output is
+    // byte-identical between the two strategies, so the reported counts and the `-4`
+    // return are unchanged; only the lost MLP (irrelevant when nothing is written)
+    // differs.
+    let use_lockstep = lockstep && steps_arena_len != 0;
+
     // One catch_unwind around the whole loop — panic anywhere → -3.
     let mut overflow = false;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for (i, t) in tasks_s.iter().enumerate() {
-            let q = unsafe {
-                std::slice::from_raw_parts(
-                    queries_arena.add(t.query_off as usize),
-                    t.query_len as usize,
-                )
-            };
-            // Fill this task's arena region directly; `_fill` returns the total
-            // count and writes at most `max_steps` steps (overflow → -4, caller
-            // retries with a larger buffer).
-            let dst = unsafe {
-                out_steps_as_smemstep(steps_arena.add(t.steps_off as usize), t.max_steps as usize)
-            };
-            let nsteps = h.idx.forward_spectrum_auto_fill(q, pac_slice, enc, dst);
-            out_ns[i] = nsteps as u64;
-            if nsteps as u64 > u64::from(t.max_steps) {
-                overflow = true;
+        if use_lockstep {
+            // Lockstep genuinely needs all tasks resident at once:
+            // `forward_spectrum_lockstep` drives them together for memory-level
+            // parallelism and returns one step vector per task. Write each result
+            // through after the batched call.
+            let fwd_tasks: Vec<_> = tasks_s
+                .iter()
+                .map(|t| {
+                    // Empty query window → `&[]`; the arena may be the canonical
+                    // `NULL + 0`, so never `from_raw_parts(NULL, 0)` (UB).
+                    let q: &[u8] = if t.query_len == 0 {
+                        &[]
+                    } else {
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                queries_arena.add(t.query_off as usize),
+                                t.query_len as usize,
+                            )
+                        }
+                    };
+                    prmi::index::spectrum::FwdTask { query: q }
+                })
+                .collect();
+            let all_steps = h.idx.forward_spectrum_lockstep(&fwd_tasks, pac_slice, enc);
+            debug_assert_eq!(all_steps.len(), tasks_s.len());
+            // `zip` (not indexing) keeps the three collections paired safely.
+            for ((t, out_ns_i), steps) in
+                tasks_s.iter().zip(out_ns.iter_mut()).zip(all_steps.iter())
+            {
+                if unsafe { write_fwd_task_steps(steps_arena, t, steps, out_ns_i) } {
+                    overflow = true;
+                }
+            }
+        } else {
+            for (i, t) in tasks_s.iter().enumerate() {
+                // Empty query window → `&[]`; the arena may be the canonical
+                // `NULL + 0`, so never `from_raw_parts(NULL, 0)` (UB).
+                let q: &[u8] = if t.query_len == 0 {
+                    &[]
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            queries_arena.add(t.query_off as usize),
+                            t.query_len as usize,
+                        )
+                    }
+                };
+                // Fill this task's arena region directly; `_fill` returns the total
+                // count and writes at most `max_steps` steps (overflow → -4, caller
+                // retries with a larger buffer). Empty step window → `&mut []`
+                // (the steps arena may likewise be the canonical `NULL + 0`).
+                let dst: &mut [prmi::index::spectrum::SmemStep] = if t.max_steps == 0 {
+                    &mut []
+                } else {
+                    unsafe {
+                        out_steps_as_smemstep(
+                            steps_arena.add(t.steps_off as usize),
+                            t.max_steps as usize,
+                        )
+                    }
+                };
+                let nsteps = h.idx.forward_spectrum_auto_fill(q, pac_slice, enc, dst);
+                out_ns[i] = nsteps as u64;
+                if nsteps as u64 > u64::from(t.max_steps) {
+                    overflow = true;
+                }
             }
         }
     }));
