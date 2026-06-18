@@ -2251,3 +2251,93 @@ pub unsafe extern "C" fn prmi_collect_smems(
         }
     }
 }
+
+/// Tiered-dispatch presence pre-reject: does the read's first full 32-mer window
+/// occur in this index? Wraps [`prmi::index::collect::LearnedIndex::present_anchor`]
+/// — one cheap `mem_search` locate, far cheaper than a full `prmi_collect_smems`
+/// whose failed reseeds on an absent read cost hundreds of probes. A Design-Z
+/// (tiered) consumer calls this on a small fast-path index to route off-target
+/// reads to the whole-genome fallback before paying the full fast-path search.
+///
+/// `read` is 2-bit-decoded query bases (`0..=3`, `4` = N; N-containing windows are
+/// skipped). `pac` is the reference in BWA-MEME `bntpac` packing (2 bits/base,
+/// MSB-first) with `pac_num_bases` bases — the same `(pac, pac_num_bases)` passed
+/// to [`prmi_collect_smems`].
+///
+/// Returns `1` if present, `0` if absent, and a negative code on error
+/// (`-1` null pointer, `-2` invalid `read_len`/`pac_num_bases`, `-3` internal panic).
+///
+/// # Safety
+/// `handle` must come from [`prmi_open`]/[`prmi_open_shm`]. `read` must be valid for
+/// `read_len` bytes (or NULL iff `read_len == 0`); `pac` must be valid for
+/// `ceil(pac_num_bases / 4)` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn prmi_present(
+    handle: *const prmi_index_t,
+    read: *const u8,
+    read_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+) -> c_int {
+    clear_last_error();
+    if handle.is_null() || pac.is_null() {
+        set_last_error("prmi_present: null pointer");
+        return -1;
+    }
+    if read_len < 0 {
+        set_last_error("prmi_present: invalid read_len");
+        return -2;
+    }
+    if read.is_null() && read_len != 0 {
+        set_last_error("prmi_present: null read with nonzero read_len");
+        return -1;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    // `packed_pac_bytes` only guards against `pac_num_bases` narrowing/overflow on
+    // this platform; it does not catch a `pac` buffer that is the wrong size for
+    // the loaded reference. Reject any `pac_num_bases` that disagrees with the
+    // index's own `l_pac` BEFORE building the slice, so `from_raw_parts` can never
+    // over-read a too-short caller buffer (UB). In correct usage the consumer
+    // passes the reference's true `(pac, l_pac)` — the same pair given to
+    // `prmi_collect_smems` — so this only rejects misuse. `l_pac()` is an infallible
+    // metadata read, but fence it anyway so a panic here returns the documented `-3`
+    // instead of crossing the C ABI (this runs before the `present_anchor` fence).
+    let l_pac = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.idx.l_pac())) {
+        Ok(v) => v,
+        Err(_) => {
+            set_last_error("prmi_present: internal panic");
+            return -3;
+        }
+    };
+    if pac_num_bases != l_pac {
+        set_last_error("prmi_present: pac_num_bases does not match index l_pac");
+        return -2;
+    }
+    let r: &[u8] = if read_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(read, read_len as usize) }
+    };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_present: pac_num_bases too large for this platform");
+            return -2;
+        }
+    };
+    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx.present_anchor(r, pac_slice, enc)
+    }));
+    match res {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => {
+            set_last_error("prmi_present: internal panic");
+            -3
+        }
+    }
+}
