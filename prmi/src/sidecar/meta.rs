@@ -113,6 +113,18 @@ pub struct Sa {
     /// (`--store-keys`; 13 B vs 5 B per entry). `None` for pre-v2 sidecars.
     #[serde(default)]
     pub stored_keys: Option<bool>,
+    /// Whether this is a tiered (position-filtered, Design Z) `.sa` that retains
+    /// only a keep-set subset of suffix positions. When `Some(true)`,
+    /// `num_entries` is legitimately `< 2*l_pac+1` while `l_pac` stays the full
+    /// forward genome length (positions remain native genome coordinates).
+    /// `None`/`Some(false)` => a full 2× SA (`num_entries == 2*l_pac+1`).
+    #[serde(default)]
+    pub tiered: Option<bool>,
+    /// Filesystem path of the keep-set BED used to build the tiered (Design Z)
+    /// `.sa`, recorded so a tiered sidecar can identify which keep-set produced
+    /// the position-filtered suffix array. `None` for full (non-tiered) builds.
+    #[serde(default)]
+    pub keep_bed: Option<String>,
     /// SHA-256 (hex) of the bwa `.pac` consumed, for `.pac`-sourced builds.
     /// `None` for FASTA-sourced (non-byte-identical) builds.
     #[serde(default)]
@@ -352,8 +364,14 @@ impl Meta {
                 encoding: self.sa.encoding.clone(),
             });
         }
-        // Validate the v2 2× invariants when present: the 2× SA has exactly
-        // `2*l_pac + 1` entries, and stored keys exist iff this is mode 2.
+        // Validate the v2 2× invariants when present. A FULL 2× SA has exactly
+        // `2*l_pac + 1` entries. A tiered (Design Z) keep-masked `.sa` retains
+        // only a position-filtered subset, so it legitimately has FEWER entries
+        // while `l_pac` stays the full forward genome length (positions remain
+        // native genome coordinates). The `tiered` flag authorizes that: when
+        // set, `1 <= num_entries <= 2*l_pac+1`; otherwise exactly `2*l_pac+1`.
+        // More than `2*l_pac+1` is impossible either way (the doubled text has
+        // exactly that many suffixes) and indicates corruption.
         if let Some(l_pac) = self.sa.l_pac {
             let expected_entries = l_pac
                 .checked_mul(2)
@@ -362,15 +380,34 @@ impl Meta {
                     file: file.to_path_buf(),
                     detail: format!("l_pac overflow: {l_pac}"),
                 })?;
-            if self.sa.num_entries != expected_entries {
+            let tiered = self.sa.tiered == Some(true);
+            let ok = if tiered {
+                self.sa.num_entries >= 1 && self.sa.num_entries <= expected_entries
+            } else {
+                self.sa.num_entries == expected_entries
+            };
+            if !ok {
                 return Err(Error::SizeMismatch {
                     file: file.to_path_buf(),
                     detail: format!(
-                        "num_entries={} inconsistent with l_pac={} (expected 2*l_pac+1={})",
-                        self.sa.num_entries, l_pac, expected_entries
+                        "num_entries={} inconsistent with l_pac={} (tiered={}; \
+                         expected {} 2*l_pac+1={})",
+                        self.sa.num_entries,
+                        l_pac,
+                        tiered,
+                        if tiered { "1..=" } else { "==" },
+                        expected_entries
                     ),
                 });
             }
+        } else if self.sa.tiered == Some(true) {
+            // A tiered sidecar's `num_entries` invariants (and the forward-length
+            // derivation) are all defined relative to `l_pac`; without it the
+            // tiered claim is unverifiable, so reject rather than silently skip.
+            return Err(Error::SizeMismatch {
+                file: file.to_path_buf(),
+                detail: "tiered=true requires sa.l_pac to be present".to_string(),
+            });
         }
         if let Some(stored_keys) = self.sa.stored_keys {
             let expected_stored_keys = self.sa.mode == "2";
@@ -531,5 +568,118 @@ type = "uniform"
         let meta = Meta::from_toml_str(toml).unwrap();
         assert_eq!(meta.sa.l_pac, Some(4));
         assert_eq!(meta.sa.stored_keys, Some(true));
+    }
+
+    /// A tiered (position-filtered, Design Z) sidecar legitimately has FEWER than
+    /// `2*l_pac+1` entries (only keep-set positions are retained) while `l_pac`
+    /// stays the full forward genome length. The `tiered` flag authorizes that.
+    fn tiered_toml(num_entries: u64, tiered_line: &str) -> String {
+        // mode "2": 13 B/entry, stored 32-mer keys.
+        tiered_toml_mode(
+            num_entries,
+            tiered_line,
+            "2",
+            13,
+            "packed_lo8_hi32_key64",
+            true,
+        )
+    }
+
+    /// Build a `[sa]` meta TOML for the given memory mode so the tiered
+    /// `num_entries` invariants can be round-tripped across modes (this is an
+    /// on-disk format/validation change, not a mode-2-only one).
+    fn tiered_toml_mode(
+        num_entries: u64,
+        tiered_line: &str,
+        mode: &str,
+        bytes_per_entry: u8,
+        encoding: &str,
+        stored_keys: bool,
+    ) -> String {
+        format!(
+            r#"
+[prmi]
+magic = "PRMIv2"
+format_version = 2
+trainer_version = "prmi=0.1.0"
+created_utc = "2026-05-28T00:00:00Z"
+[ref]
+path = "ref.fa"
+sha256 = "00"
+size_bytes = 1
+[sa]
+num_entries = {num_entries}
+bytes_per_entry = {bytes_per_entry}
+encoding = "{encoding}"
+mode = "{mode}"
+strand = "forward_rc_2x"
+l_pac = 4
+stored_keys = {stored_keys}
+{tiered_line}
+[rmi]
+spec = "pwl4,linear,linear_spline"
+l2_leaf_count = 16
+bit_shift = 60
+max_error_bound = 0
+[priors]
+type = "uniform"
+"#
+        )
+    }
+
+    /// mode "1": 5 B/entry, position-only (no stored keys).
+    fn tiered_toml_mode1(num_entries: u64, tiered_line: &str) -> String {
+        tiered_toml_mode(num_entries, tiered_line, "1", 5, "packed_lo8_hi32", false)
+    }
+
+    #[test]
+    fn tiered_sa_allows_fewer_entries_than_full() {
+        // num_entries = 5 < 2*l_pac+1 = 9, authorized by tiered = true.
+        let m = Meta::from_toml_str(&tiered_toml(5, "tiered = true")).unwrap();
+        assert_eq!(m.sa.tiered, Some(true));
+        assert_eq!(m.sa.l_pac, Some(4));
+    }
+
+    #[test]
+    fn non_tiered_rejects_fewer_entries() {
+        // Same but without the tiered flag: a short full SA is corruption.
+        assert!(Meta::from_toml_str(&tiered_toml(5, "")).is_err());
+    }
+
+    #[test]
+    fn num_entries_above_max_rejected_even_when_tiered() {
+        // 11 > 2*l_pac+1 = 9 is impossible (the doubled text has 9 suffixes).
+        assert!(Meta::from_toml_str(&tiered_toml(11, "tiered = true")).is_err());
+    }
+
+    // The same tiered `num_entries` invariants must hold for mode "1" — the
+    // validation is mode-independent, so cover it across both memory modes.
+
+    #[test]
+    fn tiered_sa_allows_fewer_entries_than_full_mode1() {
+        let m = Meta::from_toml_str(&tiered_toml_mode1(5, "tiered = true")).unwrap();
+        assert_eq!(m.sa.tiered, Some(true));
+        assert_eq!(m.sa.l_pac, Some(4));
+        assert_eq!(m.sa.mode, "1");
+        assert_eq!(m.sa.stored_keys, Some(false));
+    }
+
+    #[test]
+    fn non_tiered_rejects_fewer_entries_mode1() {
+        assert!(Meta::from_toml_str(&tiered_toml_mode1(5, "")).is_err());
+    }
+
+    #[test]
+    fn num_entries_above_max_rejected_even_when_tiered_mode1() {
+        assert!(Meta::from_toml_str(&tiered_toml_mode1(11, "tiered = true")).is_err());
+    }
+
+    #[test]
+    fn tiered_without_l_pac_rejected() {
+        // tiered=true with no l_pac is unverifiable and must be rejected (the
+        // num_entries bounds are all defined relative to l_pac). Drop the
+        // `l_pac = 4` line from an otherwise-valid tiered mode-2 meta.
+        let toml = tiered_toml(5, "tiered = true").replace("l_pac = 4\n", "");
+        assert!(Meta::from_toml_str(&toml).is_err());
     }
 }

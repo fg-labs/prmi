@@ -27,6 +27,21 @@ pub struct MaskConfig {
     /// Source path of the BED file used to build `mask_bed`, stored for
     /// provenance in the `.meta` TOML. `None` when no BED was provided.
     pub mask_bed_path: Option<std::path::PathBuf>,
+    /// If `Some(intervals)`, build a *tiered* (position-filtered) `.sa`:
+    /// retain ONLY suffix-array entries whose forward reference coordinate
+    /// falls in one of these intervals (0-based, half-open, sorted, merged).
+    ///
+    /// This is the opposite polarity of [`MaskConfig::mask_bed`] — a KEEP-mask
+    /// — and, unlike `mask_bed` (which narrows only the RMI training pairs), it
+    /// filters the `.sa` file ITSELF so the on-disk suffix array shrinks to the
+    /// keep-set (Design Z). The full genome text/`.pac` is unchanged, so
+    /// `match_len` is still computed against real genome bases and SA positions
+    /// remain native genome coordinates. The keep-set is applied
+    /// RC-symmetrically to the doubled `[Fwd||RC]` text via [`keep_doubled_pos`].
+    /// `None` = the normal full build.
+    pub keep_bed: Option<Vec<BedInterval>>,
+    /// Source path of the BED used to build `keep_bed`, for `.meta` provenance.
+    pub keep_bed_path: Option<std::path::PathBuf>,
 }
 
 /// A single half-open reference interval `[start, end)` from a BED file.
@@ -124,6 +139,43 @@ pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
     }
 
     Ok(out)
+}
+
+/// Decide whether a doubled-text suffix-array position should be RETAINED by a
+/// tiered keep-mask (Design Z).
+///
+/// `pos` is a position in the doubled `[Fwd||RC]+sentinel` coordinate space
+/// (`0..=2*l_pac`); `l_pac` is the forward genome length. The forward reference
+/// coordinate is recovered as:
+/// - `pos < l_pac`            → forward strand, coordinate `pos`;
+/// - `l_pac <= pos < 2*l_pac` → reverse strand, coordinate `2*l_pac - 1 - pos`;
+/// - `pos == 2*l_pac`         → the sentinel/empty-suffix row, always kept;
+/// - `pos > 2*l_pac`          → out of range; rejected (fail closed).
+///
+/// Testing the *forward* coordinate against the keep-set for BOTH strands makes
+/// the mask RC-symmetric: a forward position `p` and its reverse image
+/// `2*l_pac - 1 - p` are kept together, which the RC-span/zigzag search logic
+/// relies on. Returns `true` to keep the entry.
+#[inline]
+pub fn keep_doubled_pos(keep: &[BedInterval], pos: u64, l_pac: u64) -> bool {
+    let doubled = match l_pac.checked_mul(2) {
+        Some(v) => v,
+        None => return false,
+    };
+    let fwd_coord = if pos < l_pac {
+        pos
+    } else if pos < doubled {
+        doubled - 1 - pos
+    } else if pos == doubled {
+        // Sentinel/empty-suffix row: always retained so the SA's terminator
+        // semantics (and the doubled-coordinate invariants) are preserved.
+        return true;
+    } else {
+        // Out-of-range doubled coordinate: reject rather than silently retain a
+        // malformed position.
+        return false;
+    };
+    covered_by_bed(keep, fwd_coord)
 }
 
 /// Return `true` if position `p` is covered by any sorted, half-open interval.
