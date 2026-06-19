@@ -160,6 +160,83 @@ fn present_anchor_discriminates_served_from_off_keep() {
     assert!(full.present_anchor(&off_then_served, &bases, PacEncoding::Unpacked));
 }
 
+/// The any-window gate (`present_anchor_any`, Design-Z item 6) recovers a
+/// boundary read that the first-window `present_anchor` mis-routes: a read whose
+/// 5' 32-mer starts just BEFORE the keep interval (so its suffix-start is dropped
+/// from the tiered SA → first-window miss) but which extends INTO the keep-set
+/// (a later window's suffix-start is retained → any-window hit). A fully-off-keep
+/// read still misses under both.
+#[test]
+fn present_anchor_any_recovers_boundary_read() {
+    let dir = tempdir().unwrap();
+    let bases = random_bases(8192, 0x5EED);
+    let keep = vec![BedInterval {
+        start: 2048,
+        end: 6144,
+    }];
+    let z_p = dir.path().join("z.prmi");
+    build(&bases, Some(keep), &z_p);
+    let z = LearnedIndex::open(&z_p).unwrap();
+    let e = PacEncoding::Unpacked;
+
+    // Independent oracle: scan every N-free 32-mer window via mem_search (a
+    // different code path than present_anchor_any's internal loop) and report
+    // whether any occurs. present_anchor_any must agree with it on every read.
+    let any_window_oracle = |read: &[u8]| -> bool {
+        const K: usize = 32;
+        let mut s = 0usize;
+        'w: while s + K <= read.len() {
+            for j in 0..K {
+                if read[s + j] >= 4 {
+                    s += j + 1;
+                    continue 'w;
+                }
+            }
+            if z.mem_search(&read[s..s + K], &bases, e).match_len as usize >= K {
+                return true;
+            }
+            s += 1;
+        }
+        false
+    };
+
+    // Boundary read [2020, 2080): the first 32-mer starts at 2020 (< 2048, not
+    // kept → first-window miss), but the window at read-offset 28 starts at 2048
+    // (kept → any-window hit).
+    let boundary = &bases[2020..2080];
+    assert!(
+        !z.present_anchor(boundary, &bases, e),
+        "first-window gate mis-routes the boundary read"
+    );
+    assert!(
+        z.present_anchor_any(boundary, &bases, e),
+        "any-window gate recovers the boundary read"
+    );
+
+    // A served read (interior to the keep-set) is present under both gates.
+    let served = &bases[3000..3060];
+    assert!(z.present_anchor(served, &bases, e));
+    assert!(z.present_anchor_any(served, &bases, e));
+
+    // A fully off-keep read (every window's suffix-start dropped) misses both.
+    let off = &bases[256..316];
+    assert!(!z.present_anchor(off, &bases, e));
+    assert!(
+        !z.present_anchor_any(off, &bases, e),
+        "a fully off-keep read is not recoverable by scanning windows"
+    );
+
+    // present_anchor_any agrees with the independent any-window oracle on all
+    // three reads (cross-checks the gate against a separate mem_search scan).
+    for r in [boundary, served, off] {
+        assert_eq!(
+            z.present_anchor_any(r, &bases, e),
+            any_window_oracle(r),
+            "present_anchor_any must match the independent any-window oracle"
+        );
+    }
+}
+
 /// Per-SMEM genome positions: decode each occurrence in `[k, k+occ)` from its
 /// doubled-coordinate SA position to a forward genome coordinate
 /// (`p < l_pac ? p : 2*l_pac-1-p`). Native coords means these must match the

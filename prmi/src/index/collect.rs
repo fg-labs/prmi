@@ -334,6 +334,40 @@ impl LearnedIndex {
         }
     }
 
+    /// Richer dispatch-gate candidate (Design-Z item 6): does ANY full 32-mer
+    /// window of the read occur in this index, not just the first N-free one?
+    ///
+    /// [`present_anchor`](Self::present_anchor) inspects only the leading N-free
+    /// window, so it mis-routes a servable read to the fallback whenever that 5'
+    /// window falls outside the keep-set — a read that starts just before a target
+    /// (capture, random starts), or one with a variant/sequencing error in its
+    /// first 32 bp. This scans every N-free window and returns `true` on the first
+    /// hit, recovering those reads.
+    ///
+    /// Cost: up to `read.len() - 31` locates on a truly-absent read (vs ≈1 for
+    /// `present_anchor`), so it trades pre-reject speed for served fraction. It is
+    /// the exact upper bound on what an any-window/bloom gate could serve, and is
+    /// measured against `present_anchor` (the `z_gate_misroute` example) to decide
+    /// whether the richer gate is worth adopting; `present_anchor` stays the default.
+    pub fn present_anchor_any(&self, read: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
+        const K: usize = 32;
+        let mut start = 0usize;
+        'windows: while start + K <= read.len() {
+            // Reject a window with any N by jumping past the offending base.
+            for j in 0..K {
+                if read[start + j] >= 4 {
+                    start += j + 1;
+                    continue 'windows;
+                }
+            }
+            if self.mem_search(&read[start..start + K], pac, enc).match_len as usize >= K {
+                return true;
+            }
+            start += 1;
+        }
+        false
+    }
+
     /// Within-read two-stage sort (port of cpp:1833-1850, restricted to one rid).
     /// Stage 1 is the per-rid restriction of the global `compare_smem`
     /// (`m ASC, n DESC`); stage 2 is the per-rid `ks_introsort(mem_intv1_learned)`
