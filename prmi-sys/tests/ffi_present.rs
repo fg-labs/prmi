@@ -5,7 +5,7 @@
 
 use prmi::train::build_sidecar_with_config;
 use prmi::train::config::{MemoryMode, TrainerConfig};
-use prmi_sys::{prmi_close, prmi_open, prmi_present};
+use prmi_sys::{prmi_close, prmi_l_pac, prmi_open, prmi_present};
 use std::ffi::CString;
 use std::ptr;
 
@@ -43,6 +43,11 @@ fn present_anchor_in_reference_returns_one() {
     let (dir, cprefix, pac, n) = fixture();
     let mut handle = ptr::null_mut();
     assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+
+    // Pin `prmi_l_pac` at the FFI boundary: a valid handle reports the reference
+    // base count, and a NULL handle returns the `0` sentinel.
+    assert_eq!(unsafe { prmi_l_pac(handle as *const _) }, n);
+    assert_eq!(unsafe { prmi_l_pac(ptr::null()) }, 0);
 
     // A 40-base ACGT-repeat read: its leading 32-mer occurs in the ACGT×128 ref.
     let on: Vec<u8> = (0u64..40).map(|i| (i % 4) as u8).collect();

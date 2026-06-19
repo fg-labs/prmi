@@ -187,6 +187,30 @@ pub unsafe extern "C" fn prmi_sa_num(handle: *const prmi_index_t) -> size_t {
     unsafe { Handle::as_ref(handle) }.idx.sa_num() as size_t
 }
 
+/// Reference length (`l_pac`, forward-strand base count) the sidecar was built
+/// against, as recorded in its metadata. A consumer validates that a sidecar
+/// belongs to the loaded reference by comparing this to the FM-index `l_pac` —
+/// the genome-identity check that a tiered (filtered-SA) sidecar needs, since
+/// such a sidecar's `sa_num` is intentionally smaller than `2*l_pac+1`.
+///
+/// # Returns
+/// `l_pac` for a valid handle; `0` for a NULL handle, or if the fenced metadata
+/// read panics (`l_pac()` is infallible, so the panic path is defensive only).
+///
+/// # Safety
+/// `handle` must be a valid handle from `prmi_open`, or NULL (returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn prmi_l_pac(handle: *const prmi_index_t) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    // `l_pac()` is an infallible metadata read, but fence it anyway so no panic
+    // can cross the FFI boundary; a panic falls back to the same `0` sentinel as
+    // the NULL-handle case.
+    let h = unsafe { Handle::as_ref(handle) };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.idx.l_pac())).unwrap_or(0)
+}
+
 /// Whether the loaded sidecar carries an inverse suffix array (`.isa`), enabling
 /// the `prmi_isa_at` launch hint / `mem_search` no-search fast path. Returns 1 if
 /// present, else 0 (also 0 for a NULL handle or an shm-opened index, which does
