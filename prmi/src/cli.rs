@@ -67,7 +67,8 @@ pub enum Cmd {
         /// byte-identical for reads served from the keep-set and positions
         /// remain native genome coordinates. Unlike --mask-bed (which only
         /// narrows the RMI training pairs), this shrinks the on-disk `.sa`.
-        /// Incompatible with --with-isa (the ISA hint needs the full SA).
+        /// Combine with --with-isa to also emit a sparse tiered ISA (the launch
+        /// hint restricted to the kept positions).
         #[arg(long, value_name = "PATH")]
         keep_bed: Option<PathBuf>,
         /// Use a BED file as a training-weight prior. Training pairs whose SA
@@ -307,16 +308,9 @@ impl Cli {
                     prior_fastq_histogram.as_deref(),
                 )?;
 
-                // Guard: a tiered keep-mask cannot coexist with --with-isa (the
-                // ISA launch hint requires the full, unfiltered SA). This is a
-                // user-input violation, so preserve the crate's `InvalidInput`
-                // categorization rather than a generic error wrapper.
-                if keep_bed.is_some() && with_isa {
-                    return Err(crate::Error::InvalidInput {
-                        detail: "--keep-bed (tiered .sa) is incompatible with --with-isa".into(),
-                    }
-                    .into());
-                }
+                // --keep-bed + --with-isa now builds a SPARSE tiered ISA over the
+                // kept positions (see train::build_sidecar_core), so the two are
+                // no longer mutually exclusive.
 
                 let mask = crate::train::mask_config_from_cli(
                     no_mask_n_runs,

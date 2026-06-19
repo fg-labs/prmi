@@ -231,8 +231,10 @@ pub unsafe extern "C" fn prmi_has_isa(handle: *const prmi_index_t) -> c_int {
 /// `*out_sa_index`. This is the exact launch hint to feed back as `est_hint` to
 /// `prmi_mem_search` (BWA-MEME's `ref2sa`).
 ///
-/// Returns 0 on success; `-1` null handle/out-ptr, `-2` `refpos >= sa_num`,
-/// `-5` the loaded sidecar has no `.isa` (build with `prmi build --with-isa`).
+/// Returns 0 on success; `-1` null handle/out-ptr, `-2` `refpos` has no
+/// inverse-SA entry (out of range for a dense ISA, or not in the keep-set for a
+/// sparse/tiered ISA), `-3` internal panic, `-5` the loaded sidecar has no
+/// `.isa` (build with `prmi build --with-isa`).
 ///
 /// # Safety
 /// `handle` valid or NULL; `out_sa_index` writable on success.
@@ -252,17 +254,28 @@ pub unsafe extern "C" fn prmi_isa_at(
         set_last_error("prmi_isa_at: sidecar has no .isa (build with --with-isa)");
         return -5;
     }
-    if refpos >= h.idx.sa_num() {
-        set_last_error("prmi_isa_at: refpos out of range");
-        return -2;
+    // isa_at returns None when refpos is out of range (dense) or not in the
+    // keep-set (sparse/tiered). Either way there is no launch hint here; report
+    // not-found rather than indexing out of bounds. A tiered ISA's valid refpos
+    // space is the genome (up to 2*l_pac), NOT sa_num (the kept-entry count), so
+    // we cannot bound-check against sa_num — isa_at does the right check. Wrapped
+    // in catch_unwind so a panic (e.g. the sparse reader's bounds assert) can
+    // never unwind across the extern "C" boundary.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.idx.isa_at(refpos)));
+    match result {
+        Ok(Some(sa_index)) => {
+            unsafe { *out_sa_index = sa_index };
+            0
+        }
+        Ok(None) => {
+            set_last_error("prmi_isa_at: refpos has no inverse-SA entry (out of range or not in keep-set)");
+            -2
+        }
+        Err(_) => {
+            set_last_error("prmi_isa_at: internal panic");
+            -3
+        }
     }
-    // has_isa() is true and refpos < sa_num (== isa num_entries), so isa_at is Some.
-    let sa_index = h
-        .idx
-        .isa_at(refpos)
-        .expect("isa_at in range with .isa loaded");
-    unsafe { *out_sa_index = sa_index };
-    0
 }
 
 /// Whether SA-probe counting is compiled in: `1` if `prmi` was built with the

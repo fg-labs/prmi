@@ -349,16 +349,32 @@ fn build_sidecar_core(
 
     // .isa — optional inverse-suffix-array sidecar (the ISA launch hint). Built
     // directly from the SA permutation; independent of the `.sa` memory mode.
-    // A position-filtered `.sa` (Design Z) breaks the ISA's full-SA invariant
-    // (`inv[p]` is undefined for dropped positions, and its entry count would no
-    // longer match `sa_num`), so the ISA is skipped under a keep-mask — the
-    // search path already treats it as an optional launch hint.
-    if config.with_isa && keep.is_none() {
-        crate::sidecar::isa_file::write_isa_file(&paths.isa, &sa)?;
-    } else if config.with_isa {
-        log::warn!(
-            "--with-isa ignored: the ISA launch hint is unavailable for a tiered (keep-masked) .sa"
-        );
+    if config.with_isa {
+        match keep {
+            // Full index: dense inverse SA, indexed by reference position.
+            None => crate::sidecar::isa_file::write_isa_file(&paths.isa, &sa)?,
+            // Tiered (Design Z): a dense refpos-indexed ISA would be genome-scale
+            // even for a small keep-set. Instead emit a SPARSE ISA over exactly
+            // the kept positions, mapping each to its COMPACTED `.sa` rank (the
+            // rank space the tiered model predicts). The compacted rank is
+            // assigned in the SAME lex-order filtered scan the `.sa` write below
+            // uses, so the two agree; pairs are then sorted by refpos for the
+            // reader's binary search. Present reads' seed positions are in the
+            // keep-set by definition, so the launch-hint fast path applies; an
+            // off-keep position simply misses and falls back to a cold launch.
+            Some(_) => {
+                let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(num_sa_entries as usize);
+                let mut compacted: u64 = 0;
+                for &pos in sa.iter() {
+                    if keep_pos(pos) {
+                        pairs.push((pos, compacted));
+                        compacted += 1;
+                    }
+                }
+                pairs.sort_unstable_by_key(|&(refpos, _)| refpos);
+                crate::sidecar::isa_file::write_tiered_isa_file(&paths.isa, &pairs)?;
+            }
+        }
     }
 
     // .sa — write the retained genome-region entries in the requested memory mode.
