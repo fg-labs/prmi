@@ -22,6 +22,7 @@ use crate::sidecar::magic::{FORMAT_VERSION, META_MAGIC};
 use crate::sidecar::meta::{Meta, Priors, Prmi, Ref, RmiSpec, Sa};
 use crate::sidecar::model_file::{ModelFileWriter, ModelLayer};
 use crate::sidecar::sa_file::{SaFileWriter, BPE_MODE2};
+use rayon::prelude::*;
 use crate::sidecar::SidecarPaths;
 use crate::train::config::{MemoryMode, TrainerConfig};
 use crate::train::mask::{MaskConfig, NBitmap};
@@ -363,15 +364,18 @@ fn build_sidecar_core(
             // keep-set by definition, so the launch-hint fast path applies; an
             // off-keep position simply misses and falls back to a cold launch.
             Some(_) => {
-                let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(num_sa_entries as usize);
-                let mut compacted: u64 = 0;
-                for &pos in sa.iter() {
-                    if keep_pos(pos) {
-                        pairs.push((pos, compacted));
-                        compacted += 1;
-                    }
-                }
-                pairs.sort_unstable_by_key(|&(refpos, _)| refpos);
+                // Kept positions in SA (lex) order; an entry's index in this
+                // filtered sequence IS its compacted `.sa` rank (the `.sa` write
+                // below filters `sa` in the same order). Parallelise the scan
+                // (keep_pos is a per-entry binary search); rayon's `collect`
+                // preserves order, so the ranks match the serial result exactly.
+                let kept: Vec<u64> = sa.par_iter().copied().filter(|&p| keep_pos(p)).collect();
+                let mut pairs: Vec<(u64, u64)> = kept
+                    .par_iter()
+                    .enumerate()
+                    .map(|(rank, &refpos)| (refpos, rank as u64))
+                    .collect();
+                pairs.par_sort_unstable_by_key(|&(refpos, _)| refpos);
                 crate::sidecar::isa_file::write_tiered_isa_file(&paths.isa, &pairs)?;
             }
         }
@@ -389,11 +393,23 @@ fn build_sidecar_core(
             w.finish()?;
         }
         MemoryMode::Mode2 => {
-            // Position + 32-mer key, 13 B/entry.
+            // Position + 32-mer key, 13 B/entry. `key_for_position_2x` (a 32-base
+            // window read per entry) is the CPU cost; the writer is a sequential
+            // BufWriter. Compute keys for each chunk's kept entries in parallel
+            // (rayon `collect` preserves order), then write the chunk in order.
+            // Chunking bounds peak memory to one chunk of (pos, key) pairs while
+            // keeping all cores busy — the dominant mode-2 build cost at scale.
+            const SA_KEY_CHUNK: usize = 1 << 22; // ~4M entries (~64 MB of pairs)
             let mut w = SaFileWriter::create_with_mode(&paths.sa, num_sa_entries, BPE_MODE2)?;
-            for &pos in sa.iter().filter(|&&pos| keep_pos(pos)) {
-                let key = key_for_position_2x(pos, &text);
-                w.write_entry_with_key(pos, key)?;
+            for chunk in sa.chunks(SA_KEY_CHUNK) {
+                let entries: Vec<(u64, u64)> = chunk
+                    .par_iter()
+                    .filter(|&&pos| keep_pos(pos))
+                    .map(|&pos| (pos, key_for_position_2x(pos, &text)))
+                    .collect();
+                for (pos, key) in entries {
+                    w.write_entry_with_key(pos, key)?;
+                }
             }
             w.finish()?;
         }

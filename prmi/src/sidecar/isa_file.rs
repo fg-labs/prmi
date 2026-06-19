@@ -41,6 +41,7 @@
 
 use crate::error::{Error, Result};
 use crate::sa::{pack_position, unpack_position, BYTES_PER_PACKED_ENTRY};
+use rayon::prelude::*;
 use crate::sidecar::magic::{FORMAT_VERSION, ISA_MAGIC};
 use byteorder::{ByteOrder, LittleEndian};
 use memmap2::{Mmap, MmapMut};
@@ -104,11 +105,38 @@ pub fn write_isa_file(path: &Path, sa: &[u64]) -> Result<()> {
 
     // Pack inv[p] = i directly: for each sorted index i at reference position
     // p = sa[i], store the 5-byte SA index i at body offset p*5.
+    //
+    // Parallel scatter. `sa` MUST be a permutation of [0, n) — this is the
+    // inverse-SA contract and the safety-critical invariant here: distinctness
+    // (not just the range bound) is what makes the concurrent raw-pointer writes
+    // race-free, since every `p = sa[i]` then targets a disjoint, non-overlapping
+    // 5-byte range. A big win at genome scale, where the serial random-write over
+    // a multi-GB mmap is the dominant `--with-isa` build cost.
     let body = &mut mmap[ISA_FILE_HEADER_BYTES..];
-    for (i, &p) in sa.iter().enumerate() {
-        let off = (p as usize) * BYTES_PER_PACKED_ENTRY;
-        body[off..off + BYTES_PER_PACKED_ENTRY].copy_from_slice(&pack_position(i as u64));
-    }
+    let body_addr = body.as_mut_ptr() as usize;
+    sa.par_iter().enumerate().for_each(|(i, &p)| {
+        let p = p as usize;
+        // Runtime (not debug-only) bound: the unsafe write below has no slice
+        // bounds check, so a malformed (non-permutation) SA must fault loudly
+        // here rather than write out of bounds in release. The serial version
+        // this replaced got that panic for free from slice indexing; one compare
+        // per entry is negligible against the write it guards.
+        assert!(p < n, "SA value {p} out of range (n={n}); SA must be a permutation");
+        let off = p * BYTES_PER_PACKED_ENTRY;
+        let packed = pack_position(i as u64);
+        // SAFETY: `p < n` (SA permutation) so `[off, off + 5)` lies within the
+        // `n * 5`-byte body; offsets are distinct across `i`, so no two threads
+        // write overlapping bytes. `body_addr` aliases the live `body` mmap for
+        // the duration of this parallel region (joined before `body` is used
+        // again or flushed).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                packed.as_ptr(),
+                (body_addr as *mut u8).add(off),
+                BYTES_PER_PACKED_ENTRY,
+            );
+        }
+    });
 
     mmap.flush().map_err(io)?;
     Ok(())
