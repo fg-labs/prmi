@@ -14,6 +14,7 @@ pub mod fasta;
 pub mod histogram;
 pub mod index;
 pub mod inspect;
+pub mod keepset;
 pub mod pac;
 pub mod sa;
 pub mod sidecar;

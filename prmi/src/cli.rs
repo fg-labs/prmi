@@ -174,6 +174,43 @@ pub enum Cmd {
         #[arg(long, default_value_t = 1)]
         threads: usize,
     },
+    /// Build a Design-Z keep-set BED from a reference + per-contig target BED.
+    ///
+    /// Emits a FLAT-coordinate keep-set (targets kept whole + the start
+    /// positions of forward/reverse-complement k-mer homologs of target k-mers
+    /// under the count cap) suitable for `prmi build --keep-bed`. The output is
+    /// in prmi's concatenated-genome coordinate space, NOT per-contig.
+    Keepset {
+        /// Reference FASTA (same contig order `prmi build` will use).
+        #[arg(long, value_name = "PATH")]
+        r#ref: PathBuf,
+        /// Per-contig BED3 of target regions (chrom must match FASTA names).
+        #[arg(long, value_name = "PATH")]
+        targets: PathBuf,
+        /// Output keep-set BED path (`-` for stdout).
+        #[arg(short = 'o', long, value_name = "PATH", default_value = "-")]
+        out: PathBuf,
+        /// k-mer length for homology detection (1..=32). Default provisional
+        /// pending the item-3 benchmark.
+        #[arg(short = 'k', long, default_value_t = 32)]
+        k: usize,
+        /// Drop target k-mers whose total reference count exceeds this cap;
+        /// `0` = uncapped (keep every homolog).
+        #[arg(long, default_value_t = 0)]
+        max_occ: u64,
+        /// Extend each kept run by this many bp on both sides before merging.
+        #[arg(long, default_value_t = 0)]
+        flank: u64,
+        /// Emit compact BED12 (blocks) instead of one BED3 line per run.
+        #[arg(long, default_value_t = false)]
+        bed12: bool,
+        /// BED12 only: maximum blocks packed per line.
+        #[arg(long, default_value_t = 1000)]
+        blocks_per_line: usize,
+        /// Cosmetic chrom label for the flat-coordinate output BED.
+        #[arg(long, default_value = "genome")]
+        chrom_label: String,
+    },
 }
 
 /// Subcommands for `prmi shm`.
@@ -364,6 +401,86 @@ impl Cli {
                 );
                 let n = crate::verify_sa::sa_verify_fasta(&r#ref, threads)?;
                 println!("OK: {n} SA entries certified against the lexicographic oracle");
+                Ok(())
+            }
+            Cmd::Keepset {
+                r#ref,
+                targets,
+                out,
+                k,
+                max_occ,
+                flank,
+                bed12,
+                blocks_per_line,
+                chrom_label,
+            } => {
+                // Validate up front (before reading the reference, which may be
+                // whole-genome) so an invalid knob fails fast with a clear error.
+                // These are user-input violations, so preserve the crate's
+                // `InvalidInput` categorization (matching the --with-isa guard
+                // above) rather than a generic anyhow error.
+                if !(1..=32).contains(&k) {
+                    return Err(crate::Error::InvalidInput {
+                        detail: format!("--k must be in 1..=32, got {k}"),
+                    }
+                    .into());
+                }
+                if blocks_per_line < 1 {
+                    return Err(crate::Error::InvalidInput {
+                        detail: format!("--blocks-per-line must be >= 1, got {blocks_per_line}"),
+                    }
+                    .into());
+                }
+                let opts = crate::keepset::KeepsetOptions {
+                    k,
+                    max_occ,
+                    flank,
+                    format: if bed12 {
+                        crate::keepset::KeepsetFormat::Bed12
+                    } else {
+                        crate::keepset::KeepsetFormat::Bed3
+                    },
+                    blocks_per_line,
+                    chrom_label,
+                };
+                // Stream to stdout for "-", else to the named file.
+                let ctx = || {
+                    format!(
+                        "building keep-set from {} + {}",
+                        r#ref.display(),
+                        targets.display()
+                    )
+                };
+                // Flush the BufWriter explicitly in each branch: `drop` swallows
+                // flush errors, so a disk-full / broken-pipe on the final flush
+                // would otherwise print success and return Ok.
+                let stats = if out == std::path::Path::new("-") {
+                    let stdout = std::io::stdout();
+                    let mut w = std::io::BufWriter::new(stdout.lock());
+                    let stats = crate::keepset::build_keepset(&r#ref, &targets, &opts, &mut w)
+                        .with_context(ctx)?;
+                    std::io::Write::flush(&mut w).context("flushing keep-set output to stdout")?;
+                    stats
+                } else {
+                    let f = std::fs::File::create(&out)
+                        .with_context(|| format!("creating {}", out.display()))?;
+                    let mut w = std::io::BufWriter::new(f);
+                    let stats = crate::keepset::build_keepset(&r#ref, &targets, &opts, &mut w)
+                        .with_context(ctx)?;
+                    std::io::Write::flush(&mut w).with_context(|| {
+                        format!("flushing keep-set output to {}", out.display())
+                    })?;
+                    stats
+                };
+                eprintln!(
+                    "keepset: genome={} bp, {} target intervals -> {} kept runs ({} bp, {:.3}%), {} BED lines",
+                    stats.genome_len,
+                    stats.target_intervals,
+                    stats.kept_runs,
+                    stats.kept_bp,
+                    100.0 * stats.kept_bp as f64 / stats.genome_len.max(1) as f64,
+                    stats.lines_written,
+                );
                 Ok(())
             }
             Cmd::Shm { cmd } => match cmd {
