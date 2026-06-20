@@ -1933,9 +1933,22 @@ pub unsafe extern "C" fn prmi_collect_smems(
             std::slice::from_raw_parts_mut(out as *mut prmi::index::collect::Smem, out_cap as usize)
         }
     };
+    // Reuse a per-thread scratch across calls so the per-read SMEM/reseed buffers are
+    // allocated once per worker thread, not once per read. `collect_smems_into` clears
+    // the scratch on entry, so this is byte-identical to `collect_smems`; it only
+    // amortizes the two allocations over the millions of per-read calls the consumer
+    // makes. Each C worker thread that calls `prmi_collect_smems` gets its own scratch
+    // (thread-local), preserving the entrypoint's thread-safety.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<prmi::index::collect::CollectScratch> =
+            std::cell::RefCell::new(prmi::index::collect::CollectScratch::new());
+    }
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.idx
-            .collect_smems(r, rid, &copts, pac_slice, enc, out_slice)
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            h.idx
+                .collect_smems_into(r, rid, &copts, pac_slice, enc, out_slice, &mut scratch)
+        })
     }));
     match res {
         Ok(Ok(n)) => {
