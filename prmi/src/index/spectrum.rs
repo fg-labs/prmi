@@ -2115,18 +2115,50 @@ impl LearnedIndex {
         if hi - lo >= min_intv {
             return span_max;
         }
-        // Walk DOWN one base at a time, carrying `[lo, hi)`. The first `L` reaching
-        // `min_intv` is `L*`.
-        let mut l = span_max;
-        while l > anchor_len {
-            l -= 1;
-            expand(l, &mut lo, &mut hi);
-            if hi - lo >= min_intv {
-                return l;
+        // Neighbor-LCP scan (replaces the per-length walk-down). Span-only: occ(L)
+        // changes only at neighbor LCPs; extend the larger-LCP side until occ reaches
+        // min_intv. Byte-identical span to the walk (proven vs the independent RC
+        // oracle on the repeats/ties corpus); O(min_intv) probes vs O(span_max-L*).
+        // Neighbors outside the span_max interval share < span_max, so cap LCPs at
+        // span_max-1.
+        let lcap = (span_max as u32).saturating_sub(1);
+        let lcp_lo = |lo: u64| {
+            if lo > 0 {
+                self.lcp_at(q, q_key, lo - 1, pac, enc, l_pac).min(lcap)
+            } else {
+                0
+            }
+        };
+        let lcp_hi = |hi: u64| {
+            if hi < sa_num {
+                self.lcp_at(q, q_key, hi, pac, enc, l_pac).min(lcap)
+            } else {
+                0
+            }
+        };
+        let mut llo = lcp_lo(lo);
+        let mut lhi = lcp_hi(hi);
+        let mut l_star = 0u32;
+        while hi - lo < min_intv {
+            if llo == 0 && lhi == 0 {
+                break;
+            }
+            if llo >= lhi {
+                l_star = llo;
+                lo -= 1;
+                llo = lcp_lo(lo);
+            } else {
+                l_star = lhi;
+                hi += 1;
+                lhi = lcp_hi(hi);
             }
         }
-        // Even the anchor span fails the threshold -> floor at the anchor.
-        anchor_len
+        let l_star = l_star as u64;
+        if hi - lo >= min_intv && l_star > anchor_len {
+            l_star
+        } else {
+            anchor_len
+        }
     }
 
     /// `min_intv`-truncated backward reseed returning the **full interval** — the
@@ -2429,46 +2461,64 @@ impl LearnedIndex {
             Some(v) if maximal.occ > 0 && maximal.sa_start < sa_num && v <= sa_num => v,
             _ => return zero,
         };
-        // Carry the forward interval outward as the length shrinks (occ grows).
-        let mut lo = maximal.sa_start;
-        let mut hi = hi0;
-        let mut best_len = 0usize;
-        let mut l = lmax;
         // Hoist the full-32 query key out of the per-length-step carry: the keyed
         // comparator masks it to `p.len() == l`, so reusing it is byte-identical to
         // re-tokenizing `query[..l]` (bases beyond `l` are masked off; for `l > 32`
         // the >32 tail reads the `p` slice). Drops a `tokenize_32mer` per length step.
         let q_key = tokenize_32mer(query, query.len().min(KMER_LEN));
-        while l > 1 {
-            l -= 1;
-            let p = &query[..l];
-            // Expand outward to interval(l), capped at min_intv (mirrors the RC walk).
-            while lo > 0
-                && hi - lo < min_intv
-                && self.shares_prefix(p, q_key, lo - 1, pac, enc, l_pac)
-            {
-                lo -= 1;
+        // Neighbor-LCP scan (replaces the O(lmax-L*) per-length walk). occ(L) changes
+        // only at the LCP of `query` with the SA suffixes just outside the interval;
+        // extend the larger-LCP side until occ >= min_intv. L* = the LCP at which occ
+        // first reaches min_intv. Byte-identical L*/interval to the walk (proven vs the
+        // naive oracle on the repeats/ties corpus); O(min_intv) probes vs O(lmax-L*).
+        // Neighbors outside the maximal interval share < lmax, so cap LCPs at lmax-1
+        // (also makes lmax<2 fall through to the zero return, matching the old walk).
+        let lcap = (lmax as u32).saturating_sub(1);
+        let mut lo = maximal.sa_start;
+        let mut hi = hi0;
+        let mut occ = hi - lo;
+        let lcp_lo = |lo: u64| {
+            if lo > 0 {
+                self.lcp_at(query, q_key, lo - 1, pac, enc, l_pac).min(lcap)
+            } else {
+                0
             }
-            while hi < sa_num
-                && hi - lo < min_intv
-                && self.shares_prefix(p, q_key, hi, pac, enc, l_pac)
-            {
-                hi += 1;
+        };
+        let lcp_hi = |hi: u64| {
+            if hi < sa_num {
+                self.lcp_at(query, q_key, hi, pac, enc, l_pac).min(lcap)
+            } else {
+                0
             }
-            if hi - lo >= min_intv {
-                best_len = l; // largest L with occ >= min_intv (occ monotone in L)
+        };
+        let mut llo = lcp_lo(lo);
+        let mut lhi = lcp_hi(hi);
+        let mut best_len = 0u32;
+        if occ >= min_intv {
+            // Caller contract says occ < min_intv; be defensive: the largest L < lmax
+            // with occ(L) >= min_intv is lmax-1 (occ is non-decreasing as L decreases).
+            best_len = lcap;
+        }
+        while occ < min_intv {
+            if llo == 0 && lhi == 0 {
                 break;
             }
+            if llo >= lhi {
+                best_len = llo;
+                lo -= 1;
+                occ += 1;
+                llo = lcp_lo(lo);
+            } else {
+                best_len = lhi;
+                hi += 1;
+                occ += 1;
+                lhi = lcp_hi(hi);
+            }
         }
-        if best_len == 0 {
-            return MemMatch {
-                match_len: 0,
-                sa_start: 0,
-                occ: 0,
-            };
+        if occ < min_intv || best_len == 0 {
+            return zero;
         }
-        // Length-only caller (next_pivot): `L*` is already fixed by the walk;
-        // skip both recovery searches.
+        let best_len = best_len as usize;
         if !want_interval {
             return MemMatch {
                 match_len: best_len as u64,
@@ -2476,13 +2526,6 @@ impl LearnedIndex {
                 occ: 0,
             };
         }
-        // The capped walk stopped expanding the moment width reached `min_intv`, so
-        // the carried `[lo, hi)` is an interior subset of the true length-`L*`
-        // interval. Recover the EXACT boundaries by galloping `find_boundary` out
-        // from that interior seed instead of a cold model-seeded `mem_search` — the
-        // forward analogue of the backward `recover()`. `find_boundary` is
-        // seed-independent, so the boundaries (and thus `occ`) are byte-identical;
-        // the tight seed only removes the model launch and shortens the gallop.
         let p = &query[..best_len];
         let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
         let lower = self.find_boundary(0, sa_num, lo, lo, |mid| {
@@ -3838,6 +3881,42 @@ mod keyed_tests {
         (dir, idx)
     }
 
+    /// Reference with structure a uniform-random reference lacks — so queries hit
+    /// occ ∈ [1, ~12], shared-LCP ties, exactly-min_intv occurrences, and
+    /// occ(maximal) ∈ [2, min_intv): a 30-mer motif ×12, homopolymer runs, a period-6
+    /// tandem ×30, a 40-mer ×5, embedded in a deterministic pseudo-random backbone.
+    fn repeat_corpus() -> Vec<u8> {
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let base: Vec<u8> = (0..4000)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) & 3) as u8
+            })
+            .collect();
+        let mut v = Vec::new();
+        v.extend_from_slice(&base[..1000]);
+        let motif = &base[100..130];
+        for i in 0..12 {
+            v.extend_from_slice(motif);
+            v.extend_from_slice(&base[200 + i * 7..200 + i * 7 + 15]);
+        }
+        v.extend(std::iter::repeat_n(0u8, 40));
+        v.extend(std::iter::repeat_n(2u8, 40));
+        let td = &base[300..306];
+        for _ in 0..30 {
+            v.extend_from_slice(td);
+        }
+        let motif2 = &base[400..440];
+        for i in 0..5 {
+            v.extend_from_slice(motif2);
+            v.extend_from_slice(&base[600 + i * 9..600 + i * 9 + 20]);
+        }
+        v.extend_from_slice(&base[1000..4000]);
+        v
+    }
+
     /// Independent brute-force forward spectrum: for each prefix length `m`,
     /// LINEAR-SCAN every SA entry and take the contiguous run whose suffix has
     /// `query[..m]` as a prefix (scalar compare = ground truth), emitting a step
@@ -4800,6 +4879,97 @@ mod keyed_tests {
         }
     }
 
+    /// Forward truncate == naive oracle on the repeats/ties corpus, BOTH want_interval
+    /// modes, exercising shared-L* ties and occ(maximal) ∈ [2,min_intv).
+    #[test]
+    fn forward_truncate_equals_oracle_on_repeats_both_modes() {
+        let fwd = repeat_corpus();
+        let (_d, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let (mut cases, mut occ_ge2, mut wide) = (0u64, 0u64, 0u64);
+        for start in (0..fwd.len() - 60).step_by(3) {
+            for qlen in [24usize, 48, 100] {
+                if start + qlen > fwd.len() {
+                    continue;
+                }
+                let q = &fwd[start..start + qlen];
+                let maximal = idx.mem_search(q, &fwd, e);
+                if maximal.match_len < 2 {
+                    continue;
+                }
+                for &min_intv in &[2u64, 3, 4, 6, 12] {
+                    if maximal.occ >= min_intv {
+                        continue;
+                    }
+                    if maximal.occ >= 2 {
+                        occ_ge2 += 1;
+                    }
+                    let want = forward_truncate_oracle(&idx, q, maximal, min_intv, &fwd, e);
+                    let got_iv =
+                        idx.forward_truncate_below_maximal(q, maximal, min_intv, true, &fwd, e);
+                    assert_eq!(got_iv, want, "FWD interval != oracle (qlen={qlen} min_intv={min_intv} maximal={maximal:?})");
+                    let got_span =
+                        idx.forward_truncate_below_maximal(q, maximal, min_intv, false, &fwd, e);
+                    assert_eq!(
+                        got_span.match_len, want.match_len,
+                        "FWD span-only L* != oracle (qlen={qlen} min_intv={min_intv})"
+                    );
+                    cases += 1;
+                    if want.occ > min_intv {
+                        wide += 1;
+                    }
+                }
+            }
+        }
+        assert!(cases >= 200, "too few cases {cases}");
+        assert!(
+            occ_ge2 >= 5,
+            "corpus didn't exercise occ(maximal)>=2 ({occ_ge2})"
+        );
+        assert!(
+            wide >= 5,
+            "corpus didn't exercise wide occ(L*)/ties ({wide})"
+        );
+    }
+
+    /// Perf-regression guard: on long-unique matches the OLD walk costs ~2*(lmax-L*)
+    /// probes (hundreds); the neighbor scan is O(min_intv)+recovery. FAILS on the walk,
+    /// PASSES on the scan.
+    #[cfg(feature = "spectrum-probe-count")]
+    #[test]
+    fn forward_truncate_is_o_min_intv_not_o_lmax() {
+        use crate::index::spectrum::probe_count;
+        let mut s: u64 = 0xDEADBEEF12345678;
+        let fwd: Vec<u8> = (0..6000)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((s >> 33) & 3) as u8
+            })
+            .collect();
+        let (_d, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let (mut maxp, mut cases) = (0u64, 0u64);
+        for start in (0..fwd.len() - 200).step_by(31) {
+            let q = &fwd[start..start + 130];
+            let maximal = idx.mem_search(q, &fwd, e);
+            if maximal.match_len < 30 || maximal.occ >= 2 {
+                continue;
+            }
+            probe_count::reset();
+            let _ = idx.forward_truncate_below_maximal(q, maximal, 2, true, &fwd, e);
+            let p = probe_count::get();
+            if p > maxp {
+                maxp = p;
+            }
+            cases += 1;
+        }
+        assert!(cases >= 20, "too few long-unique cases {cases}");
+        assert!(
+            maxp < 80,
+            "forward_truncate still O(lmax-L*): max probes {maxp}"
+        );
+    }
+
     /// Both public RC-span entry points (`mem_search_backward_truncated_span_rc` and
     /// its `..._warmstart` twin) route through `span_rc_walk`, which slices the
     /// caller-supplied `pac`. An undersized `Packed` must fail closed to the anchor
@@ -5419,6 +5589,85 @@ mod keyed_tests {
             assert_eq!(n2, want.len(), "fill must report the total step count");
             assert!(n2 > cap, "this case must overflow the buffer");
         }
+    }
+
+    /// RC span (via the warm-start entry → span_rc_walk) == the independent
+    /// truncated_span_oracle on the repeats/ties corpus, across pivots/anchor_len/min_intv
+    /// (incl. the reseed config occ_count derived from a length-1 anchor, anchor_len=1).
+    #[test]
+    fn span_rc_equals_oracle_on_repeats() {
+        let fwd = repeat_corpus();
+        let (_d, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let (mut cases, mut nontrivial) = (0u64, 0u64);
+        for start in (0..fwd.len() - 140).step_by(3) {
+            let read = &fwd[start..start + 140];
+            for &pivot in &[60usize, 90, 120] {
+                for &anchor_len in &[1u64, 2] {
+                    // length-`anchor_len` forward anchor at the pivot (the reseed anchor)
+                    if pivot + anchor_len as usize > read.len() {
+                        continue;
+                    }
+                    let a = idx.mem_search(&read[pivot..pivot + anchor_len as usize], &fwd, e);
+                    if a.match_len == 0 {
+                        continue;
+                    }
+                    for &min_intv in &[2u64, 3, 4, 6, 12] {
+                        let want = truncated_span_oracle(
+                            &idx, a.sa_start, a.occ, anchor_len, read, pivot, min_intv, &fwd, e,
+                        );
+                        let got = idx.mem_search_backward_truncated_span_rc(
+                            a.occ, anchor_len, read, pivot, min_intv, &fwd, e,
+                        );
+                        assert_eq!(
+                            got,
+                            want,
+                            "RC span != oracle (start={start} pivot={pivot} anchor_len={anchor_len} min_intv={min_intv})"
+                        );
+                        cases += 1;
+                        if got > anchor_len {
+                            nontrivial += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases >= 400, "too few RC cases {cases}");
+        assert!(
+            nontrivial >= 80,
+            "too few RC extensions beyond the floor {nontrivial}"
+        );
+    }
+
+    /// Perf-regression guard: RC walk-down is O(span_max-L*); the neighbor scan is
+    /// O(min_intv). FAILS on the walk, PASSES on the scan.
+    #[cfg(feature = "spectrum-probe-count")]
+    #[test]
+    fn span_rc_is_o_min_intv_not_o_span() {
+        let mut s: u64 = 0xA5A5A5A5C3C3C3C3;
+        let fwd: Vec<u8> = (0..6000)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((s >> 33) & 3) as u8
+            })
+            .collect();
+        let (_d, idx) = build_mode2(&fwd);
+        let e = PacEncoding::Unpacked;
+        let (mut maxp, mut cases) = (0u64, 0u64);
+        for start in (0..fwd.len() - 140).step_by(29) {
+            let read = &fwd[start..start + 140];
+            probe_count::reset();
+            let span = idx.mem_search_backward_span_rc_warmstart(1, 1, read, 120, 2, None, &fwd, e);
+            let p = probe_count::get();
+            if span > 1 {
+                if p > maxp {
+                    maxp = p;
+                }
+                cases += 1;
+            }
+        }
+        assert!(cases >= 20, "too few RC extension cases {cases}");
+        assert!(maxp < 90, "span_rc still O(span_max-L*): max probes {maxp}");
     }
 
     /// Reference-lifted queries extend to full depth and become unique, so they
