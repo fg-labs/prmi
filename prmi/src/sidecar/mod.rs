@@ -4,6 +4,7 @@
 //! On-disk sidecar format: TOML meta + binary `.sa` / `.l1` / `.l2`, plus an
 //! optional `.kmt` k-mer-table accelerator sidecar.
 
+pub mod bloom_file;
 pub mod isa_file;
 pub mod kmt_file;
 pub mod magic;
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 ///
 /// `prefix = "/data/hg38.fa.prmi"` →
 ///   `meta = "/data/hg38.fa.prmi.meta"`, `.sa`, `.l1`, `.l2`, and the optional
-///   `.kmt`.
+///   `.kmt` / `.isa` / `.blm`.
 #[derive(Debug, Clone)]
 pub struct SidecarPaths {
     /// Path to the `.meta` TOML file.
@@ -32,6 +33,8 @@ pub struct SidecarPaths {
     pub kmt: PathBuf,
     /// Path to the optional `.isa` inverse-suffix-array file (ISA launch hint).
     pub isa: PathBuf,
+    /// Path to the optional `.blm` bloom-filter file (any-window dispatch gate).
+    pub bloom: PathBuf,
 }
 
 impl SidecarPaths {
@@ -53,6 +56,7 @@ impl SidecarPaths {
             l2: with(".l2"),
             kmt: with(".kmt"),
             isa: with(".isa"),
+            bloom: with(".blm"),
         }
     }
 }

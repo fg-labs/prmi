@@ -1937,6 +1937,48 @@ impl LearnedIndex {
         bands
     }
 
+    /// Exact membership test for the Design-Z dispatch gate (Lever 2, A2): does the
+    /// FULL `query` window occur in the reference? Returns `true` iff the maximal
+    /// forward match spans all of `query` (`match_len == query.len()`).
+    ///
+    /// This is the exact-but-cheaper alternative to
+    /// [`mem_search`](Self::mem_search)`(query).match_len >= query.len()`, used by
+    /// the [`present_anchor_exact`](super::collect) gate. It computes the SAME
+    /// `match_len` (via [`forward_maximal_len`](Self::forward_maximal_len) — model
+    /// `lookup` + one bounded insertion `find_boundary` + the two neighbour LCP
+    /// compares), but SKIPS `mem_search`'s two interval-recovery gallops
+    /// (`sa_start`/`occ`), which the gate never reads. The verdict is therefore
+    /// byte-identical to the `mem_search` form while paying ~2 fewer bounded
+    /// searches per call — the gate-cost saving the cheap-gate lever targets.
+    /// `false` for an empty query (cannot fully match a zero-length window — but
+    /// the gate only ever passes a full 32-mer window).
+    ///
+    /// With a k-mer table loaded the tabled trace is already the cheap launch, so
+    /// this defers to `mem_search` there (no interval-recovery saving exists on
+    /// that path; the `match_len` is identical either way).
+    pub fn kmer_exists(&self, query: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
+        if query.is_empty() {
+            return false;
+        }
+        // Fail closed on an undersized packed pac, exactly as `mem_search` does:
+        // `forward_maximal_len`'s `fill_doubled_chunk` `.unwrap()`s `pac_base_at`.
+        if let PacEncoding::Packed { num_bases } = enc {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "kmer_exists").is_err() {
+                return false;
+            }
+        }
+        if self.kmt.is_none() {
+            let sa_num = self.sa_num();
+            let l_pac = self.l_pac();
+            let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+            let (match_len, _ip) =
+                self.forward_maximal_len(query, query_key, sa_num, pac, enc, l_pac);
+            return match_len as usize >= query.len();
+        }
+        // Table loaded: the tabled trace IS the cheap launch; reuse `mem_search`.
+        self.mem_search(query, pac, enc).match_len as usize >= query.len()
+    }
+
     /// One-shot maximal exact forward match: the longest prefix of `query` that
     /// occurs in the reference, with its SA interval. Equals the MAXIMAL (deepest)
     /// step of [`forward_spectrum_auto`] — byte-identical by construction.

@@ -126,6 +126,26 @@ pub enum Cmd {
         /// (~+32 GB for hg38). Off by default.
         #[arg(long, default_value_t = false)]
         with_isa: bool,
+        /// Also emit a `.blm` bloom-filter sidecar over the keep-set's 32-mer keys
+        /// (the Design-Z any-window dispatch gate). Meaningful for a tiered
+        /// `--keep-bed` build; the bloom is small (~1.2 B/key at the default fp)
+        /// and cache-resident. Off by default.
+        #[arg(long, default_value_t = false)]
+        with_bloom: bool,
+        /// Target false-positive rate for the `--with-bloom` gate. A false
+        /// positive only costs an extra confirming search (never a wrong verdict),
+        /// so the default 0.01 trades a little gate work for a smaller filter.
+        #[arg(long, default_value_t = 0.01, value_name = "RATE")]
+        bloom_fp_rate: f64,
+        /// Design-Z Lever 3: pad the `--with-bloom` routing key set by this many
+        /// bases on each side of every `--keep-bed` interval, while keeping the
+        /// `.sa` keep-mask TIGHT. Decouples routing (the wider bloom) from seeding
+        /// (the tight SA): recovers capture-boundary / flank-starting reads without
+        /// the SA bloat that padding the keep-bed itself would cause. Requires
+        /// `--with-bloom` and `--keep-bed`. 0 (default) keeps the bloom coupled to
+        /// the keep-set.
+        #[arg(long, default_value_t = 0, value_name = "BP")]
+        routing_pad: u64,
     },
     /// Convert a KMC text-format dump to a prmi u64-key histogram TSV.
     ///
@@ -267,6 +287,9 @@ impl Cli {
                 store_keys,
                 kmer_table_k,
                 with_isa,
+                with_bloom,
+                bloom_fp_rate,
+                routing_pad,
             } => {
                 // Resolve the reference source: exactly one of the positional
                 // FASTA or `--pac`. clap's `conflicts_with` rejects both; here
@@ -333,11 +356,47 @@ impl Cli {
                 } else {
                     crate::train::config::MemoryMode::Mode1
                 };
+                // A bloom gate over a non-tiered (full) index would hold every
+                // 32-mer in the genome — huge and pointless (the first-window gate
+                // is ~always present). Reject it early rather than build a multi-GB
+                // bloom; the gate is for the small tiered on-target index.
+                // CLI guard violations preserve the crate's `InvalidInput` category
+                // (matching the other guarded knobs); `Cli::run` converts it. These
+                // fail fast here, and `build_sidecar_core` re-enforces them for
+                // direct library callers.
+                if with_bloom && keep_bed.is_none() {
+                    return Err(crate::Error::InvalidInput {
+                        detail: "--with-bloom requires --keep-bed: the any-window bloom gate is \
+                                 for a tiered on-target index, not a whole-genome one"
+                            .to_string(),
+                    }
+                    .into());
+                }
+                if with_bloom && !(bloom_fp_rate > 0.0 && bloom_fp_rate < 1.0) {
+                    return Err(crate::Error::InvalidInput {
+                        detail: format!("--bloom-fp-rate must be in (0, 1), got {bloom_fp_rate}"),
+                    }
+                    .into());
+                }
+                // Lever 3: --routing-pad pads the bloom only, so it is meaningless
+                // without --with-bloom (and --with-bloom already requires --keep-bed,
+                // which padding needs). Reject the no-op rather than silently ignore.
+                if routing_pad > 0 && !with_bloom {
+                    return Err(crate::Error::InvalidInput {
+                        detail: "--routing-pad requires --with-bloom: it pads the routing \
+                                 bloom's key set (the .sa keep-mask stays tight)"
+                            .to_string(),
+                    }
+                    .into());
+                }
                 let trainer_config = crate::train::config::TrainerConfig {
                     prior,
                     memory_mode: mem_mode,
                     kmer_table_k,
                     with_isa,
+                    with_bloom,
+                    bloom_fp_rate,
+                    routing_pad,
                     ..Default::default()
                 };
 

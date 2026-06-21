@@ -29,7 +29,9 @@
 //! [80..88)   : u64 l2_len
 //! [88..96)   : u64 kmt_offset  (0 when no `.kmt` is carried)
 //! [96..104)  : u64 kmt_len     (0 when no `.kmt` is carried)
-//! [104..4096): zero padding (reserved)
+//! [104..112) : u64 blm_offset  (0 when no `.blm` is carried)
+//! [112..120) : u64 blm_len     (0 when no `.blm` is carried)
+//! [120..4096): zero padding (reserved)
 //! [4096..)   : concatenated components, each starting on a 4 KiB boundary
 //! ```
 //!
@@ -37,13 +39,16 @@
 //! ensures that each component starts on a page boundary, which is necessary for
 //! callers that want to mmap individual components independently.
 //!
-//! The optional `.kmt` (a 5th component, a forward k-mer table) was added without
-//! bumping the wrapper version: `[88..104)` were specified-zero from the start, so
-//! a `kmt_len == 0` reads as "no table" on both old and new readers. The version
-//! is therefore *intentionally* retained at 3 — do not bump it for `.kmt`. An old
-//! reader simply ignores a carried table; a new reader treats an old (zero) blob
-//! as table-less. The table is a pure accelerator, so either way the result is
-//! correct (see [`LearnedIndex::open_shm`] best-effort loading).
+//! The optional `.kmt` (a 5th component, a forward k-mer table) and `.blm` (a 6th
+//! component, the Design-Z bloom dispatch gate) were added without bumping the
+//! wrapper version: their header slots were specified-zero from the start, so a
+//! `*_len == 0` reads as "not carried" on both old and new readers. The version is
+//! therefore *intentionally* retained at 3 — do not bump it for these optional
+//! components. An old reader simply ignores a carried table/bloom; a new reader
+//! treats an old (zero) blob as lacking them. Both are pure accelerators (the
+//! `.kmt` for forward search; the `.blm` gate confirms every hit with a
+//! `mem_search`), so either way the result is correct (see
+//! [`LearnedIndex::open_shm`] best-effort loading).
 //!
 //! # Cross-process sharing
 //!
@@ -116,6 +121,10 @@ pub struct ShmBlob {
     pub kmt_offset: usize,
     /// Byte length of the optional `.kmt` component (`0` when absent).
     pub kmt_len: usize,
+    /// Byte offset of the optional `.blm` bloom component (`0` when absent).
+    pub blm_offset: usize,
+    /// Byte length of the optional `.blm` bloom component (`0` when absent).
+    pub blm_len: usize,
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
@@ -199,6 +208,21 @@ pub fn write_shm_blob(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
             })
         }
     };
+    // Optional `.blm` bloom dispatch gate (a 6th component). Absent for sidecars
+    // built without `--with-bloom`; carried so shm-loaded indexes get the cheap
+    // first-window bloom gate (Lever 2, A1) too — otherwise a shared index would
+    // silently fall back to the `mem_search` first-window gate. Same NotFound-vs-
+    // real-error handling as `.kmt`.
+    let blm_bytes: Option<Vec<u8>> = match std::fs::read(&paths.bloom) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(Error::Io {
+                path: paths.bloom.clone(),
+                source: e,
+            })
+        }
+    };
 
     // Compute component offsets (each 4 KiB-aligned, starting after the header).
     let meta_offset = HEADER_SIZE; // first component starts right after the header
@@ -207,6 +231,22 @@ pub fn write_shm_blob(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
     let l2_offset = align_up(l1_offset + l1_bytes.len(), COMPONENT_ALIGN);
     let kmt_offset = align_up(l2_offset + l2_bytes.len(), COMPONENT_ALIGN);
     let kmt_len = kmt_bytes.as_ref().map_or(0, |b| b.len());
+    // The `.blm` follows the `.kmt` (or `.l2` when no table is carried). Anchor it
+    // on the actual end of the previous component so a `kmt_len == 0` build packs
+    // the bloom immediately after `.l2`. Sum with `checked_add` so a (pathologically
+    // large) component layout fails closed rather than wrapping `blm_offset` into a
+    // malformed blob. (The pre-existing sa/l1/l2/kmt offset sums above keep their
+    // unchecked form; only the new `.blm` slot is hardened here.)
+    let blm_offset = {
+        let end = kmt_offset
+            .checked_add(kmt_len)
+            .ok_or_else(|| Error::SizeMismatch {
+                file: shm_path.to_path_buf(),
+                detail: "shm component offsets overflow usize before the .blm component".into(),
+            })?;
+        align_up(end, COMPONENT_ALIGN)
+    };
+    let blm_len = blm_bytes.as_ref().map_or(0, |b| b.len());
 
     // Build the 4 KiB wrapper header.
     let mut header = [0u8; HEADER_SIZE];
@@ -226,7 +266,13 @@ pub fn write_shm_blob(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
         LittleEndian::write_u64(&mut header[88..96], kmt_offset as u64);
         LittleEndian::write_u64(&mut header[96..104], kmt_len as u64);
     }
-    // bytes [104..4096) remain zero (reserved).
+    // `.blm` component: offset+len, both 0 when absent (backward-compatible —
+    // old blobs leave these reserved bytes zero, which reads as "no bloom").
+    if blm_len > 0 {
+        LittleEndian::write_u64(&mut header[104..112], blm_offset as u64);
+        LittleEndian::write_u64(&mut header[112..120], blm_len as u64);
+    }
+    // bytes [120..4096) remain zero (reserved).
 
     // Write the blob file.
     let f = OpenOptions::new()
@@ -297,6 +343,21 @@ pub fn write_shm_blob(sidecar_prefix: &Path, shm_path: &Path) -> Result<()> {
         )?;
         debug_assert_eq!(off, kmt_offset);
         w.write_all(kmt).map_err(|e| Error::Io {
+            path: shm_path.to_path_buf(),
+            source: e,
+        })?;
+    }
+    // Optional `.blm` component (follows `.kmt`, or `.l2` when no table carried).
+    if let Some(blm) = &blm_bytes {
+        // Pad from the actual end of the last written component: `.kmt` if one was
+        // carried, otherwise `.l2`.
+        let prev_end = match &kmt_bytes {
+            Some(kmt) => kmt_offset + kmt.len(),
+            None => l2_offset + l2_bytes.len(),
+        };
+        let off = write_padding(&mut w, prev_end, COMPONENT_ALIGN, shm_path)?;
+        debug_assert_eq!(off, blm_offset);
+        w.write_all(blm).map_err(|e| Error::Io {
             path: shm_path.to_path_buf(),
             source: e,
         })?;
@@ -372,6 +433,24 @@ pub fn read_shm_blob(shm_path: &Path) -> Result<ShmBlob> {
     // Optional `.kmt` (both 0 when absent — old blobs leave these zero).
     let kmt_offset = LittleEndian::read_u64(&blob[88..96]) as usize;
     let kmt_len = LittleEndian::read_u64(&blob[96..104]) as usize;
+    // Optional `.blm` (both 0 when absent — old blobs leave these zero).
+    // The `.blm` slots are new in this layout; parse them with `try_from` so a
+    // crafted u64 that does not fit `usize` is rejected before the layout checks
+    // below (an `as usize` cast would truncate it into a spuriously in-range
+    // value on a 32-bit target). The meta/sa/l1/l2/kmt slots above predate this
+    // and keep their `as usize` form.
+    let blm_offset = usize::try_from(LittleEndian::read_u64(&blob[104..112])).map_err(|_| {
+        Error::SizeMismatch {
+            file: shm_path.to_path_buf(),
+            detail: "blm_offset exceeds usize on this platform".into(),
+        }
+    })?;
+    let blm_len = usize::try_from(LittleEndian::read_u64(&blob[112..120])).map_err(|_| {
+        Error::SizeMismatch {
+            file: shm_path.to_path_buf(),
+            detail: "blm_len exceeds usize on this platform".into(),
+        }
+    })?;
 
     // Enforce the documented PRMI_SHM_v1 wrapper layout: every component must
     // start after the reserved header, be 4 KiB-aligned, sit within the blob,
@@ -385,18 +464,19 @@ pub fn read_shm_blob(shm_path: &Path) -> Result<ShmBlob> {
         ("l1", l1_offset, l1_len),
         ("l2", l2_offset, l2_len),
         ("kmt", kmt_offset, kmt_len),
+        ("blm", blm_offset, blm_len),
     ] {
-        // Only `.kmt` is optional: an absent table is written as offset 0 / len 0
-        // and occupies no bytes, so the strict layout checks (which assume a real,
-        // header-following, page-aligned range) do not apply — skip it, but still
-        // enforce its offset is 0. A zero-length CORE component (meta/sa/l1/l2) is
-        // a malformed wrapper and must be rejected, not silently passed through as
-        // an empty slice.
-        if name == "kmt" && len == 0 {
+        // `.kmt` and `.blm` are optional: an absent component is written as offset
+        // 0 / len 0 and occupies no bytes, so the strict layout checks (which assume
+        // a real, header-following, page-aligned range) do not apply — skip it, but
+        // still enforce its offset is 0. A zero-length CORE component (meta/sa/l1/l2)
+        // is a malformed wrapper and must be rejected, not silently passed through
+        // as an empty slice.
+        if (name == "kmt" || name == "blm") && len == 0 {
             if offset != 0 {
                 return Err(Error::SizeMismatch {
                     file: shm_path.to_path_buf(),
-                    detail: format!("kmt offset {offset} must be 0 when kmt len is 0"),
+                    detail: format!("{name} offset {offset} must be 0 when {name} len is 0"),
                 });
             }
             continue;
@@ -455,6 +535,8 @@ pub fn read_shm_blob(shm_path: &Path) -> Result<ShmBlob> {
         l2_len,
         kmt_offset,
         kmt_len,
+        blm_offset,
+        blm_len,
     })
 }
 

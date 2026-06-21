@@ -32,6 +32,7 @@ fn sample() -> Meta {
             tiered: None,
             keep_bed: None,
             pac_sha256: None,
+            bloom_keyset_digest: None,
         },
         rmi: RmiSpec {
             spec: "pwl,linear,linear_spline".into(),

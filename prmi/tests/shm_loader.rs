@@ -7,8 +7,11 @@ use prmi::index::shm::{read_shm_blob, write_shm_blob};
 use prmi::index::smem::PacEncoding;
 use prmi::index::LearnedIndex;
 use prmi::train::build_sidecar;
+use prmi::train::build_sidecar_from_pac_with_config;
 use prmi::train::build_sidecar_with_config;
-use prmi::train::config::TrainerConfig;
+use prmi::train::config::{MemoryMode, TrainerConfig};
+use prmi::train::mask::{BedInterval, MaskConfig};
+use std::io::Write;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -410,5 +413,188 @@ fn read_shm_blob_rejects_zero_length_core_component() {
     assert!(
         read_shm_blob(&shm_path).is_err(),
         "a zero-length core component (meta) must be rejected"
+    );
+}
+
+// ── open_shm: .blm bloom-gate carriage (Lever 2, M3) ─────────────────────────
+
+/// Pack a 2-bit base array into bwa-style `.pac` (2 bits/base, big-endian within
+/// a byte) with the trailing partial-byte count. Mirrors the `z_keep_mask` helper.
+fn write_pac(path: &std::path::Path, bases: &[u8]) {
+    let l = bases.len();
+    let mut buf = vec![0u8; l / 4 + 1];
+    for (i, &b) in bases.iter().enumerate() {
+        buf[i >> 2] |= b << ((3 - (i & 3)) * 2);
+    }
+    buf.push((l % 4) as u8);
+    std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
+}
+
+/// Deterministic pseudo-random 0..=3 base sequence (xorshift).
+fn random_bases(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x & 3) as u8
+        })
+        .collect()
+}
+
+/// Build a mode-2 tiered sidecar in `dir` that emits a `.blm` bloom gate over the
+/// keep-set, returning the sidecar prefix and the unpacked reference bases.
+fn build_bloom_sidecar(dir: &std::path::Path) -> (PathBuf, Vec<u8>) {
+    let bases = random_bases(8192, 0x5EED);
+    let prefix = dir.join("bloom.prmi");
+    let pac = dir.join("bloom.prmi.pac");
+    write_pac(&pac, &bases);
+    let mask = MaskConfig {
+        keep_bed: Some(vec![BedInterval {
+            start: 2048,
+            end: 6144,
+        }]),
+        ..Default::default()
+    };
+    let cfg = TrainerConfig::default()
+        .with_memory_mode(MemoryMode::Mode2)
+        .with_bloom(0.01);
+    build_sidecar_from_pac_with_config(&pac, &prefix, None, mask, 1, Some(cfg)).unwrap();
+    (prefix, bases)
+}
+
+/// The `.blm` is a new on-disk sidecar; it must round-trip across BOTH memory
+/// modes, not only Mode2. This exercises a Mode1 build through file-backed open
+/// AND the shm carriage (the bloom binds and the gate verdict is identical on
+/// both), since the other bloom coverage is Mode2-only.
+#[test]
+fn blm_round_trips_in_mode1_file_and_shm() {
+    let dir = tempdir().unwrap();
+    let bases = random_bases(8192, 0xB10F);
+    let prefix = dir.path().join("m1bloom.prmi");
+    let pac = dir.path().join("m1bloom.prmi.pac");
+    write_pac(&pac, &bases);
+    let mask = MaskConfig {
+        keep_bed: Some(vec![BedInterval {
+            start: 2048,
+            end: 6144,
+        }]),
+        ..Default::default()
+    };
+    let cfg = TrainerConfig::default()
+        .with_memory_mode(MemoryMode::Mode1)
+        .with_bloom(0.01);
+    build_sidecar_from_pac_with_config(&pac, &prefix, None, mask, 1, Some(cfg)).unwrap();
+
+    // File-backed: the Mode1 bloom binds (sa_num + ref_digest + keyset_digest) and
+    // loads.
+    let file_idx = LearnedIndex::open(&prefix).unwrap();
+    assert!(
+        file_idx.has_bloom(),
+        "Mode1 --with-bloom must produce a loadable, bound .blm"
+    );
+
+    // shm carriage: the bloom survives the blob and still binds.
+    let shm_path = dir.path().join("m1bloom.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+    let shm_idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(
+        shm_idx.has_bloom(),
+        "Mode1 .blm must round-trip through the shm blob"
+    );
+
+    // The gate verdict agrees file-backed vs shm over a read sweep.
+    let e = PacEncoding::Unpacked;
+    for start in (0..bases.len() - 60).step_by(53) {
+        let read = &bases[start..start + 60];
+        assert_eq!(
+            file_idx.present_anchor_bloom(read, &bases, e),
+            shm_idx.present_anchor_bloom(read, &bases, e),
+            "Mode1 bloom gate must agree file-backed vs shm at start {start}"
+        );
+    }
+}
+
+/// A sidecar built without `--with-bloom` produces a blob with no `.blm`, and
+/// `open_shm` reports `has_bloom() == false` (gate degrades to first-window).
+#[test]
+fn open_shm_without_blm_has_no_bloom() {
+    let (_dir, prefix) = build_test_sidecar();
+    let shm_path = _dir.path().join("no_blm.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+    let blob = read_shm_blob(&shm_path).unwrap();
+    assert_eq!(blob.blm_len, 0, "no .blm was built, so blm_len must be 0");
+    assert_eq!(blob.blm_offset, 0, "absent .blm must have offset 0");
+    let idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(!idx.has_bloom(), "an shm blob without .blm must not load a bloom");
+}
+
+/// A sidecar built WITH `--with-bloom` carries the `.blm` into the shm blob;
+/// `open_shm` loads it (`has_bloom()`), and the bloom first-window gate verdict is
+/// identical to the file-backed index's over a sweep of reads — proving the shm
+/// carriage neither drops nor corrupts the bloom. This is the M3 fix: without it a
+/// shared exome index would silently lose the cheap bloom gate.
+#[test]
+fn open_shm_with_blm_gate_matches_file_backed() {
+    let dir = tempdir().unwrap();
+    let (prefix, bases) = build_bloom_sidecar(dir.path());
+    let e = PacEncoding::Unpacked;
+
+    let shm_path = dir.path().join("with_blm.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+
+    // The blob must carry the .blm component, page-aligned, after .l2/.kmt.
+    let blob = read_shm_blob(&shm_path).unwrap();
+    assert!(blob.blm_len > 0, ".blm must be carried in the blob");
+    assert_eq!(blob.blm_offset % 4096, 0, "blm_offset must be page-aligned");
+    assert!(blob.l2_offset + blob.l2_len <= blob.blm_offset);
+
+    let file_idx = LearnedIndex::open(&prefix).unwrap();
+    assert!(file_idx.has_bloom(), "file-backed index must load the .blm");
+    let shm_idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(shm_idx.has_bloom(), "open_shm must load the carried .blm");
+
+    // The bloom first-window gate verdict must be identical between the two over a
+    // sweep spanning served / boundary / off-keep reads.
+    let mut checked = 0usize;
+    for start in (64..bases.len() - 60).step_by(11) {
+        let read = &bases[start..start + 60];
+        assert_eq!(
+            shm_idx.present_anchor_bloom_first(read, &bases, e),
+            file_idx.present_anchor_bloom_first(read, &bases, e),
+            "shm bloom gate diverged from file-backed at read start {start}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 50);
+}
+
+/// Best-effort, never-silently-wrong: a carried `.blm` whose own header is corrupt
+/// (magic clobbered) must be rejected by `from_shm_slice`, so `open_shm` still
+/// succeeds with `has_bloom() == false` (the gate degrades to the exact
+/// first-window). Exercises the corrupt-slice fallback in the shm bloom load path.
+#[test]
+fn open_shm_with_corrupt_blm_falls_back() {
+    let dir = tempdir().unwrap();
+    let (prefix, _bases) = build_bloom_sidecar(dir.path());
+
+    let shm_path = dir.path().join("corrupt_blm.shm");
+    write_shm_blob(&prefix, &shm_path).unwrap();
+
+    // Clobber the carried .blm's 4-byte magic (at the start of its component).
+    let blob = read_shm_blob(&shm_path).unwrap();
+    assert!(blob.blm_len > 0);
+    let blm_off = blob.blm_offset;
+    drop(blob);
+    let mut bytes = std::fs::read(&shm_path).unwrap();
+    bytes[blm_off..blm_off + 4].fill(0xFF);
+    std::fs::write(&shm_path, &bytes).unwrap();
+
+    // open_shm still succeeds; the corrupt bloom is ignored.
+    let idx = LearnedIndex::open_shm(&shm_path).unwrap();
+    assert!(
+        !idx.has_bloom(),
+        "a corrupt carried .blm must be ignored (has_bloom == false)"
     );
 }

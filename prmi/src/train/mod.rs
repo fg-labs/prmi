@@ -213,6 +213,34 @@ fn build_sidecar_core(
         }
     }
 
+    // Validate the bloom-gate config here (not only in `Cli::run`): direct library
+    // callers bypass the CLI, so enforce the same invariants before any expensive
+    // work, lest the API build a whole-genome `.blm` or silently accept a no-op
+    // padding / out-of-range fp-rate. These are caller-input violations.
+    if config.with_bloom {
+        if mask.keep_bed.is_none() {
+            return Err(Error::InvalidInput {
+                detail: "with_bloom requires a keep-set (keep_bed): the bloom gate is for a \
+                         tiered on-target index, not a whole-genome one"
+                    .to_string(),
+            });
+        }
+        if !(config.bloom_fp_rate > 0.0 && config.bloom_fp_rate < 1.0) {
+            return Err(Error::InvalidInput {
+                detail: format!(
+                    "bloom_fp_rate must be in (0, 1), got {}",
+                    config.bloom_fp_rate
+                ),
+            });
+        }
+    } else if config.routing_pad > 0 {
+        return Err(Error::InvalidInput {
+            detail: "routing_pad requires with_bloom: it pads the routing bloom's key set, \
+                     which does not exist without a bloom gate"
+                .to_string(),
+        });
+    }
+
     // Build the 2× generalized suffix array over [Fwd||RC]+sentinel. No
     // T-padding and no filtering: every entry is retained, including the
     // sentinel/empty-suffix row, so SA order is byte-identical to the FMI.
@@ -330,12 +358,12 @@ fn build_sidecar_core(
 
     let paths = SidecarPaths::from_prefix(prefix);
 
-    // Remove any pre-existing `.kmt`/`.isa` so a rebuild (especially one WITHOUT
-    // `--kmer-table-k` / `--with-isa`) can never inherit a stale sidecar for the
-    // old reference. Fresh ones are written at the end if requested. Propagate
+    // Remove any pre-existing `.kmt`/`.isa`/`.blm` so a rebuild (especially one
+    // WITHOUT `--kmer-table-k` / `--with-isa` / `--with-bloom`) can never inherit a
+    // stale sidecar for the old reference. Fresh ones are written if requested. Propagate
     // anything other than "already absent": a swallowed permission/I/O error
     // would silently leave the stale sidecar in place for the next open.
-    for stale in [&paths.kmt, &paths.isa] {
+    for stale in [&paths.kmt, &paths.isa, &paths.bloom] {
         match std::fs::remove_file(stale) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -378,6 +406,102 @@ fn build_sidecar_core(
                 pairs.par_sort_unstable_by_key(|&(refpos, _)| refpos);
                 crate::sidecar::isa_file::write_tiered_isa_file(&paths.isa, &pairs)?;
             }
+        }
+    }
+
+    // .blm — optional bloom gate over the keep-set's 32-mer keys (the Design-Z
+    // dispatch gate). Member set = `key_for_position_2x(p)` for every routing-kept
+    // doubled-coordinate position `p` whose 32-base window is full. With no Lever 3
+    // padding this is exactly the `.sa` keep-set — the set `mem_search` can match at
+    // `match_len >= 32` on the tiered `.sa`, so the gate has no false negatives.
+    // Full-window-only (`full_key_for_position_2x` skips positions truncated by the
+    // sentinel: a sub-32 window can never satisfy `match_len >= 32`, so including it
+    // would only manufacture pointless false positives). Built independent of the
+    // memory mode (works for a mode-1 tiered index too); the keys are recomputed
+    // here rather than reused from the mode-2 loop to keep the two write paths
+    // decoupled.
+    //
+    // Lever 3 (`routing_pad > 0`): the bloom covers a PADDED keep-set (the routing
+    // filter) while the `.sa` above stays on the TIGHT keep-set (the seeding SA).
+    // This decouples routing from seeding: the wider bloom routes flank-starting /
+    // capture-boundary reads to the on-target index (their in-target windows seed
+    // on the tight `.sa`; the 5' flank soft-clips), recovering recall WITHOUT the
+    // SA bloat padding the keep-bed itself would cause. The padded routing set is a
+    // SUPERSET of the seeding set, so still no false negatives over servable reads.
+    //
+    // The bloom's keyset digest (computed while streaming keys into the writer) is
+    // captured here as a 16-char hex string and persisted in `.meta` below, so the
+    // loader can bind the `.blm` to this exact keep-set/routing-pad. Hex because
+    // TOML integers are `i64` and the digest spans the full `u64` range.
+    let mut bloom_keyset_digest: Option<String> = None;
+    if config.with_bloom {
+        use crate::sidecar::bloom_file::{write_bloom_file, BloomParams};
+        // Resolve the routing key region: the padded keep-set under Lever 3,
+        // otherwise the tight keep-set (coupled — prior behavior).
+        let routing_intervals: Option<Vec<crate::train::mask::BedInterval>> =
+            if config.routing_pad > 0 {
+                keep.map(|k| crate::train::mask::pad_and_merge(k, config.routing_pad, genome_len))
+            } else {
+                None
+            };
+        let keep_routing_pos = |pos: u64| match routing_intervals.as_deref() {
+            Some(r) => crate::train::mask::keep_doubled_pos(r, pos, genome_len),
+            None => keep_pos(pos),
+        };
+        // Count the routing keys (parallel) for sizing WITHOUT materializing them
+        // — a large keep-set / routing-pad would otherwise be a multi-GB `Vec<u64>`
+        // on top of the already-live SA/text/model state, OOM-ing the build.
+        let num_keys = sa
+            .par_iter()
+            .filter(|&&pos| keep_routing_pos(pos))
+            .filter_map(|&pos| full_key_for_position_2x(pos, &text))
+            .count() as u64;
+        let params = BloomParams::for_keys(num_keys, config.bloom_fp_rate);
+        // Bind the bloom to its index exactly as `.kmt` does: the tiered `.sa`
+        // entry count plus the reference digest (prefer `pac_sha256`, else the
+        // FASTA ref sha). The keyset_digest (returned below, persisted in `.meta`)
+        // additionally distinguishes a different keep-set/routing-pad over the same
+        // reference, which sa_num + ref_digest alone cannot. The loader checks all
+        // three and ignores a mismatched `.blm`, so a stale bloom can't
+        // false-negative against a different index.
+        let bloom_sa_num = num_sa_entries;
+        let bloom_digest_hex = pac_sha256.as_deref().unwrap_or(ref_sha256.as_str());
+        let bloom_ref_digest =
+            crate::sidecar::kmt_file::hex32(bloom_digest_hex).unwrap_or([0u8; 32]);
+        // Stream the keys sequentially into the writer (no `Vec`); it computes the
+        // order-independent keyset digest as it inserts.
+        let key_iter = sa
+            .iter()
+            .filter(|&&pos| keep_routing_pos(pos))
+            .filter_map(|&pos| full_key_for_position_2x(pos, &text));
+        let keyset_digest = write_bloom_file(
+            &paths.bloom,
+            num_keys,
+            key_iter,
+            params,
+            bloom_sa_num,
+            &bloom_ref_digest,
+        )?;
+        bloom_keyset_digest = Some(format!("{keyset_digest:016x}"));
+        if config.routing_pad > 0 {
+            log::info!(
+                "prmi bloom gate (Lever 3, routing-pad {} bp): {} keys, {} bits ({:.1} MB), {} hashes (target fp {:.3}%)",
+                config.routing_pad,
+                num_keys,
+                params.num_bits,
+                params.num_bits as f64 / 8.0 / 1.048_576e6,
+                params.num_hashes,
+                100.0 * config.bloom_fp_rate,
+            );
+        } else {
+            log::info!(
+                "prmi bloom gate: {} keys, {} bits ({:.1} MB), {} hashes (target fp {:.3}%)",
+                num_keys,
+                params.num_bits,
+                params.num_bits as f64 / 8.0 / 1.048_576e6,
+                params.num_hashes,
+                100.0 * config.bloom_fp_rate,
+            );
         }
     }
 
@@ -471,6 +595,7 @@ fn build_sidecar_core(
             tiered: keep.is_some().then_some(true),
             keep_bed: keep_bed_path,
             pac_sha256,
+            bloom_keyset_digest,
         },
         rmi: RmiSpec {
             spec,
@@ -678,6 +803,20 @@ fn key_for_position_2x(pos: u64, text: &[u8]) -> u64 {
         *slot = crate::sa::text_value_to_base(v);
     }
     tokenize_32mer(&window[..avail], avail)
+}
+
+/// Like [`key_for_position_2x`] but returns `None` when the 32-base window at
+/// `pos` is truncated by the end of the doubled text (fewer than [`KMER_LEN`]
+/// real bases). Used to populate the bloom gate with ONLY full 32-mers — the
+/// exact set `mem_search` can match at `match_len >= 32` — so a sub-32 boundary
+/// window never manufactures a bloom false positive.
+#[inline]
+fn full_key_for_position_2x(pos: u64, text: &[u8]) -> Option<u64> {
+    let start = pos as usize;
+    if text.len().saturating_sub(start) < KMER_LEN {
+        return None;
+    }
+    Some(key_for_position_2x(pos, text))
 }
 
 /// Compute the 32-mer key for a forward-only SA position. Legacy helper from the v1 forward-only build path; retained pending removal in a later plan.

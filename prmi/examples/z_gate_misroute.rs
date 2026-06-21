@@ -63,6 +63,12 @@ fn main() {
 
     let files: Vec<String> = std::env::args().skip(1).collect();
     let (mut total, mut first_present, mut any_present, mut misroute) = (0u64, 0u64, 0u64, 0u64);
+    // The actual production gate the consumer now calls (`prmi_present_bloom`):
+    // bloom-probe every window, confirm hits with a mem_search. With a `.blm`
+    // loaded this should equal `any_present` (the bloom has no false negatives and
+    // the confirm removes false positives); without one it equals `first_present`.
+    let has_bloom = fast.has_bloom();
+    let mut bloom_present = 0u64;
     // Histogram of the first hitting window offset among MIS-ROUTED reads — how
     // far in the recoverable anchor sits. A cheap "check the first few windows"
     // gate recovers the early buckets; a long tail argues for a full bloom.
@@ -79,6 +85,9 @@ fn main() {
                 .map(|b| prmi::encoding::base_to_2bit(b).unwrap_or(4))
                 .collect();
             total += 1;
+            if fast.present_anchor_bloom(&read, &pac, enc) {
+                bloom_present += 1;
+            }
             let first = fast.present_anchor(&read, &pac, enc);
             if first {
                 first_present += 1;
@@ -114,6 +123,17 @@ fn main() {
         "  any-window present   (upper bound)    : {any_present} ({:.2}%)",
         pct(any_present, total)
     );
+    eprintln!(
+        "  bloom gate present   ({}) : {bloom_present} ({:.2}%)",
+        if has_bloom { "prmi_present_bloom, .blm loaded" } else { "no .blm -> first-window" },
+        pct(bloom_present, total)
+    );
+    if has_bloom && bloom_present != any_present {
+        eprintln!(
+            "  WARNING: bloom gate ({bloom_present}) != any-window ({any_present}) — \
+             the bloom+confirm gate should match the exact any-window verdict"
+        );
+    }
     eprintln!(
         "  mis-routed (servable but first-window rejects): {misroute} \
          ({:.2}% of all reads, {:.2}% of servable)",

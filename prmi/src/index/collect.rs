@@ -352,7 +352,14 @@ impl LearnedIndex {
     pub fn present_anchor_any(&self, read: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
         const K: usize = 32;
         let mut start = 0usize;
-        'windows: while start + K <= read.len() {
+        'windows: loop {
+            // Checked window bound: fail closed rather than let `start + K` wrap.
+            let Some(end) = start.checked_add(K) else {
+                return false;
+            };
+            if end > read.len() {
+                return false;
+            }
             // Reject a window with any N by jumping past the offending base.
             for j in 0..K {
                 if read[start + j] >= 4 {
@@ -360,12 +367,145 @@ impl LearnedIndex {
                     continue 'windows;
                 }
             }
-            if self.mem_search(&read[start..start + K], pac, enc).match_len as usize >= K {
+            if self.mem_search(&read[start..end], pac, enc).match_len >= K as u64 {
                 return true;
             }
             start += 1;
         }
-        false
+    }
+
+    /// Bloom-accelerated any-window dispatch gate (Design-Z item-6 follow-up):
+    /// the cheap, correctness-exact realisation of [`present_anchor_any`].
+    ///
+    /// With a `.blm` loaded ([`has_bloom`](Self::has_bloom)), probes the bloom for
+    /// EVERY N-free 32-mer window (O(read_len) in-memory probes) and, on a probe
+    /// HIT, runs ONE confirming [`mem_search`](Self::mem_search) to reject bloom
+    /// false positives. The verdict is therefore identical to `present_anchor_any`
+    /// (the bloom has no false negatives over the keep-set's 32-mer keys, so no
+    /// servable read is lost; the confirm removes every false positive), but a
+    /// truly-absent read pays ~0 locates instead of `present_anchor_any`'s up to
+    /// `read_len - 31`. The confirm is what makes this safe for the Design-Z
+    /// consumer, which seeds present reads via the on-target index ONLY — an
+    /// unconfirmed bloom false positive routed there would be a correctness
+    /// regression, not just wasted work.
+    ///
+    /// Without a `.blm` loaded, falls back to the first-window
+    /// [`present_anchor`](Self::present_anchor) — the cheap production default —
+    /// rather than the expensive locate-every-window `present_anchor_any`.
+    pub fn present_anchor_bloom(&self, read: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
+        const K: usize = 32;
+        // No bloom: keep the cheap first-window behaviour (never silently switch to
+        // the O(read_len)-locate any-window scan).
+        if !self.has_bloom() {
+            return self.present_anchor(read, pac, enc);
+        }
+        let mut start = 0usize;
+        'windows: loop {
+            // Checked window bound: fail closed rather than let `start + K` wrap.
+            let Some(end) = start.checked_add(K) else {
+                return false;
+            };
+            if end > read.len() {
+                return false;
+            }
+            // Reject a window with any N by jumping past the offending base.
+            for j in 0..K {
+                if read[start + j] >= 4 {
+                    start += j + 1;
+                    continue 'windows;
+                }
+            }
+            // The bloom member set is `key_for_position_2x` over kept full-window
+            // positions, which is `tokenize_32mer` of the 0..=3 bases — compute the
+            // query window's key the same way so a true keep-set 32-mer never misses.
+            let key = crate::encoding::tokenize_32mer(&read[start..end], K);
+            if self.bloom_contains(key) == Some(true)
+                && self.mem_search(&read[start..end], pac, enc).match_len >= K as u64
+            {
+                return true;
+            }
+            start += 1;
+        }
+    }
+
+    /// Cheap FIRST-WINDOW dispatch gate (Design-Z Lever 2, A1): does the read's
+    /// first N-free 32-mer window's key occur in the keep-set bloom?
+    ///
+    /// Same routing decision as [`present_anchor`](Self::present_anchor) — the first
+    /// N-free leading window only — but replaces that window's `mem_search` locate
+    /// (≈1–2 cold SA probes + model launch) with a single in-memory bloom probe (a
+    /// few hash ops, NO SA/pac access, index-size-independent). Over the bloom's
+    /// member set there are no false negatives, so it never mis-routes a read whose
+    /// first window IS in the keep-set; it admits ≈`fp_rate` false positives (built
+    /// at 0.01), which the Design-Z consumer's present-read fallback (Lever 0)
+    /// re-seeds harmlessly — making the cheap probe accuracy-safe.
+    ///
+    /// Without a `.blm` loaded, falls back to the exact first-window
+    /// [`present_anchor`](Self::present_anchor) (never the O(read_len)-locate
+    /// any-window scan) so behaviour degrades to the production default, not a
+    /// slower path.
+    pub fn present_anchor_bloom_first(&self, read: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
+        const K: usize = 32;
+        // No bloom: exact first-window behaviour (the cheap production default).
+        if !self.has_bloom() {
+            return self.present_anchor(read, pac, enc);
+        }
+        let mut start = 0usize;
+        'windows: loop {
+            // Checked window bound: fail closed rather than let `start + K` wrap.
+            let Some(end) = start.checked_add(K) else {
+                return false;
+            };
+            if end > read.len() {
+                return false;
+            }
+            // Reject a window with any N by jumping past the offending base.
+            for j in 0..K {
+                if read[start + j] >= 4 {
+                    start += j + 1;
+                    continue 'windows;
+                }
+            }
+            // First N-free window decides — same window `present_anchor` inspects.
+            // The bloom member set is `tokenize_32mer` over kept full-window 0..=3
+            // bases; compute the query key the same way so a true keep-set 32-mer
+            // never misses.
+            let key = crate::encoding::tokenize_32mer(&read[start..end], K);
+            return self.bloom_contains(key) == Some(true);
+        }
+    }
+
+    /// Cheap EXACT first-window dispatch gate (Design-Z Lever 2, A2): does the
+    /// read's first N-free 32-mer window occur in the reference?
+    ///
+    /// Identical routing decision and verdict to
+    /// [`present_anchor`](Self::present_anchor) (`mem_search(window).match_len >=
+    /// 32`), but uses [`kmer_exists`](Self::kmer_exists)
+    /// — which skips `mem_search`'s two interval-recovery gallops the gate never
+    /// reads — so it is exact (no false positives) and modestly cheaper than the
+    /// `mem_search` first-window gate. Use when accuracy must be exact and the
+    /// per-read gate `mem_search` cost still matters (i.e. the bloom A1 gate's
+    /// false positives are not acceptable).
+    pub fn present_anchor_exact(&self, read: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
+        const K: usize = 32;
+        let mut start = 0usize;
+        'windows: loop {
+            // Checked window bound: fail closed rather than let `start + K` wrap.
+            let Some(end) = start.checked_add(K) else {
+                return false;
+            };
+            if end > read.len() {
+                return false;
+            }
+            // Reject a window with any N by jumping past the offending base.
+            for j in 0..K {
+                if read[start + j] >= 4 {
+                    start += j + 1;
+                    continue 'windows;
+                }
+            }
+            return self.kmer_exists(&read[start..end], pac, enc);
+        }
     }
 
     /// Within-read two-stage sort (port of cpp:1833-1850, restricted to one rid).
