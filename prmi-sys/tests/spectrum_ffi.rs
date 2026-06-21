@@ -2120,3 +2120,112 @@ fn collect_smems_ffi_null_empty_read() {
     unsafe { prmi_close(handle) };
     drop(dir);
 }
+
+/// The backward-batch C ABI entrypoints must accept the canonical empty-slice
+/// case `NULL + len 0` (a C caller's empty buffer) rather than treating the NULL
+/// as a hard error. With `ntasks > 0` but every task empty (`read_len == 0`,
+/// `max_steps == 0`, empty interval), passing both arenas as `NULL + 0` must
+/// succeed with all `out_nsteps == 0` and must NOT dereference the NULL arenas.
+/// Covers both the serial and lockstep backward entrypoints, which share the
+/// validation path.
+#[test]
+fn backward_spectrum_batch_accepts_null_plus_zero_arenas() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases: u64 = pac_unpacked.len() as u64;
+
+    // Two real but empty tasks: empty read window, empty interval, zero capacity.
+    let empty_task = prmi_bwd_task_t {
+        sa_start: 0,
+        occ_count: 0,
+        anchor_len: 0,
+        read_off: 0,
+        read_len: 0,
+        pivot: 0,
+        steps_off: 0,
+        max_steps: 0,
+    };
+    let tasks = [empty_task, empty_task];
+
+    for lockstep in [false, true] {
+        let mut out_nsteps = [u64::MAX; 2];
+        let entry = if lockstep {
+            prmi_backward_spectrum_batch_lockstep
+        } else {
+            prmi_backward_spectrum_batch
+        };
+        let rc = unsafe {
+            entry(
+                handle,
+                ptr::null(), // reads_arena = NULL ...
+                0,           // ... with reads_arena_len = 0 (canonical empty)
+                tasks.as_ptr(),
+                2,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                ptr::null_mut(), // steps_arena = NULL ...
+                0,               // ... with steps_arena_len = 0 (canonical empty)
+                out_nsteps.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            rc, 0,
+            "lockstep={lockstep}: NULL+0 arenas with empty tasks must succeed, got rc={rc}"
+        );
+        assert_eq!(
+            out_nsteps,
+            [0, 0],
+            "lockstep={lockstep}: empty tasks must produce 0 steps each"
+        );
+    }
+
+    // A NULL arena declared with a NON-zero length is still a hard error (-1).
+    let mut bad_out = [0u64; 1];
+    let rc_bad = unsafe {
+        prmi_backward_spectrum_batch(
+            handle,
+            ptr::null(), // NULL reads_arena ...
+            8,           // ... but declared length 8 → reject
+            tasks.as_ptr(),
+            1,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            ptr::null_mut(),
+            0,
+            bad_out.as_mut_ptr(),
+        )
+    };
+    assert_eq!(
+        rc_bad, -1,
+        "NULL reads_arena with nonzero declared length must be rejected, got {rc_bad}"
+    );
+
+    // Symmetric check for the OTHER arena: NULL steps_arena with a nonzero declared
+    // length is also a hard error. Pass reads_arena as the accepted `NULL + 0` so
+    // the steps_arena gate is what rejects (not the reads_arena gate).
+    let rc_bad_steps = unsafe {
+        prmi_backward_spectrum_batch(
+            handle,
+            ptr::null(), // reads_arena = NULL ...
+            0,           // ... with len 0 → accepted, so it is not what rejects
+            tasks.as_ptr(),
+            1,
+            pac_packed.as_ptr(),
+            pac_num_bases,
+            ptr::null_mut(), // NULL steps_arena ...
+            8,               // ... but declared length 8 → reject
+            bad_out.as_mut_ptr(),
+        )
+    };
+    assert_eq!(
+        rc_bad_steps, -1,
+        "NULL steps_arena with nonzero declared length must be rejected, got {rc_bad_steps}"
+    );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
