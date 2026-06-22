@@ -233,8 +233,9 @@ pub unsafe extern "C" fn prmi_has_isa(handle: *const prmi_index_t) -> c_int {
 ///
 /// Returns 0 on success; `-1` null handle/out-ptr, `-2` `refpos` has no
 /// inverse-SA entry (out of range for a dense ISA, or not in the keep-set for a
-/// sparse/tiered ISA), `-3` internal panic, `-5` the loaded sidecar has no
-/// `.isa` (build with `prmi build --with-isa`).
+/// sparse/tiered ISA), `-3` internal panic or a corrupt `.isa` (out-of-range SA
+/// index), `-5` the loaded sidecar has no `.isa` (build with `prmi build
+/// --with-isa`).
 ///
 /// # Safety
 /// `handle` valid or NULL; `out_sa_index` writable on success.
@@ -249,27 +250,54 @@ pub unsafe extern "C" fn prmi_isa_at(
         set_last_error("prmi_isa_at: null handle or out_sa_index");
         return -1;
     }
-    let h = unsafe { Handle::as_ref(handle) };
-    if !h.idx.has_isa() {
-        set_last_error("prmi_isa_at: sidecar has no .isa (build with --with-isa)");
-        return -5;
-    }
-    // isa_at returns None when refpos is out of range (dense) or not in the
-    // keep-set (sparse/tiered). Either way there is no launch hint here; report
+    // Do ALL work — handle deref, `.isa` presence check, and the lookup — inside
+    // the catch_unwind boundary so no panic from any of them can unwind across
+    // `extern "C"` (UB). `isa_at` returns None when refpos is out of range (dense)
+    // or not in the keep-set (sparse/tiered): there is no launch hint, so report
     // not-found rather than indexing out of bounds. A tiered ISA's valid refpos
     // space is the genome (up to 2*l_pac), NOT sa_num (the kept-entry count), so
-    // we cannot bound-check against sa_num — isa_at does the right check. Wrapped
-    // in catch_unwind so a panic (e.g. the sparse reader's bounds assert) can
-    // never unwind across the extern "C" boundary.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.idx.isa_at(refpos)));
+    // we cannot bound-check against sa_num — isa_at does the right check itself.
+    enum IsaAtOutcome {
+        NoIsa,
+        Miss,
+        Corrupt { sa_index: u64, sa_num: u64 },
+        Hit(u64),
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let h = unsafe { Handle::as_ref(handle) };
+        if !h.idx.has_isa() {
+            return IsaAtOutcome::NoIsa;
+        }
+        // The returned value is an SA rank fed straight back to bwa-mem3 as a
+        // launch hint; a malformed `.isa` body could yield a rank past the SA, so
+        // bound-check it here rather than let an out-of-range index propagate.
+        let sa_num = h.idx.sa_num();
+        match h.idx.isa_at(refpos) {
+            Some(sa_index) if sa_index < sa_num => IsaAtOutcome::Hit(sa_index),
+            Some(sa_index) => IsaAtOutcome::Corrupt { sa_index, sa_num },
+            None => IsaAtOutcome::Miss,
+        }
+    }));
     match result {
-        Ok(Some(sa_index)) => {
+        Ok(IsaAtOutcome::Hit(sa_index)) => {
             unsafe { *out_sa_index = sa_index };
             0
         }
-        Ok(None) => {
-            set_last_error("prmi_isa_at: refpos has no inverse-SA entry (out of range or not in keep-set)");
+        Ok(IsaAtOutcome::NoIsa) => {
+            set_last_error("prmi_isa_at: sidecar has no .isa (build with --with-isa)");
+            -5
+        }
+        Ok(IsaAtOutcome::Miss) => {
+            set_last_error(
+                "prmi_isa_at: refpos has no inverse-SA entry (out of range or not in keep-set)",
+            );
             -2
+        }
+        Ok(IsaAtOutcome::Corrupt { sa_index, sa_num }) => {
+            set_last_error(&format!(
+                "prmi_isa_at: .isa returned out-of-range SA index {sa_index} >= sa_num {sa_num}"
+            ));
+            -3
         }
         Err(_) => {
             set_last_error("prmi_isa_at: internal panic");

@@ -150,9 +150,14 @@ fn tiered_build_with_isa_inverts_compacted_sa_and_misses_off_keep() {
         "tiered build --with-isa must produce a loadable sparse .isa"
     );
     let sa_num = idx.sa_num(); // tiered: the compacted kept-entry count
-    assert!(
-        sa_num > 0 && sa_num < 2 * 3000 + 1,
-        "tiered sa_num ({sa_num}) must be a strict subset of the full 2*l_pac+1"
+    // Keep [500,1500) = 1000 forward positions, kept RC-symmetrically (their
+    // distinct RC images) plus the sentinel = exactly 2*1000 + 1 entries. An
+    // exact count catches a keep-mask that silently fails to apply (the loose
+    // band, and the original `< 2*l_pac+1`, did not).
+    let expected_sa_num = 2 * (1500u64 - 500) + 1;
+    assert_eq!(
+        sa_num, expected_sa_num,
+        "tiered sa_num must equal kept forward positions + RC images + sentinel"
     );
     // The sparse ISA inverts the COMPACTED tiered SA: for every compacted rank i,
     // isa_at(sa_position_for(i)) == i.
@@ -173,15 +178,20 @@ fn tiered_build_with_isa_inverts_compacted_sa_and_misses_off_keep() {
     for start in (520..1400).step_by(37) {
         let q = &bases[start..start + 60];
         let m = idx.mem_search(q, &bases, e);
-        if m.match_len == 0 {
-            continue;
-        }
-        // A match position returned by the tiered index is, by construction, a
-        // kept entry, so the inverse SA must have it.
-        let refpos = idx.sa_position_for(m.sa_start);
+        // q is copied from a reference window fully inside the keep interval
+        // [500,1500), so a zero-length match is itself a keep-mask/search
+        // regression — fail rather than silently skipping the sample.
+        assert_ne!(
+            m.match_len, 0,
+            "cold mem_search must hit an in-keep reference window at start={start}"
+        );
+        // Independent oracle: seed the hint from the KNOWN in-keep query
+        // coordinate `start` (not from `m.sa_start`, which would make the check
+        // self-referential on the very `mem_search` result it validates). `start`
+        // lies inside [500,1500), so its forward position is in the keep-set.
         let hint = idx
-            .isa_at(refpos)
-            .expect("a tiered-SA match position is always in the keep-set");
+            .isa_at(start as u64)
+            .expect("the sampled forward start lies inside the keep-set");
         let hinted = idx.mem_search_from_hint(q, hint, true, &bases, e);
         assert_eq!(hinted, m, "tiered ISA hint must equal cold mem_search at start={start}");
     }

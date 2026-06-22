@@ -200,6 +200,7 @@ impl LearnedIndex {
     /// [`crate::index::spectrum::LearnedIndex::mem_search_from_hint`]; a `None`
     /// degrades to a cold/model launch (byte-identical — the hint only seeds the
     /// search).
+    #[inline]
     pub fn isa_at(&self, refpos: u64) -> Option<u64> {
         self.isa.as_ref()?.lookup(refpos)
     }

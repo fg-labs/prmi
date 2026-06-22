@@ -61,6 +61,41 @@ const ISA_MODE_DENSE: u8 = 0;
 const ISA_MODE_SPARSE: u8 = 1;
 /// Width of one sparse entry: a `(refpos, rank)` pair, each uint40.
 const SPARSE_ENTRY_BYTES: usize = 2 * BYTES_PER_PACKED_ENTRY;
+/// Largest value representable in the 5-byte (uint40) packing shared by the `.sa`
+/// and `.isa` files; refpos/rank/entry-count guards reject anything above it.
+const UINT40_MAX: u64 = (1u64 << 40) - 1;
+
+/// Validate that `sa` is a permutation of `[0, n)` — distinctness AND range.
+///
+/// The dense scatter in [`write_isa_file`] writes through raw pointers with no
+/// bounds or overlap check, so a duplicate or out-of-range value would be a data
+/// race / out-of-bounds write (UB). A 1-bit-per-entry bitset keeps the guard to
+/// ~n/8 bytes (~775 MB at hg38) and one O(n) pass — negligible against the
+/// multi-GB `.isa` it protects. A violation is an internal bug (`build_gsa`
+/// guarantees a permutation), hence [`Error::Internal`].
+fn validate_dense_sa_permutation(sa: &[u64], n: usize) -> Result<()> {
+    let mut seen = vec![0u64; n.div_ceil(64)];
+    for &p in sa {
+        let p = usize::try_from(p).map_err(|_| Error::Internal {
+            detail: format!("SA value {p} does not fit in usize; SA must be a permutation"),
+        })?;
+        if p >= n {
+            return Err(Error::Internal {
+                detail: format!("SA value {p} out of range (n={n}); SA must be a permutation"),
+            });
+        }
+        let (word, bit) = (p / 64, 1u64 << (p % 64));
+        if seen[word] & bit != 0 {
+            return Err(Error::Internal {
+                detail: format!(
+                    "SA value {p} appears twice; SA must be a permutation (distinct values)"
+                ),
+            });
+        }
+        seen[word] |= bit;
+    }
+    Ok(())
+}
 
 /// Build the inverse suffix array from the SA permutation and write it to `path`.
 ///
@@ -71,6 +106,22 @@ const SPARSE_ENTRY_BYTES: usize = 2 * BYTES_PER_PACKED_ENTRY;
 /// `Vec<u64>` inverse).
 pub fn write_isa_file(path: &Path, sa: &[u64]) -> Result<()> {
     let n = sa.len();
+    // Ranks (the stored SA indices `0..n`) are packed as uint40, so the largest
+    // rank `n - 1` must fit in 5 bytes; `n > 2^40` would silently truncate. This
+    // is a writer/SA-integrity invariant on internally generated input, hence
+    // `Error::Internal` (mirrors the tiered writer's uint40 guard).
+    if n as u64 > UINT40_MAX + 1 {
+        return Err(Error::Internal {
+            detail: format!(
+                "dense ISA rank count {n} exceeds uint40 capacity {}",
+                UINT40_MAX + 1
+            ),
+        });
+    }
+    // Validate the permutation BEFORE any file I/O so a malformed `sa` fails
+    // without truncating/creating the output (the sparse writer validates up
+    // front too); the raw-pointer scatter below then assumes a valid permutation.
+    validate_dense_sa_permutation(sa, n)?;
     let io = |e: std::io::Error| Error::Io {
         path: path.to_path_buf(),
         source: e,
@@ -106,12 +157,12 @@ pub fn write_isa_file(path: &Path, sa: &[u64]) -> Result<()> {
     // Pack inv[p] = i directly: for each sorted index i at reference position
     // p = sa[i], store the 5-byte SA index i at body offset p*5.
     //
-    // Parallel scatter. `sa` MUST be a permutation of [0, n) — this is the
-    // inverse-SA contract and the safety-critical invariant here: distinctness
-    // (not just the range bound) is what makes the concurrent raw-pointer writes
-    // race-free, since every `p = sa[i]` then targets a disjoint, non-overlapping
-    // 5-byte range. A big win at genome scale, where the serial random-write over
-    // a multi-GB mmap is the dominant `--with-isa` build cost.
+    // Parallel scatter. `sa` is a permutation of [0, n) (validated above), which
+    // is the safety-critical invariant here: distinctness (not just the range
+    // bound) is what makes the concurrent raw-pointer writes race-free, since
+    // every `p = sa[i]` targets a disjoint, non-overlapping 5-byte range. A big
+    // win at genome scale, where the serial random-write over a multi-GB mmap is
+    // the dominant `--with-isa` build cost.
     let body = &mut mmap[ISA_FILE_HEADER_BYTES..];
     let body_addr = body.as_mut_ptr() as usize;
     sa.par_iter().enumerate().for_each(|(i, &p)| {
@@ -155,24 +206,37 @@ pub fn write_tiered_isa_file(path: &Path, pairs: &[(u64, u64)]) -> Result<()> {
     // a release build silently produce corrupt lookups): pairs sorted ascending by
     // refpos (the reader binary-searches), and both fields within the 5-byte
     // (uint40) packing — `pack_position` would otherwise truncate silently.
-    const UINT40_MAX: u64 = (1 << 40) - 1;
+    let n = pairs.len();
     let mut prev: Option<u64> = None;
     for &(refpos, rank) in pairs {
+        // These are writer-API / SA-integrity invariants on internally generated
+        // pairs (compacted SA -> (refpos, rank)), not user input, so a violation
+        // is an internal bug -> `Error::Internal` (matching the dense writer, which
+        // treats its permutation invariant as a hard internal contract).
         if refpos > UINT40_MAX || rank > UINT40_MAX {
-            return Err(Error::InvalidInput {
+            return Err(Error::Internal {
                 detail: format!(
                     "tiered ISA entry (refpos={refpos}, rank={rank}) exceeds uint40 max {UINT40_MAX}"
                 ),
             });
         }
-        if prev.is_some_and(|p| refpos < p) {
-            return Err(Error::InvalidInput {
-                detail: "write_tiered_isa_file requires pairs sorted ascending by refpos".into(),
+        // `rank` is handed back as the launch hint into the compacted `.sa`, so a
+        // rank past the compacted length would serialize a loadable `.isa` that
+        // points outside the `.sa` — reject it (uint40 alone is not enough).
+        if rank >= n as u64 {
+            return Err(Error::Internal {
+                detail: format!("tiered ISA rank {rank} is outside compacted SA range [0, {n})"),
+            });
+        }
+        if prev.is_some_and(|p| refpos <= p) {
+            return Err(Error::Internal {
+                detail: "write_tiered_isa_file requires pairs STRICTLY ascending by refpos \
+                         (duplicate refpos would corrupt the binary-search lookup)"
+                    .into(),
             });
         }
         prev = Some(refpos);
     }
-    let n = pairs.len();
     let io = |e: std::io::Error| Error::Io {
         path: path.to_path_buf(),
         source: e,
@@ -483,6 +547,51 @@ mod tests {
         // Exact file size: header + n * 10.
         let size = std::fs::metadata(&path).unwrap().len();
         assert_eq!(size, (ISA_FILE_HEADER_BYTES + sorted.len() * SPARSE_ENTRY_BYTES) as u64);
+    }
+
+    #[test]
+    fn tiered_isa_writer_contract_violations_are_internal() {
+        // The pairs are generated internally by the tiered build, so a violated
+        // writer invariant is an internal bug, not user input -> Error::Internal.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.tiered.isa");
+        // Non-strictly-ascending refpos (duplicate) corrupts the binary search.
+        assert!(matches!(
+            write_tiered_isa_file(&path, &[(0, 0), (0, 1)]),
+            Err(Error::Internal { .. })
+        ));
+        // refpos beyond the uint40 packing width.
+        let over = (1u64 << 40) + 1;
+        assert!(matches!(
+            write_tiered_isa_file(&path, &[(over, 0)]),
+            Err(Error::Internal { .. })
+        ));
+        // rank within uint40 but past the compacted SA length (n=1 here) would
+        // serialize a hint pointing outside the `.sa`.
+        assert!(matches!(
+            write_tiered_isa_file(&path, &[(0, 5)]),
+            Err(Error::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn write_isa_file_rejects_duplicate_sa() {
+        // The dense writer's parallel scatter is race-free only if `sa` is a
+        // permutation; the all-builds distinctness guard must reject a duplicate
+        // (which would otherwise let two threads write the same offset — UB)
+        // before any write. `[0, 1, 1]` is in-range (every value < 3) but not a
+        // permutation.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dup.isa");
+        assert!(matches!(
+            write_isa_file(&path, &[0, 1, 1]),
+            Err(Error::Internal { .. })
+        ));
+        // An out-of-range value (>= n) is likewise rejected, not written OOB.
+        assert!(matches!(
+            write_isa_file(&path, &[0, 5, 1]),
+            Err(Error::Internal { .. })
+        ));
     }
 
     #[test]
