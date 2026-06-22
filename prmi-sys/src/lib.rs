@@ -909,6 +909,12 @@ unsafe fn write_bwd_task_steps(
     if steps.len() as u64 > u64::from(t.max_steps) {
         return true;
     }
+    if steps.is_empty() {
+        // Canonical empty: nothing to write. Return before touching `steps_arena`,
+        // which a caller may pass as `NULL + 0` (so `from_raw_parts_mut(NULL, 0)`
+        // — UB — is never reached).
+        return false;
+    }
     let dst = unsafe {
         std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
     };
@@ -953,8 +959,22 @@ unsafe fn backward_spectrum_batch_impl(
     if ntasks == 0 {
         return 0;
     }
-    if reads_arena.is_null() || tasks.is_null() || steps_arena.is_null() || out_nsteps.is_null() {
-        set_last_error("prmi_backward_spectrum_batch: null arena/tasks/out with ntasks > 0");
+    // `tasks` and `out_nsteps` have length `ntasks > 0`, so they must be non-null.
+    if tasks.is_null() || out_nsteps.is_null() {
+        set_last_error("prmi_backward_spectrum_batch: null tasks/out with ntasks > 0");
+        return -1;
+    }
+    // A NULL arena is the canonical empty slice ONLY with a declared length of 0
+    // (C callers pass empty buffers as `NULL + 0`); building such a slice from the
+    // raw NULL pointer would be UB, so the per-task slices below branch to `&[]` /
+    // `&mut []` for zero-length windows. Reject NULL when the caller declares a
+    // non-empty arena.
+    if reads_arena.is_null() && reads_arena_len != 0 {
+        set_last_error("prmi_backward_spectrum_batch: null reads_arena with reads_arena_len > 0");
+        return -1;
+    }
+    if steps_arena.is_null() && steps_arena_len != 0 {
+        set_last_error("prmi_backward_spectrum_batch: null steps_arena with steps_arena_len > 0");
         return -1;
     }
     let h = unsafe { Handle::as_ref(handle) };
@@ -1030,11 +1050,17 @@ unsafe fn backward_spectrum_batch_impl(
             let bwd_tasks: Vec<_> = tasks_s
                 .iter()
                 .map(|t| {
-                    let read = unsafe {
-                        std::slice::from_raw_parts(
-                            reads_arena.add(t.read_off as usize),
-                            t.read_len as usize,
-                        )
+                    // Empty read window → `&[]`; the arena may be the canonical
+                    // `NULL + 0`, so never `from_raw_parts(NULL, 0)` (UB).
+                    let read: &[u8] = if t.read_len == 0 {
+                        &[]
+                    } else {
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                reads_arena.add(t.read_off as usize),
+                                t.read_len as usize,
+                            )
+                        }
                     };
                     prmi::index::spectrum::BwdTask {
                         sa_start: t.sa_start,
@@ -1056,17 +1082,29 @@ unsafe fn backward_spectrum_batch_impl(
             // Serial: fill each task's arena region directly (mirroring
             // prmi_forward_spectrum_batch), with no per-task or whole-batch Vec.
             for (i, t) in tasks_s.iter().enumerate() {
-                let read = unsafe {
-                    std::slice::from_raw_parts(
-                        reads_arena.add(t.read_off as usize),
-                        t.read_len as usize,
-                    )
+                // Empty read window → `&[]`; the arena may be the canonical
+                // `NULL + 0`, so never `from_raw_parts(NULL, 0)` (UB).
+                let read: &[u8] = if t.read_len == 0 {
+                    &[]
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            reads_arena.add(t.read_off as usize),
+                            t.read_len as usize,
+                        )
+                    }
                 };
-                let dst = unsafe {
-                    out_steps_as_smemstep(
-                        steps_arena.add(t.steps_off as usize),
-                        t.max_steps as usize,
-                    )
+                // Empty step window → `&mut []` (the steps arena may likewise be the
+                // canonical `NULL + 0`).
+                let dst: &mut [prmi::index::spectrum::SmemStep] = if t.max_steps == 0 {
+                    &mut []
+                } else {
+                    unsafe {
+                        out_steps_as_smemstep(
+                            steps_arena.add(t.steps_off as usize),
+                            t.max_steps as usize,
+                        )
+                    }
                 };
                 let nsteps = h.idx.backward_spectrum_fill(
                     t.sa_start,
@@ -1112,7 +1150,10 @@ unsafe fn backward_spectrum_batch_impl(
 /// high-DRAM-latency microarchitectures, slower on low-latency ones (measure).
 ///
 /// Returns 0 on success. Error codes:
-///   - `-1` — null pointer (with ntasks>0).
+///   - `-1` — a required pointer is null: `handle`, `pac`, or (with `ntasks > 0`)
+///     `tasks` / `out_nsteps`, or a `reads_arena` / `steps_arena` declared with a
+///     non-zero length. A NULL arena with a zero declared length is accepted as the
+///     canonical empty slice.
 ///   - `-2` — a task descriptor's read or steps window falls outside its arena,
 ///     or `ntasks` / a task's `read_off` / the packed pac length does not fit
 ///     `usize` on this target;
@@ -1164,8 +1205,24 @@ pub unsafe extern "C" fn prmi_backward_spectrum_batch(
 /// in execution strategy. Faster on high-DRAM-latency microarchitectures (server
 /// x86 / Graviton); can be SLOWER on low-latency ones (e.g. Apple Silicon, which
 /// already hides the latency). A/B both entry points on the target hardware and
-/// pick the winner. Same arguments, arena contract, and error codes as
+/// pick the winner. Same arguments and arena contract as
 /// `prmi_backward_spectrum_batch`.
+///
+/// Returns 0 on success. Error codes (identical to `prmi_backward_spectrum_batch`,
+/// listed in full here so this entrypoint's contract is self-contained):
+///   - `-1` — a required pointer is null: `handle`, `pac`, or (with `ntasks > 0`)
+///     `tasks` / `out_nsteps`, or a `reads_arena` / `steps_arena` declared with a
+///     non-zero length. A NULL arena with a zero declared length is accepted as the
+///     canonical empty slice.
+///   - `-2` — a task descriptor's read or steps window falls outside its arena, or
+///     `ntasks` / a task's `read_off` / the packed pac length does not fit `usize`
+///     on this target; `prmi_last_error_message` names the offending task index and
+///     window. The whole batch is aborted on the first violation; no arena memory
+///     is read or written for the violating task.
+///   - `-3` — internal/panic (including a contiguity-guard failure).
+///   - `-4` — a task's produced nsteps exceeds its `max_steps`; that task's
+///     `out_nsteps[i]` is set to the needed count; its steps region is left
+///     unwritten/partial.
 ///
 /// # Safety
 /// All pointers valid for their declared sizes; arenas at least as large as
