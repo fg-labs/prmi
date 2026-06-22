@@ -12,10 +12,10 @@ use prmi::train::config::{MemoryMode, TrainerConfig};
 use prmi_sys::{
     prmi_backward_spectrum, prmi_backward_spectrum_batch, prmi_backward_spectrum_batch_lockstep,
     prmi_bwd_task_t, prmi_close, prmi_collect_opts_t, prmi_collect_smems, prmi_forward_spectrum,
-    prmi_forward_spectrum_batch, prmi_fwd_task_t, prmi_mem_search, prmi_mem_search_backward,
-    prmi_mem_search_backward_truncated_interval, prmi_mem_search_capped, prmi_mem_search_lean,
-    prmi_open, prmi_sa_num, prmi_sa_positions, prmi_sa_positions_strided, prmi_smem_step_t,
-    prmi_smem_t, PRMI_MEM_WANT_INTERVAL,
+    prmi_forward_spectrum_batch, prmi_forward_spectrum_batch_lockstep, prmi_fwd_task_t,
+    prmi_mem_search, prmi_mem_search_backward, prmi_mem_search_backward_truncated_interval,
+    prmi_mem_search_capped, prmi_mem_search_lean, prmi_open, prmi_sa_num, prmi_sa_positions,
+    prmi_sa_positions_strided, prmi_smem_step_t, prmi_smem_t, PRMI_MEM_WANT_INTERVAL,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -639,6 +639,156 @@ fn forward_spectrum_batch_matches_single() {
     drop(dir);
 }
 
+/// `prmi_forward_spectrum_batch_lockstep` must produce byte-identical output to
+/// the serial `prmi_forward_spectrum_batch` — same `out_nsteps`, same steps, same
+/// order — over a shared multi-query arena.
+#[test]
+fn forward_spectrum_batch_lockstep_matches_serial() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases: u64 = pac_unpacked.len() as u64;
+    let query_len: usize = 32;
+
+    // Three queries from different reference offsets (exercises multiple
+    // simultaneously-active steppers in the lockstep rounds).
+    let q0: Vec<u8> = pac_unpacked[0..query_len].to_vec();
+    let q1: Vec<u8> = pac_unpacked[16..16 + query_len].to_vec();
+    let q2: Vec<u8> = pac_unpacked[8..8 + query_len].to_vec();
+    let mut queries_arena = Vec::new();
+    for q in [&q0, &q1, &q2] {
+        queries_arena.extend_from_slice(q);
+    }
+
+    const MAX_STEPS: u32 = 64;
+    let tasks = [
+        prmi_fwd_task_t {
+            query_off: 0,
+            query_len: query_len as u32,
+            steps_off: 0,
+            max_steps: MAX_STEPS,
+        },
+        prmi_fwd_task_t {
+            query_off: query_len as u64,
+            query_len: query_len as u32,
+            steps_off: MAX_STEPS,
+            max_steps: MAX_STEPS,
+        },
+        prmi_fwd_task_t {
+            query_off: 2 * query_len as u64,
+            query_len: query_len as u32,
+            steps_off: 2 * MAX_STEPS,
+            max_steps: MAX_STEPS,
+        },
+    ];
+
+    // Run both strategies into separate arenas and compare element-for-element.
+    let run = |lockstep: bool| -> (Vec<prmi_smem_step_t>, [u64; 3]) {
+        let mut steps = vec![
+            prmi_smem_step_t {
+                sa_start: 0,
+                occ_count: 0,
+                match_len: 0
+            };
+            3 * MAX_STEPS as usize
+        ];
+        let mut ns = [0u64; 3];
+        let f = if lockstep {
+            prmi_forward_spectrum_batch_lockstep
+        } else {
+            prmi_forward_spectrum_batch
+        };
+        let rc = unsafe {
+            f(
+                handle,
+                queries_arena.as_ptr(),
+                queries_arena.len() as u64,
+                tasks.as_ptr(),
+                3,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                steps.as_mut_ptr(),
+                steps.len() as u64,
+                ns.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "rc={rc} lockstep={lockstep}");
+        (steps, ns)
+    };
+    let (serial_steps, serial_ns) = run(false);
+    let (lockstep_steps, lockstep_ns) = run(true);
+
+    assert_eq!(serial_ns, lockstep_ns, "out_nsteps differ");
+    assert!(
+        serial_ns.iter().all(|&n| n >= 1),
+        "expected non-trivial forward steps for every query"
+    );
+    // Independent oracle: each task's lockstep output must also equal the
+    // single-query `prmi_forward_spectrum` (not just the serial batch — so the
+    // check does not rest on two code paths that share the batch implementation).
+    for (idx, q) in [&q0, &q1, &q2].iter().enumerate() {
+        let mut oracle = vec![
+            prmi_smem_step_t {
+                sa_start: 0,
+                occ_count: 0,
+                match_len: 0
+            };
+            query_len
+        ];
+        let mut oracle_n: u64 = 0;
+        let rc = unsafe {
+            prmi_forward_spectrum(
+                handle,
+                q.as_ptr(),
+                q.len() as i32,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                oracle.as_mut_ptr(),
+                oracle.len() as u64,
+                &mut oracle_n,
+            )
+        };
+        assert_eq!(rc, 0, "single-query oracle (task {idx}) failed");
+        assert_eq!(
+            oracle_n, lockstep_ns[idx],
+            "task {idx}: oracle nsteps != lockstep"
+        );
+        let off = tasks[idx].steps_off as usize;
+        for k in 0..oracle_n as usize {
+            let o = &oracle[k];
+            let b = &lockstep_steps[off + k];
+            assert_eq!(
+                o.sa_start, b.sa_start,
+                "task {idx} step {k}: oracle sa_start"
+            );
+            assert_eq!(
+                o.occ_count, b.occ_count,
+                "task {idx} step {k}: oracle occ_count"
+            );
+            assert_eq!(
+                o.match_len, b.match_len,
+                "task {idx} step {k}: oracle match_len"
+            );
+        }
+    }
+    for idx in 0..3 {
+        let off = tasks[idx].steps_off as usize;
+        for k in 0..serial_ns[idx] as usize {
+            let a = &serial_steps[off + k];
+            let b = &lockstep_steps[off + k];
+            assert_eq!(a.sa_start, b.sa_start, "task {idx} step {k}: sa_start");
+            assert_eq!(a.occ_count, b.occ_count, "task {idx} step {k}: occ_count");
+            assert_eq!(a.match_len, b.match_len, "task {idx} step {k}: match_len");
+        }
+    }
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
 /// The batch overflow path: a task with `max_steps == 0` for a query that
 /// produces at least one step must cause the batch to return -4, and that
 /// task's `out_nsteps` must be set to the needed count (> 0).
@@ -691,6 +841,100 @@ fn forward_spectrum_batch_overflow_returns_minus_four() {
         out_nsteps[0] > 0,
         "out_nsteps[0] must be set to the needed count (>0), got {}",
         out_nsteps[0]
+    );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// A sizing probe — non-empty queries with NO steps buffer (`steps_arena = NULL`,
+/// `steps_arena_len = 0`, every `max_steps = 0`) — must return `-4` and populate
+/// `out_nsteps` with each task's required step count, identically through BOTH the
+/// serial and lockstep forward-batch entrypoints. The lockstep symbol routes this
+/// case through the bounded serial fill path (rather than materializing every
+/// task's full trace just to answer a sizing probe), so its observable contract
+/// must match the serial symbol exactly.
+#[test]
+fn forward_spectrum_batch_sizing_probe_matches_across_entrypoints() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases: u64 = pac_unpacked.len() as u64;
+
+    // Three real queries (one empty, two non-empty) packed into one arena.
+    let q0 = &pac_unpacked[0..32];
+    let q1 = &pac_unpacked[10..58];
+    let mut queries_arena: Vec<u8> = Vec::new();
+    queries_arena.extend_from_slice(q0);
+    queries_arena.extend_from_slice(q1);
+    let tasks = [
+        prmi_fwd_task_t {
+            query_off: 0,
+            query_len: q0.len() as u32,
+            steps_off: 0,
+            max_steps: 0, // sizing probe: no room advertised
+        },
+        prmi_fwd_task_t {
+            query_off: q0.len() as u64,
+            query_len: q1.len() as u32,
+            steps_off: 0,
+            max_steps: 0,
+        },
+        prmi_fwd_task_t {
+            query_off: 0,
+            query_len: 0, // empty query → 0 steps, rc unaffected
+            steps_off: 0,
+            max_steps: 0,
+        },
+    ];
+
+    let run = |lockstep: bool| -> (i32, [u64; 3]) {
+        let entry = if lockstep {
+            prmi_forward_spectrum_batch_lockstep
+        } else {
+            prmi_forward_spectrum_batch
+        };
+        let mut out_nsteps = [u64::MAX; 3];
+        let rc = unsafe {
+            entry(
+                handle,
+                queries_arena.as_ptr(),
+                queries_arena.len() as u64,
+                tasks.as_ptr(),
+                tasks.len() as u64,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                ptr::null_mut(), // no steps buffer — pure sizing probe
+                0,
+                out_nsteps.as_mut_ptr(),
+            )
+        };
+        (rc, out_nsteps)
+    };
+
+    let (rc_serial, ns_serial) = run(false);
+    let (rc_lockstep, ns_lockstep) = run(true);
+
+    assert_eq!(rc_serial, -4, "sizing probe (serial) must overflow with -4");
+    assert_eq!(
+        rc_lockstep, -4,
+        "sizing probe (lockstep) must overflow with -4"
+    );
+    assert_eq!(
+        ns_serial, ns_lockstep,
+        "sizing-probe counts must match across entrypoints"
+    );
+    assert!(
+        ns_serial[0] > 0 && ns_serial[1] > 0,
+        "non-empty queries must report their required step counts, got {ns_serial:?}"
+    );
+    assert_eq!(
+        ns_serial[2], 0,
+        "empty query must report 0 steps, got {}",
+        ns_serial[2]
     );
 
     unsafe { prmi_close(handle) };
@@ -2225,6 +2469,132 @@ fn backward_spectrum_batch_accepts_null_plus_zero_arenas() {
         rc_bad_steps, -1,
         "NULL steps_arena with nonzero declared length must be rejected, got {rc_bad_steps}"
     );
+
+    unsafe { prmi_close(handle) };
+    drop(dir);
+}
+
+/// `prmi-sys` C ABI entrypoints must accept the canonical empty-slice case
+/// `NULL + len 0` (a C caller's empty buffer) rather than treating the NULL as a
+/// hard error. With `ntasks > 0` but every task empty (`query_len == 0`,
+/// `max_steps == 0`), passing both arenas as `NULL + 0` must succeed with all
+/// `out_nsteps == 0` — and must NOT dereference the NULL arenas. Covers both the
+/// serial and lockstep forward-batch entrypoints, which share the validation path.
+#[test]
+fn forward_spectrum_batch_accepts_null_plus_zero_arenas() {
+    let (dir, prefix_str, pac_unpacked) = build_test_sidecar();
+    let cprefix = CString::new(prefix_str).unwrap();
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { prmi_open(cprefix.as_ptr(), &mut handle) }, 0);
+
+    let pac_packed = pack_bases(&pac_unpacked);
+    let pac_num_bases: u64 = pac_unpacked.len() as u64;
+
+    // Two real tasks, both empty: empty query window and zero step capacity.
+    let tasks = [
+        prmi_fwd_task_t {
+            query_off: 0,
+            query_len: 0,
+            steps_off: 0,
+            max_steps: 0,
+        },
+        prmi_fwd_task_t {
+            query_off: 0,
+            query_len: 0,
+            steps_off: 0,
+            max_steps: 0,
+        },
+    ];
+
+    for lockstep in [false, true] {
+        let mut out_nsteps = [u64::MAX; 2];
+        let entry = if lockstep {
+            prmi_forward_spectrum_batch_lockstep
+        } else {
+            prmi_forward_spectrum_batch
+        };
+        let rc = unsafe {
+            entry(
+                handle,
+                ptr::null(), // queries_arena = NULL ...
+                0,           // ... with queries_arena_len = 0 (canonical empty)
+                tasks.as_ptr(),
+                2,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                ptr::null_mut(), // steps_arena = NULL ...
+                0,               // ... with steps_arena_len = 0 (canonical empty)
+                out_nsteps.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            rc, 0,
+            "lockstep={lockstep}: NULL+0 arenas with empty tasks must succeed, got rc={rc}"
+        );
+        assert_eq!(
+            out_nsteps,
+            [0, 0],
+            "lockstep={lockstep}: empty tasks must produce 0 steps each"
+        );
+    }
+
+    // A NULL arena declared with a NON-zero length is still a hard error (-1).
+    // Both wrappers document the same `-1` ABI contract, so run each bad-arena case
+    // through both entrypoints to catch future drift between them.
+    let bad_tasks = [prmi_fwd_task_t {
+        query_off: 0,
+        query_len: 0,
+        steps_off: 0,
+        max_steps: 0,
+    }];
+    for lockstep in [false, true] {
+        let entry = if lockstep {
+            prmi_forward_spectrum_batch_lockstep
+        } else {
+            prmi_forward_spectrum_batch
+        };
+        let mut bad_out = [0u64; 1];
+        let rc_bad = unsafe {
+            entry(
+                handle,
+                ptr::null(), // NULL queries_arena ...
+                8,           // ... but declared length 8 → reject
+                bad_tasks.as_ptr(),
+                1,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                ptr::null_mut(),
+                0,
+                bad_out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            rc_bad, -1,
+            "lockstep={lockstep}: NULL queries_arena with nonzero declared length must be rejected, got {rc_bad}"
+        );
+
+        // Symmetric check for the OTHER arena: NULL steps_arena with a nonzero declared
+        // length is also a hard error. Pass queries_arena as the accepted `NULL + 0` so
+        // the steps_arena gate is what rejects (not the queries_arena gate).
+        let rc_bad_steps = unsafe {
+            entry(
+                handle,
+                ptr::null(), // queries_arena = NULL ...
+                0,           // ... with len 0 → accepted, so it is not what rejects
+                bad_tasks.as_ptr(),
+                1,
+                pac_packed.as_ptr(),
+                pac_num_bases,
+                ptr::null_mut(), // NULL steps_arena ...
+                8,               // ... but declared length 8 → reject
+                bad_out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            rc_bad_steps, -1,
+            "lockstep={lockstep}: NULL steps_arena with nonzero declared length must be rejected, got {rc_bad_steps}"
+        );
+    }
 
     unsafe { prmi_close(handle) };
     drop(dir);
