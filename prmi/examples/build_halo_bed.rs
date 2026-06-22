@@ -8,8 +8,10 @@
 //! Build the exome-plus keep-set BED: exome targets + a genome-count-capped
 //! homology halo + flanks (Design Z, measurement-only; not shipped).
 //!
-//! Halo definition: every position of the reference whose `k`-mer (a) also occurs
-//! at an exome position AND (b) has total reference count <= C. These are the
+//! Halo definition: every position of the reference whose `k`-mer (a) overlaps an
+//! exome position (its `k`-mer window intersects an exome base) AND (b) has total
+//! reference count <= C (measured against the doubled `[Fwd || RC]` SA, so
+//! palindromes count twice). These are the
 //! low-copy homologous copies of exonic k-mers — including them makes `occ` match
 //! the whole-genome value for exonic seeds (the byte-identity condition), while
 //! the count cap C drops high-copy repeats (which fall back regardless).
@@ -23,6 +25,21 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 
+/// Reverse-complement a right-aligned k-mer code (the `k` bases occupy the low
+/// `2*k` bits, MSB-first, matching the rolling `code` built in both passes).
+/// Canonicalizing each code to `min(code, revcomp_code(code, k))` collapses a
+/// k-mer and its reverse complement into one key — required because the suffix
+/// array is built over the doubled `[Fwd || RC]` text, so a seed's `occ` counts
+/// both its forward copies and the forward copies of its reverse complement.
+fn revcomp_code(mut code: u64, k: usize) -> u64 {
+    let mut rc = 0u64;
+    for _ in 0..k {
+        rc = (rc << 2) | (3 - (code & 3));
+        code >>= 2;
+    }
+    rc
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() != 6 {
@@ -33,15 +50,29 @@ fn main() {
     let bed = &a[2];
     let k: usize = a[3].parse().expect("k");
     let cap: u32 = a[4].parse().expect("cap_C");
-    let flank: i64 = a[5].parse().expect("flank");
+    // Parse `flank` as `usize`: it is only ever added to / subtracted from
+    // 0-based positions, so an unsigned type rejects negatives at parse time
+    // and lets the interval math below use saturating (overflow-free) bounds.
+    let flank: usize = a[5].parse().expect("flank");
     assert!((1..=32).contains(&k), "k must be 1..=32");
 
     // --- read single-contig FASTA into a 2-bit code vec (N -> 4 sentinel) ---
     let mut seq: Vec<u8> = Vec::new();
+    // Contig name for the output BED, taken from the first FASTA header (not
+    // hardcoded) so the tool is correct for any single-contig reference.
+    let mut contig = String::new();
     let f = BufReader::new(std::fs::File::open(fa).expect("open fa"));
     for line in f.lines() {
         let line = line.unwrap();
-        if line.starts_with('>') {
+        if let Some(rest) = line.strip_prefix('>') {
+            if contig.is_empty() {
+                contig = rest.split_whitespace().next().unwrap_or("seq").to_string();
+            } else {
+                // Single-contig tool: a second header would silently mislabel
+                // the appended sequence with the first contig's name.
+                eprintln!("error: FASTA must be single-contig; found additional header: {rest}");
+                std::process::exit(2);
+            }
             continue;
         }
         // `BufRead::lines()` strips `\n` but not a trailing `\r`, so a CRLF FASTA
@@ -65,21 +96,48 @@ fn main() {
     let mut ex: Vec<(usize, usize)> = Vec::new();
     let bf = BufReader::new(std::fs::File::open(bed).expect("open bed"));
     for line in bf.lines() {
-        let line = line.unwrap();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("track") {
+        let raw = line.unwrap();
+        let line = raw.trim();
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with("track")
+            || line.starts_with("browser")
+        {
             continue;
         }
         let c: Vec<&str> = line.split_whitespace().collect();
+        // Fail closed on malformed rows (parity with `MaskConfig::parse_bed`):
+        // a silently-skipped row would shrink the keep-set without any warning.
         if c.len() < 3 {
-            continue;
+            eprintln!("error: BED row needs at least 3 columns: {line:?}");
+            std::process::exit(2);
         }
-        ex.push((c[1].parse().unwrap(), c[2].parse().unwrap()));
+        // Fail closed on a BED contig that does not match the FASTA: the tool
+        // emits intervals in the FASTA contig's coordinates, so a mismatched
+        // (or extra-contig) BED would silently produce mislabeled intervals.
+        if c[0] != contig {
+            eprintln!(
+                "error: BED contig {:?} does not match FASTA contig {:?}",
+                c[0], contig
+            );
+            std::process::exit(2);
+        }
+        let s: usize = c[1].parse().expect("BED start");
+        let e: usize = c[2].parse().expect("BED end");
+        // Reject inverted/empty or out-of-reference intervals rather than
+        // truncating them later: a half-open [s, e) must satisfy s < e <= n.
+        if e <= s || e > n {
+            eprintln!("error: BED interval [{s}, {e}) is invalid for reference length {n}");
+            std::process::exit(2);
+        }
+        ex.push((s, e));
     }
     ex.sort_unstable();
     // membership bitmap over reference positions
     let mut in_exome = vec![false; n];
     for &(s, e) in &ex {
-        for p in s..e.min(n) {
+        // `e <= n` is enforced at parse time, so no clamping is needed here.
+        for p in s..e {
             in_exome[p] = true;
         }
     }
@@ -105,11 +163,29 @@ fn main() {
         code = ((code << 2) | b as u64) & mask;
         valid += 1;
         if valid >= k {
+            // Canonicalize to the smaller of the forward code and its reverse
+            // complement so a k-mer and its RC share one key. The SA is built
+            // over the doubled `[Fwd || RC]` text, so a seed's `occ` (the
+            // "total reference count" the cap C is applied to) counts both
+            // orientations — counting forward-only would undercount it.
             let start = i + 1 - k; // k-mer starting position
-            let c = count.entry(code).or_insert(0);
-            *c = c.saturating_add(1);
-            if in_exome[start] {
-                in_ex_kmer.insert(code, true);
+            let rc = revcomp_code(code, k);
+            let canon = code.min(rc);
+            // A palindromic k-mer (code == its own RC) maps to a single canonical
+            // key, yet it occupies BOTH halves of the doubled `[Fwd || RC]` text
+            // at each forward position, so it contributes 2 to `occ`; a
+            // non-palindrome and its RC are distinct forward k-mers that each add
+            // 1 under the shared key. Counting a palindrome once would halve its
+            // `occ` and wrongly admit a high-copy palindrome past the cap C.
+            let c = count.entry(canon).or_insert(0);
+            *c = c.saturating_add(if code == rc { 2 } else { 1 });
+            // Flag the k-mer as exonic if its window overlaps the exome at ANY
+            // base, not only at `start`: a read covering the exome boundary
+            // produces boundary-spanning seeds whose start is off-exome, and
+            // those seeds still need their low-copy homologs kept for `occ`
+            // byte-identity.
+            if in_exome[start..start + k].iter().any(|&hit| hit) {
+                in_ex_kmer.insert(canon, true);
             }
         }
     }
@@ -139,7 +215,10 @@ fn main() {
         valid += 1;
         if valid >= k {
             let start = i + 1 - k;
-            if halo.contains(&code) {
+            // Match the canonical key used when building `halo` so RC-homolog
+            // positions (off-target copies that are reverse-complemented) are
+            // kept too — they contribute to the exonic seed's `occ`.
+            if halo.contains(&code.min(revcomp_code(code, k))) {
                 for p in start..start + k {
                     keep[p] = true;
                 }
@@ -157,7 +236,7 @@ fn main() {
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let mut halo_bp = 0usize;
     let mut i = 0usize;
-    let mut intervals: Vec<(i64, i64)> = Vec::new();
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
     while i < n {
         if !keep[i] {
             i += 1;
@@ -168,13 +247,15 @@ fn main() {
             i += 1;
         }
         halo_bp += i - s;
-        let fs = (s as i64 - flank).max(0);
-        let fe = (i as i64 + flank).min(n as i64);
+        // Saturating bounds keep the ±flank math in range for any `flank`
+        // value (it is an unbounded CLI argument); `n` clamps the right edge.
+        let fs = s.saturating_sub(flank);
+        let fe = i.saturating_add(flank).min(n);
         intervals.push((fs, fe));
     }
     // merge after flanking
     intervals.sort_unstable();
-    let mut merged: Vec<(i64, i64)> = Vec::new();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
     for (s, e) in intervals {
         match merged.last_mut() {
             Some(last) if s <= last.1 => {
@@ -185,9 +266,9 @@ fn main() {
             _ => merged.push((s, e)),
         }
     }
-    let mut kept_bp = 0i64;
+    let mut kept_bp = 0usize;
     for (s, e) in &merged {
-        writeln!(out, "chr22\t{s}\t{e}").unwrap();
+        writeln!(out, "{contig}\t{s}\t{e}").unwrap();
         kept_bp += e - s;
     }
     eprintln!(

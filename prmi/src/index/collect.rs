@@ -307,8 +307,10 @@ impl LearnedIndex {
     /// cost hundreds of probes. Used by a tiered (Design Z) consumer to send
     /// off-target reads to the whole-genome fallback without paying the full
     /// fast-path search. `read` is 2-bit encoded (`0..=3`, `4` = N); windows
-    /// containing an N are skipped. Returns `true` iff some leading 32-mer window
-    /// fully occurs (`match_len == 32`).
+    /// containing an N are skipped. Inspects only the FIRST N-free 32-mer window
+    /// from the read start: returns `true` iff that window fully occurs
+    /// (`match_len == 32`), and `false` if it does not, or if the read has no
+    /// N-free 32-mer window.
     pub fn present_anchor(&self, read: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
         const K: usize = 32;
         let mut start = 0usize;
