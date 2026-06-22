@@ -63,14 +63,43 @@ fn main() {
     let idx = LearnedIndex::open(Path::new(&prefix)).expect("open index");
     let l_pac = idx.l_pac();
     let pac = std::fs::read(&pac_path).expect("read pac");
+    // Fail fast if the PAC file can't encode all `l_pac` bases (4 per byte),
+    // rather than deferring to an out-of-range byte access deep in the seeding
+    // walk where the cause would be far harder to diagnose.
+    let needed_pac_bytes =
+        usize::try_from(l_pac.div_ceil(4)).expect("l_pac too large for this platform");
+    assert!(
+        pac.len() >= needed_pac_bytes,
+        "PAC too short: need >= {needed_pac_bytes} bytes for l_pac={l_pac}, got {}",
+        pac.len()
+    );
     let enc = PacEncoding::Packed { num_bases: l_pac };
     let f = std::fs::File::open(&fq).expect("open fq");
     let mut lines = BufReader::new(f).lines();
     let mut reads: Vec<Vec<u8>> = Vec::new();
-    while let Some(Ok(_h)) = lines.next() {
-        let Some(Ok(seq)) = lines.next() else { break };
-        let _ = lines.next();
-        let _ = lines.next();
+    // Parse strict 4-line FASTQ blocks, failing closed on I/O errors or a
+    // truncated final record so a malformed input cannot silently undercount
+    // reads and skew the measured throughput.
+    while let Some(h) = lines.next() {
+        let h = h.expect("read FASTQ header line");
+        let seq = lines
+            .next()
+            .transpose()
+            .expect("read FASTQ sequence line")
+            .expect("truncated FASTQ: missing sequence line");
+        let plus = lines
+            .next()
+            .transpose()
+            .expect("read FASTQ '+' line")
+            .expect("truncated FASTQ: missing '+' line");
+        let qual = lines
+            .next()
+            .transpose()
+            .expect("read FASTQ quality line")
+            .expect("truncated FASTQ: missing quality line");
+        assert!(h.starts_with('@'), "invalid FASTQ header: {h}");
+        assert!(plus.starts_with('+'), "invalid FASTQ '+' line: {plus}");
+        assert_eq!(seq.len(), qual.len(), "FASTQ seq/qual length mismatch");
         reads.push(
             seq.bytes()
                 .map(|b| match b {
@@ -116,6 +145,12 @@ fn main() {
         }
     }
     let el = t.elapsed();
+    // Guard against `n == 0` (empty input or `PRMI_REPEAT=0`) before computing
+    // per-read metrics, which would otherwise divide by zero.
+    if n == 0 {
+        eprintln!("no reads processed; check PRMI_REPEAT and FASTQ input");
+        std::process::exit(2);
+    }
     let path = if use_scratch { "scratch" } else { "alloc" };
     println!(
         "wall_gate path={path} reads={n} repeat={repeat} smems={nsmems} \
