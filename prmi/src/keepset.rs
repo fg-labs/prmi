@@ -384,7 +384,7 @@ fn runs_from_bitmap(keep: &[bool], flank: u64) -> Vec<(u64, u64)> {
         let (mut a, mut b) = (s as u64, i as u64);
         if flank > 0 {
             a = a.saturating_sub(flank);
-            b = (b + flank).min(n as u64);
+            b = b.saturating_add(flank).min(n as u64);
         }
         runs.push((a, b));
     }
