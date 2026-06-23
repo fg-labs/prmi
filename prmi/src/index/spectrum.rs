@@ -3577,7 +3577,9 @@ impl LearnedIndex {
     ) -> Vec<SmemStep> {
         // Fail closed on a bad packed pac, exactly as serial `forward_spectrum`.
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "forward_spectrum_via_stepper").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "forward_spectrum_via_stepper")
+                .is_err()
+            {
                 return Vec::new();
             }
         }
@@ -3603,7 +3605,9 @@ impl LearnedIndex {
         // Fail closed on a bad packed pac, exactly as serial `forward_spectrum`:
         // every task yields an empty trace (preserving per-task byte-identity).
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "forward_spectrum_lockstep").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "forward_spectrum_lockstep")
+                .is_err()
+            {
                 return tasks.iter().map(|_| Vec::new()).collect();
             }
         }
@@ -3708,7 +3712,8 @@ impl LearnedIndex {
             occ: 0,
         };
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_via_stepper").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "mem_search_via_stepper").is_err()
+            {
                 return zero;
             }
         }
@@ -3751,7 +3756,7 @@ impl LearnedIndex {
                 .collect();
         }
         if let PacEncoding::Packed { num_bases } = enc {
-            if validate_packed_pac(pac, num_bases, "mem_search_lockstep").is_err() {
+            if validate_packed_pac(pac, num_bases, self.l_pac(), "mem_search_lockstep").is_err() {
                 return tasks.iter().map(|_| zero).collect();
             }
         }
