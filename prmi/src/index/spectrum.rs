@@ -6237,8 +6237,15 @@ mod keyed_tests {
         let cfg = TrainerConfig::default()
             .with_memory_mode(MemoryMode::Mode2)
             .with_kmer_table_k(6);
-        build_sidecar_from_pac_with_config(&pac, &prefix, None, MaskConfig::default(), 1, Some(cfg))
-            .unwrap();
+        build_sidecar_from_pac_with_config(
+            &pac,
+            &prefix,
+            None,
+            MaskConfig::default(),
+            1,
+            Some(cfg),
+        )
+        .unwrap();
         let idx = LearnedIndex::open(&prefix).unwrap();
         assert!(idx.kmt.is_some(), ".kmt fallback branch must be exercised");
 
