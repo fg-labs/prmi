@@ -136,7 +136,10 @@ fn tiered_build_with_isa_inverts_compacted_sa_and_misses_off_keep() {
     let prefix = dir.path().join("ref.prmi");
     // Keep a strict sub-interval so the tiered .sa is a proper subset.
     let mask = MaskConfig {
-        keep_bed: Some(vec![BedInterval { start: 500, end: 1500 }]),
+        keep_bed: Some(vec![BedInterval {
+            start: 500,
+            end: 1500,
+        }]),
         ..MaskConfig::default()
     };
     let cfg = TrainerConfig::default()
@@ -149,11 +152,11 @@ fn tiered_build_with_isa_inverts_compacted_sa_and_misses_off_keep() {
         idx.has_isa(),
         "tiered build --with-isa must produce a loadable sparse .isa"
     );
-    let sa_num = idx.sa_num(); // tiered: the compacted kept-entry count
-    // Keep [500,1500) = 1000 forward positions, kept RC-symmetrically (their
-    // distinct RC images) plus the sentinel = exactly 2*1000 + 1 entries. An
-    // exact count catches a keep-mask that silently fails to apply (the loose
-    // band, and the original `< 2*l_pac+1`, did not).
+    // Tiered: the compacted kept-entry count. Keep [500,1500) = 1000 forward
+    // positions, kept RC-symmetrically (their distinct RC images) plus the
+    // sentinel = exactly 2*1000 + 1 entries. An exact count catches a keep-mask
+    // that silently fails to apply (the loose band, and `< 2*l_pac+1`, did not).
+    let sa_num = idx.sa_num();
     let expected_sa_num = 2 * (1500u64 - 500) + 1;
     assert_eq!(
         sa_num, expected_sa_num,
@@ -193,7 +196,10 @@ fn tiered_build_with_isa_inverts_compacted_sa_and_misses_off_keep() {
             .isa_at(start as u64)
             .expect("the sampled forward start lies inside the keep-set");
         let hinted = idx.mem_search_from_hint(q, hint, true, &bases, e);
-        assert_eq!(hinted, m, "tiered ISA hint must equal cold mem_search at start={start}");
+        assert_eq!(
+            hinted, m,
+            "tiered ISA hint must equal cold mem_search at start={start}"
+        );
     }
 
     // A doubled-coordinate position whose forward coordinate is outside the keep
@@ -201,7 +207,10 @@ fn tiered_build_with_isa_inverts_compacted_sa_and_misses_off_keep() {
     // since 100 < l_pac (3000) it maps to itself (not an RC image), so it is not
     // kept and isa_at must miss — the consumer then falls back to a cold launch.
     let off_keep = 100u64;
-    assert!(off_keep < 500, "the off-keep probe must sit below the keep interval");
+    assert!(
+        off_keep < 500,
+        "the off-keep probe must sit below the keep interval"
+    );
     assert_eq!(idx.isa_at(off_keep), None, "off-keep refpos must miss");
 }
 

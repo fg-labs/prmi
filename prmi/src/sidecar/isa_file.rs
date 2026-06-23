@@ -41,10 +41,10 @@
 
 use crate::error::{Error, Result};
 use crate::sa::{pack_position, unpack_position, BYTES_PER_PACKED_ENTRY};
-use rayon::prelude::*;
 use crate::sidecar::magic::{FORMAT_VERSION, ISA_MAGIC};
 use byteorder::{ByteOrder, LittleEndian};
 use memmap2::{Mmap, MmapMut};
+use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
@@ -172,7 +172,10 @@ pub fn write_isa_file(path: &Path, sa: &[u64]) -> Result<()> {
         // here rather than write out of bounds in release. The serial version
         // this replaced got that panic for free from slice indexing; one compare
         // per entry is negligible against the write it guards.
-        assert!(p < n, "SA value {p} out of range (n={n}); SA must be a permutation");
+        assert!(
+            p < n,
+            "SA value {p} out of range (n={n}); SA must be a permutation"
+        );
         let off = p * BYTES_PER_PACKED_ENTRY;
         let packed = pack_position(i as u64);
         // SAFETY: `p < n` (SA permutation) so `[off, off + 5)` lies within the
@@ -496,7 +499,11 @@ mod tests {
         let r = IsaFileReader::open(&path).unwrap();
         assert_eq!(r.num_entries(), sa.len() as u64);
         for (i, &p) in sa.iter().enumerate() {
-            assert_eq!(r.lookup(p), Some(i as u64), "inv[sa[{i}]={p}] should be {i}");
+            assert_eq!(
+                r.lookup(p),
+                Some(i as u64),
+                "inv[sa[{i}]={p}] should be {i}"
+            );
         }
         // Exact file size.
         let size = std::fs::metadata(&path).unwrap().len();
@@ -538,7 +545,11 @@ mod tests {
         let r = IsaFileReader::open(&path).unwrap();
         assert_eq!(r.num_entries(), sorted.len() as u64);
         for &(refpos, rank) in &sorted {
-            assert_eq!(r.lookup(refpos), Some(rank), "kept refpos {refpos} -> {rank}");
+            assert_eq!(
+                r.lookup(refpos),
+                Some(rank),
+                "kept refpos {refpos} -> {rank}"
+            );
         }
         // Non-kept positions: None (consumer falls back to a cold launch).
         for miss in [1u64, 3, 4, 6, 7, 8, 10, 11, 13, 100] {
@@ -546,7 +557,10 @@ mod tests {
         }
         // Exact file size: header + n * 10.
         let size = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(size, (ISA_FILE_HEADER_BYTES + sorted.len() * SPARSE_ENTRY_BYTES) as u64);
+        assert_eq!(
+            size,
+            (ISA_FILE_HEADER_BYTES + sorted.len() * SPARSE_ENTRY_BYTES) as u64
+        );
     }
 
     #[test]

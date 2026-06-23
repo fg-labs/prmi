@@ -22,7 +22,6 @@ use crate::sidecar::magic::{FORMAT_VERSION, META_MAGIC};
 use crate::sidecar::meta::{Meta, Priors, Prmi, Ref, RmiSpec, Sa};
 use crate::sidecar::model_file::{ModelFileWriter, ModelLayer};
 use crate::sidecar::sa_file::{SaFileWriter, BPE_MODE2};
-use rayon::prelude::*;
 use crate::sidecar::SidecarPaths;
 use crate::train::config::{MemoryMode, TrainerConfig};
 use crate::train::mask::{MaskConfig, NBitmap};
@@ -32,6 +31,7 @@ use crate::train::training_set::{
     keep_masked_training_set, masked_training_set, streamed_training_set,
 };
 use crate::train::verify::compute_error_distribution;
+use rayon::prelude::*;
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
