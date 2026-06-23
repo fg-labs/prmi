@@ -30,9 +30,13 @@ jobs:
       # and would reformat Marcus's verbatim 2020-era code. Install nightly for
       # the fmt check only. Stable is installed last below so it stays the
       # default toolchain for clippy/build/test.
+      #
+      # Pin to a specific nightly date: a floating `nightly` silently bumps
+      # rustfmt under us, reformatting unchanged code and turning every open
+      # PR's fmt check red on a new release. Bump this deliberately.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-06-22
           components: rustfmt
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable, 2026-05-21
         with:
@@ -43,7 +47,7 @@ jobs:
       # this step ensures the library exists on the runner.
       - if: runner.os == 'macOS'
         run: brew install libomp
-      - run: cargo +nightly fmt --all -- --check
+      - run: cargo +nightly-2026-06-22 fmt --all -- --check
       # Lint only the Fulcrum-authored crates. prmi/src/upstream/ carries
       # verbatim 2020-era code; cleaning Marcus's lints would force
       # `Modified by Fulcrum Genomics 2026` headers across every file and
