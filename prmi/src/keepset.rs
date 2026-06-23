@@ -148,12 +148,8 @@ fn read_fasta_contigs(path: &Path) -> Result<(Vec<u8>, Vec<Contig>)> {
 /// Parse a per-contig BED3 target file and map each interval into flat
 /// coordinates using the contig table. The chrom column must name a contig in
 /// the reference; `end` must not exceed the contig length.
-fn parse_target_bed_to_flat(
-    path: &Path,
-    contigs: &[Contig],
-) -> Result<Vec<(u64, u64)>> {
-    let by_name: HashMap<&str, &Contig> =
-        contigs.iter().map(|c| (c.name.as_str(), c)).collect();
+fn parse_target_bed_to_flat(path: &Path, contigs: &[Contig]) -> Result<Vec<(u64, u64)>> {
+    let by_name: HashMap<&str, &Contig> = contigs.iter().map(|c| (c.name.as_str(), c)).collect();
     let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -228,7 +224,11 @@ fn parse_target_bed_to_flat(
 /// The rolling code resets at any [`N_SENTINEL`] base, so no window spans an N.
 /// `k` must be in 1..=32 (caller-validated).
 fn for_each_kmer(bases: &[u8], k: usize, mut f: impl FnMut(usize, u64)) {
-    let mask: u64 = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mask: u64 = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
     let mut code: u64 = 0;
     let mut valid: usize = 0;
     for (i, &b) in bases.iter().enumerate() {
@@ -428,8 +428,10 @@ fn emit_bed12<W: Write>(
         let span_start = chunk[0].0;
         let span_end = chunk[chunk.len() - 1].1;
         let sizes: Vec<String> = chunk.iter().map(|&(s, e)| (e - s).to_string()).collect();
-        let starts: Vec<String> =
-            chunk.iter().map(|&(s, _)| (s - span_start).to_string()).collect();
+        let starts: Vec<String> = chunk
+            .iter()
+            .map(|&(s, _)| (s - span_start).to_string())
+            .collect();
         writeln!(
             out,
             "{chrom}\t{span_start}\t{span_end}\tkeep\t0\t+\t{span_start}\t{span_end}\t0\t{}\t{}\t{}",
@@ -465,9 +467,7 @@ pub fn build_keepset<W: Write>(
     let kept_bp: u64 = runs.iter().map(|&(s, e)| e - s).sum();
     let lines_written = match opts.format {
         KeepsetFormat::Bed3 => emit_bed3(out, &opts.chrom_label, &runs)?,
-        KeepsetFormat::Bed12 => {
-            emit_bed12(out, &opts.chrom_label, &runs, opts.blocks_per_line)?
-        }
+        KeepsetFormat::Bed12 => emit_bed12(out, &opts.chrom_label, &runs, opts.blocks_per_line)?,
     };
     Ok(KeepsetStats {
         genome_len,
@@ -573,7 +573,10 @@ mod tests {
         // Uncapped, the four reverse-complement homolog starts are kept too.
         let uncapped = compute_keep_runs(&b, &[(0, 1)], 2, 0, 0).unwrap();
         let kept_bp_u: u64 = uncapped.iter().map(|&(s, e)| e - s).sum();
-        assert_eq!(kept_bp_u, 5, "uncapped keeps the RC homolog starts (0,2,4,6,8)");
+        assert_eq!(
+            kept_bp_u, 5,
+            "uncapped keeps the RC homolog starts (0,2,4,6,8)"
+        );
     }
 
     #[test]
@@ -583,17 +586,29 @@ mod tests {
         let mut keep = vec![false; 12];
         keep[5] = true;
         assert_eq!(runs_from_bitmap(&keep, 0), vec![(5, 6)]);
-        assert_eq!(runs_from_bitmap(&keep, 1), vec![(4, 7)], "flank=1 widens to [4,7)");
+        assert_eq!(
+            runs_from_bitmap(&keep, 1),
+            vec![(4, 7)],
+            "flank=1 widens to [4,7)"
+        );
         // Two nearby positions whose flanks overlap must merge into one run.
         let mut keep2 = vec![false; 12];
         keep2[3] = true;
         keep2[5] = true;
-        assert_eq!(runs_from_bitmap(&keep2, 1), vec![(2, 7)], "overlapping flanks merge");
+        assert_eq!(
+            runs_from_bitmap(&keep2, 1),
+            vec![(2, 7)],
+            "overlapping flanks merge"
+        );
         // Flank clamps at the genome bounds.
         let mut keep3 = vec![false; 5];
         keep3[0] = true;
         keep3[4] = true;
-        assert_eq!(runs_from_bitmap(&keep3, 10), vec![(0, 5)], "flank clamps to [0,len]");
+        assert_eq!(
+            runs_from_bitmap(&keep3, 10),
+            vec![(0, 5)],
+            "flank clamps to [0,len]"
+        );
     }
 
     #[test]
@@ -635,8 +650,16 @@ mod tests {
         // Two contigs of length 10 and 8; a target on the second contig maps to
         // flat offset 10 + local.
         let contigs = vec![
-            Contig { name: "chr1".into(), offset: 0, len: 10 },
-            Contig { name: "chr2".into(), offset: 10, len: 8 },
+            Contig {
+                name: "chr1".into(),
+                offset: 0,
+                len: 10,
+            },
+            Contig {
+                name: "chr2".into(),
+                offset: 10,
+                len: 8,
+            },
         ];
         let mut bed = NamedTempFile::new().unwrap();
         writeln!(bed, "chr2\t2\t5").unwrap();
@@ -678,7 +701,11 @@ mod tests {
 
     #[test]
     fn target_bed_rejects_unknown_chrom_and_overrun() {
-        let contigs = vec![Contig { name: "chr1".into(), offset: 0, len: 10 }];
+        let contigs = vec![Contig {
+            name: "chr1".into(),
+            offset: 0,
+            len: 10,
+        }];
         let mut bad_chrom = NamedTempFile::new().unwrap();
         writeln!(bad_chrom, "chrX\t0\t5").unwrap();
         bad_chrom.flush().unwrap();

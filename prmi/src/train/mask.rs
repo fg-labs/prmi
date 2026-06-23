@@ -513,7 +513,11 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t2\t10,20\t0,50").unwrap();
         let intervals = parse_bed(f.path()).unwrap();
-        assert_eq!(intervals.len(), 2, "two disjoint blocks, not the whole span");
+        assert_eq!(
+            intervals.len(),
+            2,
+            "two disjoint blocks, not the whole span"
+        );
         assert_eq!((intervals[0].start, intervals[0].end), (100, 110));
         assert_eq!((intervals[1].start, intervals[1].end), (150, 170));
         assert!(covered_by_bed(&intervals, 100));
@@ -523,7 +527,10 @@ mod tests {
         assert!(covered_by_bed(&intervals, 150));
         assert!(covered_by_bed(&intervals, 169));
         assert!(!covered_by_bed(&intervals, 170), "block2 end is exclusive");
-        assert!(!covered_by_bed(&intervals, 199), "span tail past last block not kept");
+        assert!(
+            !covered_by_bed(&intervals, 199),
+            "span tail past last block not kept"
+        );
     }
 
     #[test]
