@@ -28,7 +28,7 @@ fn main() {
 
 #[cfg(feature = "spectrum-probe-count")]
 fn main() {
-    use prmi::index::collect::{CollectOpts, Smem};
+    use prmi::index::collect::{CollectOpts, CollectScratch, Smem};
     use prmi::index::smem::PacEncoding;
     use prmi::index::LearnedIndex;
     use std::io::{BufRead, BufReader};
@@ -43,28 +43,76 @@ fn main() {
     let full = LearnedIndex::open(Path::new(&require("PRMI_FULL"))).expect("open full");
     let fast = LearnedIndex::open(Path::new(&require("PRMI_FAST"))).expect("open fast");
     let pac = std::fs::read(require("PRMI_PAC")).expect("read pac");
-    let cap: i64 = std::env::var("PRMI_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    // Default to 10 only when PRMI_CAP is absent; a present-but-unparsable value is
+    // misconfiguration and must fail fast rather than silently run as cap 10.
+    let cap: i64 = match std::env::var("PRMI_CAP") {
+        Ok(s) => s
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid PRMI_CAP {s:?}: {e}")),
+        Err(std::env::VarError::NotPresent) => 10,
+        Err(e) => panic!("read PRMI_CAP: {e}"),
+    };
+    // A non-positive cap makes `max_s < cap` unsatisfiable for every read, so the
+    // P2/P3 predicates silently collapse to zero served and the harness reports
+    // nonsense. Fail fast on bad configuration instead.
+    assert!(cap > 0, "PRMI_CAP must be > 0 (got {cap})");
     let l_pac = full.l_pac();
-    assert_eq!(l_pac, fast.l_pac(), "full and fast must share the genome length");
+    assert_eq!(
+        l_pac,
+        fast.l_pac(),
+        "full and fast must share the genome length"
+    );
+    // A truncated or wrong-reference PRMI_PAC would let the harness print convincing
+    // but meaningless concordance numbers; reject it up front against the genome
+    // length both indices agree on (bntpac is 2 bits/base → `l_pac.div_ceil(4)` bytes).
+    let expected_pac_bytes =
+        usize::try_from(l_pac.div_ceil(4)).expect("l_pac does not fit in usize");
+    assert_eq!(
+        pac.len(),
+        expected_pac_bytes,
+        "PRMI_PAC length does not match index l_pac"
+    );
     let enc = PacEncoding::Packed { num_bases: l_pac };
-    let opts = CollectOpts { min_seed_len: 19, split_len: 28, split_width: 10, max_mem_intv: 20 };
+    let opts = CollectOpts {
+        min_seed_len: 19,
+        split_len: 28,
+        split_width: 10,
+        max_mem_intv: 20,
+    };
 
     // A read's SMEM signature: sorted (m, n, s, sorted genome positions) — the
     // byte-identity-relevant content. Positions are fetched only when (m,n,s)
     // already agree (an (m,n,s) mismatch is divergence regardless of positions).
-    let smem_mns = |idx: &LearnedIndex, read: &[u8]| -> Vec<Smem> {
-        let zero = Smem { rid: 0, m: 0, n: 0, k: 0, l: 0, s: 0 };
-        let mut buf = vec![zero; 4096];
+    // Reuse one `CollectScratch` AND a pair of output buffers across every per-read
+    // `collect_smems_into` call (the scratch is cleared on entry, so this stays
+    // byte-identical to `collect_smems`) to avoid allocator churn: both the two
+    // internal scratch buffers and the 4096-`Smem` output Vec would otherwise be
+    // reallocated and zero-filled on each of the two calls per present read.
+    let zero = Smem {
+        rid: 0,
+        m: 0,
+        n: 0,
+        k: 0,
+        l: 0,
+        s: 0,
+    };
+    let mut fast_smems = vec![zero; 4096];
+    let mut full_smems = vec![zero; 4096];
+    // Collect into the caller-held `buf` (grown on overflow) and return the count;
+    // the caller then slices `buf[..n]`. Reused across reads — no per-read alloc.
+    let smem_mns = |idx: &LearnedIndex,
+                    read: &[u8],
+                    buf: &mut Vec<Smem>,
+                    scratch: &mut CollectScratch|
+     -> usize {
         loop {
-            match idx.collect_smems(read, 0, &opts, &pac, enc, &mut buf) {
-                Ok(n) => {
-                    buf.truncate(n);
-                    return buf;
-                }
+            match idx.collect_smems_into(read, 0, &opts, &pac, enc, buf.as_mut_slice(), scratch) {
+                Ok(n) => return n,
                 Err(need) => buf.resize(need, zero),
             }
         }
     };
+    let mut scratch = CollectScratch::new();
     let positions = |idx: &LearnedIndex, k: u64, s: i64| -> Vec<u64> {
         let mut out = vec![0u64; s as usize];
         idx.sa_positions(k, &mut out).expect("sa_positions");
@@ -89,18 +137,27 @@ fn main() {
         fa_s.sort_unstable_by(ord);
         fu_s.sort_unstable_by(ord);
         fa_s.iter().zip(&fu_s).all(|(a, b)| {
-            a.m == b.m && a.n == b.n && a.s == b.s && positions(&fast, a.k as u64, a.s) == positions(&full, b.k as u64, b.s)
+            a.m == b.m
+                && a.n == b.n
+                && a.s == b.s
+                && positions(&fast, a.k as u64, a.s) == positions(&full, b.k as u64, b.s)
         })
     };
 
     let files: Vec<String> = std::env::args().skip(1).collect();
+    // No input paths → every tally stays zero and the harness would print convincing
+    // but meaningless all-zero metrics; surface the bad invocation instead.
+    assert!(
+        !files.is_empty(),
+        "usage: z_accept_gate <reads.fq> [reads2.fq ...]"
+    );
     // Tallies. P1 = present; P2 = present & max_s<cap; P3 = present & max_s<cap & full-cover.
     let (mut total, mut absent) = (0u64, 0u64);
     let (mut p_acc_ok, mut p_acc_bad) = ([0u64; 3], [0u64; 3]); // served-correct / FALSE-ACCEPT
     let mut present_total = 0u64;
     let mut present_identical = 0u64;
     let mut diag = [0u64; 4]; // present reads: [identical&lo, identical&hi, divergent&lo, divergent&hi] by max_s_full vs cap
-    // Divergent-span classification across all divergent reads, keyed by (m,n).
+                              // Divergent-span classification across all divergent reads, keyed by (m,n).
     let mut miss_class = [0u64; 3]; // [reseed-like(contained), read-boundary, primary-interior]
     let mut miss_occ = [0u64; 5]; // full-occ of the divergent span: 1,2,3,4,5+
     let (mut div_occ_reduced, mut div_wholly_missing) = (0u64, 0u64);
@@ -109,10 +166,36 @@ fn main() {
     for path in &files {
         let f = std::fs::File::open(path).unwrap_or_else(|_| panic!("open {path}"));
         let mut lines = BufReader::new(f).lines();
-        while let Some(Ok(_h)) = lines.next() {
-            let Some(Ok(seq)) = lines.next() else { break };
-            let _ = lines.next();
-            let _ = lines.next();
+        while let Some(h) = lines.next() {
+            // A truncated tail (a record missing its `+` or quality line) must fail
+            // fast: counting it would skew present_total, the predicate tallies, and
+            // the divergence diagnostics. Require all four FASTQ lines per record.
+            let header = h.unwrap_or_else(|e| panic!("read {path}: {e}"));
+            assert!(
+                header.starts_with('@'),
+                "invalid FASTQ in {path}: header line expected, got {header:?}"
+            );
+            let Some(seq) = lines.next() else {
+                panic!("truncated FASTQ in {path}: missing sequence after header");
+            };
+            let seq = seq.unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let Some(plus) = lines.next() else {
+                panic!("truncated FASTQ in {path}: missing '+' line after sequence");
+            };
+            let plus = plus.unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let Some(qual) = lines.next() else {
+                panic!("truncated FASTQ in {path}: missing quality line after '+'");
+            };
+            let qual = qual.unwrap_or_else(|e| panic!("read {path}: {e}"));
+            assert!(
+                plus.starts_with('+'),
+                "invalid FASTQ in {path}: '+' line expected, got {plus:?}"
+            );
+            assert_eq!(
+                qual.len(),
+                seq.len(),
+                "invalid FASTQ in {path}: seq/qual length mismatch"
+            );
             let read: Vec<u8> = seq
                 .bytes()
                 .map(|b| match b {
@@ -129,9 +212,11 @@ fn main() {
                 continue;
             }
             present_total += 1;
-            let fa = smem_mns(&fast, &read);
-            let fu = smem_mns(&full, &read);
-            let id = identical(&fa, &fu);
+            let fa_n = smem_mns(&fast, &read, &mut fast_smems, &mut scratch);
+            let fu_n = smem_mns(&full, &read, &mut full_smems, &mut scratch);
+            let fa = &fast_smems[..fa_n];
+            let fu = &full_smems[..fu_n];
+            let id = identical(fa, fu);
             if id {
                 present_identical += 1;
             }
@@ -148,19 +233,26 @@ fn main() {
                 let fast_at = |m: u32, n: u32| -> Option<i64> {
                     fa.iter().find(|a| a.m == m && a.n == n).map(|a| a.s)
                 };
-                let full_has = |m: u32, n: u32| -> bool {
-                    fu.iter().any(|g| g.m == m && g.n == n)
-                };
+                let full_has = |m: u32, n: u32| -> bool { fu.iter().any(|g| g.m == m && g.n == n) };
                 // A span is reseed-like if strictly contained in another full span.
                 let classify = |f: &Smem| -> usize {
-                    let contained = fu.iter().any(|g| (g.m, g.n) != (f.m, f.n) && g.m <= f.m && f.n <= g.n);
+                    let contained = fu
+                        .iter()
+                        .any(|g| (g.m, g.n) != (f.m, f.n) && g.m <= f.m && f.n <= g.n);
                     let boundary = f.m == 0 || f.n == rend;
-                    if contained { 0 } else if boundary { 1 } else { 2 } // reseed/boundary/primary
+                    if contained {
+                        0
+                    } else if boundary {
+                        1
+                    } else {
+                        2
+                    } // reseed/boundary/primary
                 };
-                for f in &fu {
+                for f in fu {
                     let divergent_span = match fast_at(f.m, f.n) {
-                        Some(s) if s == f.s => false,        // matched exactly
-                        Some(s) if s < f.s => {              // occ-reduced (missing copies)
+                        Some(s) if s == f.s => false, // matched exactly
+                        Some(s) if s < f.s => {
+                            // occ-reduced (missing copies)
                             div_occ_reduced += 1;
                             true
                         }
@@ -168,7 +260,8 @@ fn main() {
                             div_occ_inflated += 1; // fast occ > full occ — ALARMING
                             true
                         }
-                        None => {                            // span wholly absent in fast
+                        None => {
+                            // span wholly absent in fast
                             div_wholly_missing += 1;
                             true
                         }
@@ -179,7 +272,7 @@ fn main() {
                     }
                 }
                 // Over-emit: fast spans full entirely lacks (true subset violation).
-                for a in &fa {
+                for a in fa {
                     if !full_has(a.m, a.n) {
                         div_over_emit += 1;
                     }
@@ -188,7 +281,7 @@ fn main() {
             let max_s = fa.iter().map(|s| s.s).max().unwrap_or(0);
             // full read coverage by served SMEM spans [m, n] (n inclusive).
             let mut covered = vec![false; read.len()];
-            for s in &fa {
+            for s in fa {
                 for p in s.m..=s.n.min(read.len() as u32 - 1) {
                     covered[p as usize] = true;
                 }
@@ -211,11 +304,23 @@ fn main() {
     let pct = |x: u64| 100.0 * x as f64 / total.max(1) as f64;
     eprintln!("=== z_accept_gate (cap={cap}) ===");
     eprintln!("reads={total}  absent(→fallback)={absent} ({:.1}%)  present={present_total}  of which identical-to-full={present_identical}", pct(absent));
-    let names = ["P1 present-only", "P2 present & max_s<cap", "P3 present & max_s<cap & full-cover"];
+    let names = [
+        "P1 present-only",
+        "P2 present & max_s<cap",
+        "P3 present & max_s<cap & full-cover",
+    ];
     for i in 0..3 {
+        // A predicate "serves" every read it accepts — both the correct ones and the
+        // false-accepts — so the served fraction is `ok + false_accept`; report that
+        // total alongside the correct count and the false-accept count.
+        let served = p_acc_ok[i] + p_acc_bad[i];
         eprintln!(
-            "  {:<38} served-correct={:<6} ({:.1}%)  FALSE-ACCEPT={}",
-            names[i], p_acc_ok[i], pct(p_acc_ok[i]), p_acc_bad[i]
+            "  {:<38} served={:<6} ({:.1}%)  served-correct={:<6}  FALSE-ACCEPT={}",
+            names[i],
+            served,
+            pct(served),
+            p_acc_ok[i],
+            p_acc_bad[i]
         );
     }
     eprintln!(
