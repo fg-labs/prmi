@@ -53,7 +53,11 @@ fn main() {
                     continue 'w;
                 }
             }
-            if fast.mem_search(&read[start..start + K], &pac, enc).match_len as usize >= K {
+            if fast
+                .mem_search(&read[start..start + K], &pac, enc)
+                .match_len as usize
+                >= K
+            {
                 return Some(start);
             }
             start += 1;
@@ -100,7 +104,10 @@ fn main() {
                 misroute += 1;
                 // A mis-route's leading N-free window missed, so the first hit is
                 // always at offset >= 1 (offset 0 is unreachable here).
-                debug_assert!(off >= 1, "mis-route first hit must be past the leading window");
+                debug_assert!(
+                    off >= 1,
+                    "mis-route first hit must be past the leading window"
+                );
                 let bucket = match off {
                     1 => 0,
                     2 => 1,
@@ -125,7 +132,11 @@ fn main() {
     );
     eprintln!(
         "  bloom gate present   ({}) : {bloom_present} ({:.2}%)",
-        if has_bloom { "prmi_present_bloom, .blm loaded" } else { "no .blm -> first-window" },
+        if has_bloom {
+            "prmi_present_bloom, .blm loaded"
+        } else {
+            "no .blm -> first-window"
+        },
         pct(bloom_present, total)
     );
     if has_bloom && bloom_present != any_present {
@@ -142,9 +153,19 @@ fn main() {
     );
     // Offset = the 0-based window index of the first hit. For a mis-route the
     // leading window missed, so the offset is always >= 1.
-    let labels = ["offset 1", "offset 2", "offset 3-5", "offset 6-10", "offset >10"];
+    let labels = [
+        "offset 1",
+        "offset 2",
+        "offset 3-5",
+        "offset 6-10",
+        "offset >10",
+    ];
     eprintln!("  mis-route first-hit window offset (windows past read start; >=1):");
     for (i, lbl) in labels.iter().enumerate() {
-        eprintln!("    {lbl:>12}: {} ({:.1}% of mis-routes)", hit_at[i], pct(hit_at[i], misroute));
+        eprintln!(
+            "    {lbl:>12}: {} ({:.1}% of mis-routes)",
+            hit_at[i],
+            pct(hit_at[i], misroute)
+        );
     }
 }

@@ -427,7 +427,10 @@ fn write_pac(path: &std::path::Path, bases: &[u8]) {
         buf[i >> 2] |= b << ((3 - (i & 3)) * 2);
     }
     buf.push((l % 4) as u8);
-    std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
+    std::fs::File::create(path)
+        .unwrap()
+        .write_all(&buf)
+        .unwrap();
 }
 
 /// Deterministic pseudo-random 0..=3 base sequence (xorshift).
@@ -527,7 +530,10 @@ fn open_shm_without_blm_has_no_bloom() {
     assert_eq!(blob.blm_len, 0, "no .blm was built, so blm_len must be 0");
     assert_eq!(blob.blm_offset, 0, "absent .blm must have offset 0");
     let idx = LearnedIndex::open_shm(&shm_path).unwrap();
-    assert!(!idx.has_bloom(), "an shm blob without .blm must not load a bloom");
+    assert!(
+        !idx.has_bloom(),
+        "an shm blob without .blm must not load a bloom"
+    );
 }
 
 /// A sidecar built WITH `--with-bloom` carries the `.blm` into the shm blob;

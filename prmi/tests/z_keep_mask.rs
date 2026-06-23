@@ -92,7 +92,12 @@ fn build_with_bloom(bases: &[u8], keep: Vec<BedInterval>, prefix: &std::path::Pa
 
 /// Build a mode-2 tiered sidecar with a Lever 3 `routing_pad`-padded `.blm` (the
 /// routing bloom covers keep ± pad; the `.sa` keep-mask stays tight).
-fn build_with_routing_pad(bases: &[u8], keep: Vec<BedInterval>, pad: u64, prefix: &std::path::Path) {
+fn build_with_routing_pad(
+    bases: &[u8],
+    keep: Vec<BedInterval>,
+    pad: u64,
+    prefix: &std::path::Path,
+) {
     let dir = prefix.parent().unwrap();
     let pac = dir.join(format!(
         "{}.pac",
@@ -316,7 +321,10 @@ fn present_anchor_bloom_matches_any_window_with_blm_and_first_window_without() {
     let blm_p = dir.path().join("zblm.prmi");
     build_with_bloom(&bases, keep.clone(), &blm_p);
     let zb = LearnedIndex::open(&blm_p).unwrap();
-    assert!(zb.has_bloom(), "build_with_bloom must produce a loadable .blm");
+    assert!(
+        zb.has_bloom(),
+        "build_with_bloom must produce a loadable .blm"
+    );
 
     // (b) Same tiered index WITHOUT a `.blm`: bloom gate == first-window gate.
     let noblm_p = dir.path().join("znoblm.prmi");
@@ -349,10 +357,19 @@ fn present_anchor_bloom_matches_any_window_with_blm_and_first_window_without() {
         checked += 1;
     }
     // Spot the three intended verdicts so the equivalences above aren't vacuous.
-    assert!(zb.present_anchor_bloom(boundary, &bases, e), "boundary read should be served by the bloom gate");
-    assert!(!zn.present_anchor_bloom(boundary, &bases, e), "boundary read is mis-routed by the first-window gate");
+    assert!(
+        zb.present_anchor_bloom(boundary, &bases, e),
+        "boundary read should be served by the bloom gate"
+    );
+    assert!(
+        !zn.present_anchor_bloom(boundary, &bases, e),
+        "boundary read is mis-routed by the first-window gate"
+    );
     assert!(zb.present_anchor_bloom(served, &bases, e));
-    assert!(!zb.present_anchor_bloom(off, &bases, e), "fully off-keep read must miss the bloom gate");
+    assert!(
+        !zb.present_anchor_bloom(off, &bases, e),
+        "fully off-keep read must miss the bloom gate"
+    );
 
     // Dense sweep across the boundary so any false negative/positive in the
     // bloom+confirm path (vs the exact any-window gate) surfaces.
@@ -389,7 +406,10 @@ fn present_anchor_bloom_first_has_no_false_negatives_vs_first_window() {
     let blm_p = dir.path().join("zblm.prmi");
     build_with_bloom(&bases, keep.clone(), &blm_p);
     let zb = LearnedIndex::open(&blm_p).unwrap();
-    assert!(zb.has_bloom(), "build_with_bloom must produce a loadable .blm");
+    assert!(
+        zb.has_bloom(),
+        "build_with_bloom must produce a loadable .blm"
+    );
 
     // (b) Same tiered index WITHOUT a `.blm`.
     let noblm_p = dir.path().join("znoblm.prmi");

@@ -2574,7 +2574,9 @@ unsafe fn present_gate_first_window(
     let pac_bytes = match packed_pac_bytes(pac_num_bases) {
         Some(b) => b,
         None => {
-            set_last_error(&format!("{name}: pac_num_bases too large for this platform"));
+            set_last_error(&format!(
+                "{name}: pac_num_bases too large for this platform"
+            ));
             return -2;
         }
     };
@@ -2587,8 +2589,9 @@ unsafe fn present_gate_first_window(
     let enc = prmi::index::smem::PacEncoding::Packed {
         num_bases: pac_num_bases,
     };
-    let res =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate(&h.idx, r, pac_slice, enc)));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gate(&h.idx, r, pac_slice, enc)
+    }));
     match res {
         Ok(true) => 1,
         Ok(false) => 0,

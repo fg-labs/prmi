@@ -497,12 +497,12 @@ fn validate_blm_header(data: &[u8], path: &Path) -> Result<(u64, u32, u64, u64, 
         file: path.to_path_buf(),
         detail: format!("num_bits too large: {num_bits}"),
     })?;
-    let expected_len = body
-        .checked_add(BLM_FILE_HEADER_BYTES)
-        .ok_or_else(|| Error::SizeMismatch {
-            file: path.to_path_buf(),
-            detail: format!(".blm size overflow for num_bits={num_bits}"),
-        })?;
+    let expected_len =
+        body.checked_add(BLM_FILE_HEADER_BYTES)
+            .ok_or_else(|| Error::SizeMismatch {
+                file: path.to_path_buf(),
+                detail: format!(".blm size overflow for num_bits={num_bits}"),
+            })?;
     if data.len() != expected_len {
         return Err(Error::SizeMismatch {
             file: path.to_path_buf(),
@@ -527,7 +527,9 @@ mod tests {
     /// Every inserted key reports present (no false negatives by construction).
     #[test]
     fn bloom_has_no_false_negatives() {
-        let keys: Vec<u64> = (0..10_000u64).map(|i| splitmix64(i.wrapping_mul(7))).collect();
+        let keys: Vec<u64> = (0..10_000u64)
+            .map(|i| splitmix64(i.wrapping_mul(7)))
+            .collect();
         let params = BloomParams::for_keys(keys.len() as u64, 0.01);
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.blm");
@@ -577,7 +579,10 @@ mod tests {
             }
         }
         let rate = fp as f64 / trials as f64;
-        assert!(rate < 0.05, "empirical fp rate {rate} unexpectedly high (target 1%)");
+        assert!(
+            rate < 0.05,
+            "empirical fp rate {rate} unexpectedly high (target 1%)"
+        );
     }
 
     /// Empty key set: a minimal filter where every query misses.
@@ -601,7 +606,10 @@ mod tests {
         let p1 = BloomParams::for_keys(1_000_000, 0.01);
         // ~9.585 bits/key at 1%; rounded to 64-bit words.
         let bits_per_key = p1.num_bits as f64 / 1_000_000.0;
-        assert!((9.0..11.0).contains(&bits_per_key), "1% bits/key = {bits_per_key}");
+        assert!(
+            (9.0..11.0).contains(&bits_per_key),
+            "1% bits/key = {bits_per_key}"
+        );
         assert!(p1.num_bits % 64 == 0);
         // A tighter fp needs a bigger filter and more hashes.
         let p2 = BloomParams::for_keys(1_000_000, 0.001);
