@@ -283,6 +283,7 @@ fn meta_toml_records_combined_mask_config() {
         mask_homopolymers: Some(15),
         mask_bed: None,
         mask_bed_path: None,
+        ..Default::default()
     };
     build_sidecar(&fa, &prefix, Some(16), mask, 1).unwrap();
 

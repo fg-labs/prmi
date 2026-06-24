@@ -27,7 +27,9 @@ use crate::train::config::{MemoryMode, TrainerConfig};
 use crate::train::mask::{MaskConfig, NBitmap};
 use crate::train::prior::Prior;
 use crate::train::trainer::default_l2_leaf_count;
-use crate::train::training_set::{masked_training_set, streamed_training_set};
+use crate::train::training_set::{
+    keep_masked_training_set, masked_training_set, streamed_training_set,
+};
 use crate::train::verify::compute_error_distribution;
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
@@ -192,6 +194,24 @@ fn build_sidecar_core(
     // Forward (unpadded) genome length = l_pac.
     let genome_len = bases.len() as u64;
 
+    // Fail fast on a degenerate tiered keep-set BEFORE building the (expensive)
+    // doubled GSA. A `--keep-bed` with no intervals, or whose every interval
+    // starts at or after the forward genome length, can retain only the
+    // sentinel row; it would otherwise build the entire 2× SA and then fail at
+    // the empty-training-set guard far below. An interval `[s, e)` can retain a
+    // forward coordinate iff `s < genome_len` (parse_bed guarantees `e > s`, so
+    // a `0 < e` lower bound always holds). This is a user-input error.
+    if let Some(keep) = mask.keep_bed.as_deref() {
+        if !keep.iter().any(|iv| iv.start < genome_len) {
+            return Err(Error::InvalidInput {
+                detail: "--keep-bed contains no intervals overlapping the reference \
+                         (every interval starts at or after the genome length); \
+                         nothing to retain"
+                    .to_string(),
+            });
+        }
+    }
+
     // Build the 2× generalized suffix array over [Fwd||RC]+sentinel. No
     // T-padding and no filtering: every entry is retained, including the
     // sentinel/empty-suffix row, so SA order is byte-identical to the FMI.
@@ -200,8 +220,32 @@ fn build_sidecar_core(
     let text = std::sync::Arc::new(crate::sa::build_doubled_2x_text(&bases));
     let sa = std::sync::Arc::new(crate::sa::build_gsa(&text, threads)?);
 
-    // Resolve the optional l2_leaf_count: use provided value or auto-scale.
-    let l2_leaf_count = l2_leaf_count.unwrap_or_else(|| default_l2_leaf_count(sa.len()));
+    // Tiered (Design Z) keep-mask. When set, the `.sa` retains only entries
+    // whose forward reference coordinate lies in the keep-set, applied
+    // RC-symmetrically over the doubled text; `genome_len` (the full forward
+    // length) stays `l_pac` so doubled-coordinate decoding and native genome
+    // positions are unchanged, while the entry COUNT shrinks. `keep_doubled_pos`
+    // returns true for every entry when there is no keep-set, so the full build
+    // is byte-identical.
+    let keep = mask.keep_bed.as_deref();
+    let keep_pos =
+        |pos: u64| keep.is_none_or(|k| crate::train::mask::keep_doubled_pos(k, pos, genome_len));
+    let num_sa_entries: u64 = match keep {
+        None => sa.len() as u64,
+        Some(_) => sa.iter().filter(|&&pos| keep_pos(pos)).count() as u64,
+    };
+    if keep.is_some() {
+        log::info!(
+            "tiered keep-mask: retaining {num_sa_entries} of {} SA entries ({:.3}%)",
+            sa.len(),
+            100.0 * num_sa_entries as f64 / sa.len() as f64
+        );
+    }
+
+    // Resolve the optional l2_leaf_count: use provided value or auto-scale to
+    // the number of RETAINED entries (so a tiered model is sized to its SA).
+    let l2_leaf_count =
+        l2_leaf_count.unwrap_or_else(|| default_l2_leaf_count(num_sa_entries as usize));
 
     // Dense/streamed fast path (the byte-identical `.pac` build): a uniform
     // prior with no homopolymer/BED mask and no effective N-mask. On this path
@@ -217,8 +261,34 @@ fn build_sidecar_core(
     let virtualize = matches!(config.prior, Prior::Uniform)
         && mask.mask_homopolymers.is_none()
         && mask.mask_bed.is_none()
+        && mask.keep_bed.is_none()
         && no_n_effect;
-    let ts = if virtualize {
+    let ts = if let Some(keep_intervals) = keep {
+        // Tiered (Design Z): train the RMI to predict COMPACTED ranks
+        // (`0..num_sa_entries`) over only the retained entries, matching the
+        // filtered `.sa` write order. Keys are tokenised from the doubled text.
+        // The keep filter (which entries the `.sa` retains) is ORTHOGONAL to the
+        // mask/prior options (which retained entries are training targets and how
+        // they are weighted): a tiered build composes with them exactly as the
+        // materialized path does, so `--keep-bed` does not silently drop
+        // `--mask-*`/`--prior-*`. Masked entries are still written to the `.sa`
+        // (only `keep_pos` filters the write), so the compacted rank advances for
+        // every retained entry regardless of masking.
+        let text_bases: Vec<u8> = text
+            .iter()
+            .map(|&v| crate::sa::text_value_to_base(v))
+            .collect();
+        let n_positions_2x = doubled_n_bitmap(&n_positions, &mask, text.len());
+        keep_masked_training_set(
+            &sa,
+            &text_bases,
+            &n_positions_2x,
+            keep_intervals,
+            genome_len,
+            &mask,
+            &config.prior,
+        )
+    } else if virtualize {
         streamed_training_set(std::sync::Arc::clone(&sa), std::sync::Arc::clone(&text))
     } else {
         // Materialized path. The SA is in doubled coordinates over `text`
@@ -232,33 +302,24 @@ fn build_sidecar_core(
             .iter()
             .map(|&v| crate::sa::text_value_to_base(v))
             .collect();
-        // Bit-packed N bitmap over the doubled text: the forward half carries the
-        // FASTA N flags and the RC half mirrors them (the RC of an ambiguous base
-        // is itself ambiguous — those RC suffixes must see the same `mask_n_runs`
-        // filtering as the forward half; the sentinel row stays non-N).
-        // Only materialise the full doubled bitmap when it will actually carry N
-        // flags (`mask_n_runs` on AND `.pac`/FASTA N positions present). Other
-        // materialised builds — a BED mask, homopolymer mask, or non-uniform
-        // prior with no N effect — keep an empty bitmap, avoiding the large
-        // all-clear allocation (and its OOM risk on big references). An empty
-        // bitmap reads as "no N anywhere": `n_in_window` clamps to its length and
-        // `any()` is false, so `masked_training_set` is byte-identical.
-        let materialise_n = mask.mask_n_runs && n_positions.is_some();
-        let mut n_positions_2x = NBitmap::zeros(if materialise_n { text.len() } else { 0 });
-        if materialise_n {
-            if let Some(ref np) = n_positions {
-                let l_pac = np.len();
-                for (i, &is_n) in np.iter().enumerate() {
-                    if is_n {
-                        n_positions_2x.set(i);
-                        // RC half: forward pos i → doubled coord l_pac+(l_pac-1-i).
-                        n_positions_2x.set(l_pac + (l_pac - 1 - i));
-                    }
-                }
-            }
-        }
+        // Doubled-text N bitmap (empty when no N-masking applies); see
+        // `doubled_n_bitmap` for the materialization policy.
+        let n_positions_2x = doubled_n_bitmap(&n_positions, &mask, text.len());
         masked_training_set(&sa, &text_bases, &n_positions_2x, &mask, &config.prior)
     };
+    // Fail closed on an empty training set before model fitting. This is a
+    // user-input failure — an out-of-reference `--keep-bed` (or an over-broad
+    // `--mask-*`/empty reference) that selects no trainable 32-mer — not an
+    // internal bug, so report it as `InvalidInput` rather than letting
+    // `train_with_config` surface its `Internal` "empty training set" guard.
+    if ts.is_empty() {
+        return Err(Error::InvalidInput {
+            detail: "training set is empty: --keep-bed/--mask-* selected no \
+                     trainable position; relax them or use a reference with at \
+                     least one 32-mer"
+                .into(),
+        });
+    }
     let model = crate::train::trainer::train_with_config(&ts, l2_leaf_count, &config)?;
     // Streaming histogram: returns the percentile distribution and the max in
     // two passes, without materialising a ~51.5 GB per-key error vector. The
@@ -288,25 +349,33 @@ fn build_sidecar_core(
 
     // .isa — optional inverse-suffix-array sidecar (the ISA launch hint). Built
     // directly from the SA permutation; independent of the `.sa` memory mode.
-    if config.with_isa {
+    // A position-filtered `.sa` (Design Z) breaks the ISA's full-SA invariant
+    // (`inv[p]` is undefined for dropped positions, and its entry count would no
+    // longer match `sa_num`), so the ISA is skipped under a keep-mask — the
+    // search path already treats it as an optional launch hint.
+    if config.with_isa && keep.is_none() {
         crate::sidecar::isa_file::write_isa_file(&paths.isa, &sa)?;
+    } else if config.with_isa {
+        log::warn!(
+            "--with-isa ignored: the ISA launch hint is unavailable for a tiered (keep-masked) .sa"
+        );
     }
 
-    // .sa — write all genome-region entries in the requested memory mode.
+    // .sa — write the retained genome-region entries in the requested memory mode.
     let memory_mode = config.memory_mode;
     match memory_mode {
         MemoryMode::Mode1 => {
             // Position-only, 5 B/entry. Original layout; unchanged.
-            let mut w = SaFileWriter::create(&paths.sa, sa.len() as u64)?;
-            for &pos in sa.iter() {
+            let mut w = SaFileWriter::create(&paths.sa, num_sa_entries)?;
+            for &pos in sa.iter().filter(|&&pos| keep_pos(pos)) {
                 w.write_position(pos)?;
             }
             w.finish()?;
         }
         MemoryMode::Mode2 => {
             // Position + 32-mer key, 13 B/entry.
-            let mut w = SaFileWriter::create_with_mode(&paths.sa, sa.len() as u64, BPE_MODE2)?;
-            for &pos in sa.iter() {
+            let mut w = SaFileWriter::create_with_mode(&paths.sa, num_sa_entries, BPE_MODE2)?;
+            for &pos in sa.iter().filter(|&&pos| keep_pos(pos)) {
                 let key = key_for_position_2x(pos, &text);
                 w.write_entry_with_key(pos, key)?;
             }
@@ -327,6 +396,10 @@ fn build_sidecar_core(
     let spec = format!("pwl{},linear,linear_spline", l2_leaf_count.trailing_zeros());
     let masked_bed_path: Option<String> = mask
         .mask_bed_path
+        .as_deref()
+        .map(|p| p.display().to_string());
+    let keep_bed_path: Option<String> = mask
+        .keep_bed_path
         .as_deref()
         .map(|p| p.display().to_string());
 
@@ -352,7 +425,7 @@ fn build_sidecar_core(
             size_bytes: ref_size_bytes,
         },
         sa: Sa {
-            num_entries: sa.len() as u64,
+            num_entries: num_sa_entries,
             bytes_per_entry: memory_mode.bytes_per_entry(),
             encoding: memory_mode.encoding_name().to_string(),
             mode: mode_str,
@@ -363,6 +436,8 @@ fn build_sidecar_core(
             masked_bed: masked_bed_path,
             l_pac: Some(genome_len),
             stored_keys: Some(memory_mode.bytes_per_entry() >= 13),
+            tiered: keep.is_some().then_some(true),
+            keep_bed: keep_bed_path,
             pac_sha256,
         },
         rmi: RmiSpec {
@@ -387,7 +462,13 @@ fn build_sidecar_core(
                 detail: "kmer_table_k must be >= 1".into(),
             });
         }
-        let sa_num = sa.len() as u64;
+        // Use the RETAINED entry count (matches the on-disk `.sa`/`.meta` under a
+        // tiered keep-mask). The table is built by reopening the just-written,
+        // position-filtered `.sa`, so binding `.kmt`'s `sa_num` to the full
+        // `sa.len()` would leave `.kmt` and `.sa`/`.meta` with different SA
+        // cardinalities — invalidating k-mer table bounds at read time. Equal to
+        // `sa.len()` when there is no keep-set.
+        let sa_num = num_sa_entries;
         // Cap k so 4^k does not dwarf the SA (avoids a huge mostly-empty table
         // on small references); the table is self-describing via its header.
         let k_max = ((sa_num as f64).log2() / 2.0).floor().clamp(1.0, 16.0) as u32;
@@ -429,6 +510,46 @@ fn build_sidecar_core(
     }
 
     Ok(())
+}
+
+/// Build the doubled-text N bitmap (length `text_len`) for `mask_n_runs`: the
+/// forward half carries the FASTA N flags and the RC half mirrors them (the RC
+/// of an ambiguous base is itself ambiguous, so those RC suffixes see the same
+/// `mask_n_runs` filtering; the sentinel row stays non-N).
+///
+/// Returns an EMPTY bitmap (which reads as "no N anywhere": `n_in_window` clamps
+/// to its length and `any()` is false) when no N-masking will occur — i.e.
+/// `mask_n_runs` is off or there are no FASTA N positions — avoiding the large
+/// all-clear allocation (and its OOM risk on big references). Shared by the
+/// materialized and tiered (keep-mask) training paths so both apply N-masking
+/// identically.
+fn doubled_n_bitmap(
+    n_positions: &Option<Vec<bool>>,
+    mask: &MaskConfig,
+    text_len: usize,
+) -> NBitmap {
+    // Only materialize when at least one FASTA position is actually N: an
+    // all-clear `Some(vec![false; ..])` would otherwise allocate (and scan) a
+    // full doubled-length bitmap, contradicting the empty-bitmap fast path
+    // documented above. Mirrors the `no_n_effect` all-clear check at L242.
+    let materialise_n = mask.mask_n_runs
+        && n_positions
+            .as_ref()
+            .is_some_and(|np| np.iter().any(|&is_n| is_n));
+    let mut n_positions_2x = NBitmap::zeros(if materialise_n { text_len } else { 0 });
+    if materialise_n {
+        if let Some(np) = n_positions {
+            let l_pac = np.len();
+            for (i, &is_n) in np.iter().enumerate() {
+                if is_n {
+                    n_positions_2x.set(i);
+                    // RC half: forward pos i → doubled coord l_pac+(l_pac-1-i).
+                    n_positions_2x.set(l_pac + (l_pac - 1 - i));
+                }
+            }
+        }
+    }
+    n_positions_2x
 }
 
 /// Construct the [`Priors`] meta struct from the trainer's [`Prior`].
@@ -474,14 +595,18 @@ pub(crate) fn mask_config_from_cli(
     no_mask_n_runs: bool,
     mask_homopolymers: Option<u32>,
     bed_path: Option<&Path>,
+    keep_bed_path: Option<&Path>,
 ) -> Result<MaskConfig> {
     use crate::train::mask::parse_bed;
     let bed = bed_path.map(parse_bed).transpose()?;
+    let keep = keep_bed_path.map(parse_bed).transpose()?;
     Ok(MaskConfig {
         mask_n_runs: !no_mask_n_runs,
         mask_homopolymers,
         mask_bed: bed,
         mask_bed_path: bed_path.map(std::path::PathBuf::from),
+        keep_bed: keep,
+        keep_bed_path: keep_bed_path.map(std::path::PathBuf::from),
     })
 }
 

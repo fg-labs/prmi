@@ -119,6 +119,48 @@ pub mod attrib {
     }
 }
 
+/// Test/coverage-only counter for the zigzag forward-progress ("stall") guard
+/// (`spectrum-probe-count` only; compiled out otherwise). Bumped exactly when a
+/// guard `break`s on no net `search_pivot` advance — which never happens on a
+/// full SA (the walk always advances there), only on a tiered (position-filtered)
+/// SA stall. Lets a tiered-SA test prove the guard FIRED, not merely that the
+/// call returned. Thread-local, so it carries no cross-test interference under
+/// parallel `cargo test`.
+#[cfg(feature = "spectrum-probe-count")]
+pub mod stall_guard {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FIRES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Zero the fire count for the current thread.
+    pub fn reset() {
+        FIRES.with(|c| c.set(0));
+    }
+
+    /// Number of times the forward-progress guard fired on the current thread.
+    pub fn count() -> u64 {
+        FIRES.with(|c| c.get())
+    }
+
+    /// Record one guard firing (called from the search hot path).
+    pub(crate) fn bump() {
+        FIRES.with(|c| c.set(c.get() + 1));
+    }
+}
+
+/// Note that the zigzag forward-progress guard fired. A no-op in production (no
+/// `spectrum-probe-count`), so the search hot path carries no counter.
+#[cfg(not(feature = "spectrum-probe-count"))]
+#[inline(always)]
+fn note_stall_guard_fired() {}
+#[cfg(feature = "spectrum-probe-count")]
+#[inline]
+fn note_stall_guard_fired() {
+    stall_guard::bump();
+}
+
 /// One SMEM, mirroring the consumer's `SMEM` (FMI_search.h:86-89) field-for-field,
 /// INCLUDING the signed `i64` interval fields. `l` (the FMI reverse-complement
 /// bi-interval) is always 0 on the learned path (cpp:760); kept for struct/layout
@@ -257,6 +299,39 @@ impl LearnedIndex {
         }
         out[..smems.len()].copy_from_slice(smems);
         Ok(smems.len())
+    }
+
+    /// Cheap tiered-dispatch pre-reject: does the read's first full 32-mer window
+    /// occur in this index? One `mem_search` locate (≈1–2 cold probes) — far
+    /// cheaper than a full `collect_smems`, whose failed reseeds on an absent read
+    /// cost hundreds of probes. Used by a tiered (Design Z) consumer to send
+    /// off-target reads to the whole-genome fallback without paying the full
+    /// fast-path search. `read` is 2-bit encoded (`0..=3`, `4` = N); windows
+    /// containing an N are skipped. Inspects only the FIRST N-free 32-mer window
+    /// from the read start: returns `true` iff that window fully occurs
+    /// (`match_len == 32`), and `false` if it does not, or if the read has no
+    /// N-free 32-mer window.
+    pub fn present_anchor(&self, read: &[u8], pac: &[u8], enc: PacEncoding) -> bool {
+        const K: usize = 32;
+        let mut start = 0usize;
+        'windows: loop {
+            // Fail closed before slicing a caller-provided read: bound-check the
+            // window end with checked arithmetic rather than `start + K`.
+            let Some(end) = start.checked_add(K) else {
+                return false;
+            };
+            if end > read.len() {
+                return false;
+            }
+            // Reject a window with any N by jumping past the offending base.
+            for (j, &base) in read[start..end].iter().enumerate() {
+                if base >= 4 {
+                    start += j + 1;
+                    continue 'windows;
+                }
+            }
+            return self.mem_search(&read[start..end], pac, enc).match_len >= K as u64;
+        }
     }
 
     /// Within-read two-stage sort (port of cpp:1833-1850, restricted to one rid).
@@ -489,6 +564,11 @@ impl LearnedIndex {
             let next_pivot = rlen;
             let mut search_pivot = pivot;
             while search_pivot < next_pivot {
+                // Forward-progress guard (see `zz_step1_reseed` for the full rationale):
+                // on the full-genome SA the walk always advances, so this is a no-op and
+                // byte-identical; a tiered (position-filtered) SA can stall it with
+                // `right > 0` but no net progress — break in that case.
+                let entry_search_pivot = search_pivot;
                 // Ambiguous guard at the (re)entry position (cpp:930-939).
                 if read[search_pivot] >= 4 {
                     if rlen - search_pivot < msl {
@@ -521,6 +601,10 @@ impl LearnedIndex {
                     enc,
                 );
                 search_pivot = pivot + right; // cpp:956
+                if search_pivot <= entry_search_pivot {
+                    note_stall_guard_fired();
+                    break; // stall guard: no forward progress (tiered-SA safety; no-op on full SA)
+                }
                 pivot = search_pivot; // cpp:957
             }
             pivot = next_pivot; // cpp:959
@@ -798,6 +882,17 @@ impl LearnedIndex {
             }
             let mut search_pivot = pivot;
             while search_pivot < next_pivot {
+                // Forward-progress guard. The reseed walk must push the right end
+                // (`search_pivot`) past where it was at the top of the iteration, or it has
+                // stalled. On the full-genome SA the walk always advances, so this never
+                // fires and the output is byte-identical; a tiered (position-filtered) SA
+                // can leave `search_pivot` stationary — `pivot` is pulled left by
+                // `zz_left_span_reseed` and pushed right by `zz_right_emit_reseed` by the
+                // same amount (the left RC span and right extension disagree because some
+                // copies are absent), so `right > 0` yet there is no net progress. This
+                // supersedes the cpp:1337 `right == 0` guard, which only caught the
+                // no-match special case (a subset of "no progress").
+                let entry_search_pivot = search_pivot;
                 if read[search_pivot] >= 4 {
                     if rlen - search_pivot < msl {
                         pivot = rlen;
@@ -827,8 +922,9 @@ impl LearnedIndex {
                     enc,
                 );
                 search_pivot = pivot + right; // cpp:1334
-                if right == 0 {
-                    break; // cpp:1337 stall guard
+                if search_pivot <= entry_search_pivot {
+                    note_stall_guard_fired();
+                    break; // stall guard (supersedes cpp:1337 right==0): no forward progress
                 }
                 pivot = search_pivot; // cpp:1338
             }

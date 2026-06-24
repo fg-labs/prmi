@@ -51,6 +51,10 @@ jobs:
       - run: cargo clippy -p prmi -p prmi-sys --all-targets --all-features -- -D warnings
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+      # Exercise the test-only `spectrum-probe-count` coverage gates (e.g. the
+      # zigzag stall-guard fire counter and the RC left-reseed probe gate), which
+      # are compiled out of the default `cargo test` run above.
+      - run: cargo test -p prmi --features spectrum-probe-count
 
   cpp-example:
     name: examples/cpp_caller

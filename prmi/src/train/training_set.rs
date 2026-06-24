@@ -12,7 +12,10 @@
 
 use crate::encoding::{tokenize_32mer, KMER_LEN};
 use crate::train::keys::sa_to_keys;
-use crate::train::mask::{covered_by_bed, homopolymer_in_window, n_in_window, MaskConfig, NBitmap};
+use crate::train::mask::{
+    covered_by_bed, homopolymer_in_window, keep_doubled_pos, n_in_window, BedInterval, MaskConfig,
+    NBitmap,
+};
 use crate::train::prior::Prior;
 use std::sync::Arc;
 
@@ -392,6 +395,92 @@ pub fn masked_training_set(
     }
 }
 
+/// Produce a tiered (Design Z) training set whose SA-index targets are the
+/// **compacted ranks** `0..N_kept` over only the keep-set entries — matching the
+/// position-filtered `.sa` write order so model predictions index directly into
+/// the shrunken on-disk array.
+///
+/// `sa` is the lex-sorted 2× suffix array (doubled coordinates over the
+/// `text_bases` 2× text of length `2*l_pac+1`); `keep` is the forward-coordinate
+/// keep-set; `l_pac` is the full forward genome length. The compacted rank is
+/// advanced for EVERY retained entry — including short-window suffixes
+/// (`p + 32 > text len`) that are written to the `.sa` but excluded as training
+/// targets — so the targets stay aligned with the filtered `.sa` indices. Keys
+/// remain non-decreasing (a kept subsequence of the lex-sorted SA), and
+/// `sa_num == N_kept` is the prediction clamp bound for the tiered index.
+///
+/// The keep filter (which entries the `.sa` retains) is ORTHOGONAL to the
+/// mask/prior options: `mask` (`mask_n_runs`/homopolymer/`mask_bed`) and `prior`
+/// are applied to the RETAINED entries exactly as [`masked_training_set`] applies
+/// them to the full SA, so `--keep-bed` composes with `--mask-*`/`--prior-*`
+/// instead of silently dropping them. A masked entry is still WRITTEN to the
+/// `.sa` (only `keep_doubled_pos` filters the write), so the compacted rank still
+/// advances for it — it is merely excluded as a training target, like a
+/// short-window suffix. `n_positions` is the doubled-text N bitmap (same
+/// coordinates as `sa`/`text_bases`).
+pub fn keep_masked_training_set(
+    sa: &[u64],
+    text_bases: &[u8],
+    n_positions: &NBitmap,
+    keep: &[BedInterval],
+    l_pac: u64,
+    mask: &MaskConfig,
+    prior: &Prior,
+) -> TrainingSet {
+    let n = text_bases.len();
+    let mut keys: Vec<u64> = Vec::new();
+    let mut sa_indices: Vec<u64> = Vec::new();
+    let use_weights = !matches!(prior, Prior::Uniform);
+    let mut weights: Vec<f64> = Vec::new();
+    // Compacted rank: the index this entry occupies in the filtered `.sa`.
+    let mut compacted: u64 = 0;
+    for &sa_pos in sa.iter() {
+        // Not retained → absent from both the `.sa` and the training set.
+        if !keep_doubled_pos(keep, sa_pos, l_pac) {
+            continue;
+        }
+        // Retained: it occupies `.sa` index `compacted` whether or not it forms
+        // a full 32-mer training key OR is masked out below.
+        let rank = compacted;
+        compacted += 1;
+        let p = sa_pos as usize;
+        // Short windows past the end of the doubled text are written to the
+        // `.sa` but are not trainable targets (no full 32-mer), exactly as in
+        // `masked_training_set`.
+        if p + KMER_LEN > n {
+            continue;
+        }
+        // Apply the same exclusion masks as `masked_training_set`. Each excluded
+        // entry is dropped only as a training target — its `.sa` slot (and hence
+        // the compacted rank already advanced above) is preserved.
+        if mask.mask_n_runs && n_in_window(n_positions, p) {
+            continue;
+        }
+        if let Some(k) = mask.mask_homopolymers {
+            if homopolymer_in_window(text_bases, p, k) {
+                continue;
+            }
+        }
+        if let Some(ref intervals) = mask.mask_bed {
+            if covered_by_bed(intervals, sa_pos) {
+                continue;
+            }
+        }
+        let key = tokenize_32mer(&text_bases[p..p + KMER_LEN], KMER_LEN);
+        keys.push(key);
+        sa_indices.push(rank);
+        if use_weights {
+            weights.push(crate::train::prior::weight_for_pair(prior, key, sa_pos));
+        }
+    }
+    TrainingSet {
+        keys: Keys::Materialized(Arc::new(keys)),
+        sa_indices: SaIndices::Materialized(Arc::new(sa_indices)),
+        sa_num: compacted,
+        weights: if use_weights { Some(weights) } else { None },
+    }
+}
+
 /// Build a training set whose keys are STREAMED from the suffix array and 2×
 /// text rather than materialised, and whose SA-index targets are dense
 /// `0..sa_num` minus the short-window skips. Yields byte-identical
@@ -567,6 +656,131 @@ mod tests {
         assert!(matches!(ts.sa_indices, SaIndices::Materialized(_)));
         assert!(matches!(ts.keys, Keys::Materialized(_)));
         assert_eq!(ts.len(), ts.sa_indices.len());
+    }
+
+    /// The tiered (keep-mask) training set must COMPOSE with the mask/prior
+    /// options, not silently ignore them: a mask drops training PAIRS while the
+    /// compacted rank (and hence `sa_num`) still counts every retained `.sa`
+    /// entry (masked entries are still written to the `.sa`), and a non-uniform
+    /// prior produces weights aligned 1:1 with the emitted pairs.
+    #[test]
+    fn keep_masked_composes_with_mask_and_prior() {
+        // A base array with an embedded poly-A run so a homopolymer mask has
+        // something to drop; the rest cycles 1,0,3,2 with no long homopolymers.
+        let mut bases: Vec<u8> = (0..200u32).map(|i| ((i * 7 + 1) % 4) as u8).collect();
+        for b in bases.iter_mut().take(72).skip(60) {
+            *b = 0; // 12-base poly-A run (>= the homopolymer threshold)
+        }
+        let l_pac = bases.len() as u64;
+        let text = crate::sa::build_doubled_2x_text(&bases);
+        let text_bases: Vec<u8> = text
+            .iter()
+            .map(|&v| crate::sa::text_value_to_base(v))
+            .collect();
+        let sa = crate::sa::build_gsa(&text, 1).unwrap();
+        let n_positions = NBitmap::zeros(text.len()); // no N
+
+        // Keep the whole genome so the keep filter retains every entry — this
+        // isolates the mask/prior effect from the keep filter itself.
+        let keep = vec![BedInterval {
+            start: 0,
+            end: l_pac,
+        }];
+        let no_mask = MaskConfig {
+            mask_n_runs: false,
+            ..MaskConfig::default()
+        };
+
+        let unmasked = keep_masked_training_set(
+            &sa,
+            &text_bases,
+            &n_positions,
+            &keep,
+            l_pac,
+            &no_mask,
+            &Prior::Uniform,
+        );
+        let homo_mask = MaskConfig {
+            mask_n_runs: false,
+            mask_homopolymers: Some(6),
+            ..MaskConfig::default()
+        };
+        let masked = keep_masked_training_set(
+            &sa,
+            &text_bases,
+            &n_positions,
+            &keep,
+            l_pac,
+            &homo_mask,
+            &Prior::Uniform,
+        );
+
+        // `sa_num` is the count of RETAINED `.sa` entries and must NOT change
+        // when a mask only drops training targets.
+        assert_eq!(
+            masked.sa_num, unmasked.sa_num,
+            "masking must not change the .sa cardinality"
+        );
+        // The homopolymer mask actually dropped some — but not all — training pairs.
+        assert!(
+            masked.len() < unmasked.len(),
+            "homopolymer mask should drop training pairs (masked={}, unmasked={})",
+            masked.len(),
+            unmasked.len()
+        );
+        assert!(!masked.is_empty(), "mask should not drop every pair");
+        // Every retained index is a valid compacted rank and a subset of the
+        // unmasked indices (masking only removes pairs, never adds/renumbers).
+        let unmasked_idx: std::collections::HashSet<u64> = unmasked.sa_indices.iter().collect();
+        for idx in masked.sa_indices.iter() {
+            assert!(idx < masked.sa_num, "compacted rank {idx} out of range");
+            assert!(
+                unmasked_idx.contains(&idx),
+                "masked index {idx} is not a subset of the unmasked indices"
+            );
+        }
+
+        // A non-uniform prior must yield weights aligned 1:1 with the pairs.
+        let prior = Prior::Bed {
+            intervals: vec![BedInterval {
+                start: 0,
+                end: l_pac,
+            }],
+            weight: 3.5,
+            path: None,
+        };
+        let weighted = keep_masked_training_set(
+            &sa,
+            &text_bases,
+            &n_positions,
+            &keep,
+            l_pac,
+            &no_mask,
+            &prior,
+        );
+        let w = weighted
+            .weights
+            .as_ref()
+            .expect("a non-uniform prior must produce weights");
+        assert_eq!(
+            w.len(),
+            weighted.len(),
+            "weights must align 1:1 with training pairs"
+        );
+        // Forward-half pairs fall in the BED (weight 3.5); RC-half pairs sit at
+        // doubled coords >= l_pac, outside the forward BED, so weight 1.0.
+        assert!(
+            w.iter().all(|&x| x == 3.5 || x == 1.0),
+            "every weight is either the BED weight or 1.0"
+        );
+        assert!(
+            w.contains(&1.0),
+            "some RC-half pair must receive the default weight"
+        );
+        assert!(
+            w.contains(&3.5),
+            "some forward-half pair must receive the BED weight"
+        );
     }
 
     /// Streamed keys (recomputed from the 2× SA + text) must equal the keys a

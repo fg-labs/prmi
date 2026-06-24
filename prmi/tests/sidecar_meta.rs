@@ -29,6 +29,8 @@ fn sample() -> Meta {
             masked_bed: None,
             l_pac: None,
             stored_keys: None,
+            tiered: None,
+            keep_bed: None,
             pac_sha256: None,
         },
         rmi: RmiSpec {
@@ -57,6 +59,41 @@ fn roundtrip_toml() {
     let s = m.to_toml().unwrap();
     let parsed: Meta = Meta::from_toml_str(&s).unwrap();
     assert_eq!(parsed, m);
+}
+
+#[test]
+fn roundtrip_tiered_keep_bed_provenance() {
+    // A tiered (Design Z) sidecar records the keep-set BED path so it can be
+    // traced back to the keep-set that produced the position-filtered `.sa`.
+    let mut m = sample();
+    m.sa.tiered = Some(true);
+    // A tiered sidecar must carry l_pac (num_entries < 2*l_pac+1 is authorized
+    // only when the full forward length is recorded).
+    m.sa.l_pac = Some(4096);
+    m.sa.keep_bed = Some("/data/keepset.bed".into());
+    let s = m.to_toml().unwrap();
+    assert!(s.contains("keep_bed = \"/data/keepset.bed\""));
+    let parsed: Meta = Meta::from_toml_str(&s).unwrap();
+    assert_eq!(parsed.sa.keep_bed.as_deref(), Some("/data/keepset.bed"));
+    assert_eq!(parsed, m);
+
+    // The keep_bed/tiered provenance fields are independent of the memory mode,
+    // so exercise the same round-trip through a valid mode "2" sidecar (a tiered
+    // index built in the key-storing memory mode). This covers the on-disk
+    // provenance path across both memory modes, not just mode "1".
+    let mut m2 = sample();
+    m2.sa.mode = "2".into();
+    m2.sa.bytes_per_entry = 13;
+    m2.sa.encoding = "packed_lo8_hi32_key64".into();
+    m2.sa.stored_keys = Some(true);
+    m2.sa.tiered = Some(true);
+    m2.sa.l_pac = Some(4096);
+    m2.sa.keep_bed = Some("/data/keepset.bed".into());
+    let s2 = m2.to_toml().unwrap();
+    assert!(s2.contains("keep_bed = \"/data/keepset.bed\""));
+    let parsed2: Meta = Meta::from_toml_str(&s2).unwrap();
+    assert_eq!(parsed2.sa.keep_bed.as_deref(), Some("/data/keepset.bed"));
+    assert_eq!(parsed2, m2);
 }
 
 #[test]

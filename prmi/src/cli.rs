@@ -60,6 +60,16 @@ pub enum Cmd {
         /// the given BED file (0-based, half-open).
         #[arg(long, value_name = "PATH")]
         mask_bed: Option<PathBuf>,
+        /// Build a TIERED (position-filtered) `.sa` (Design Z): retain ONLY
+        /// suffix-array entries whose forward reference coordinate falls in an
+        /// interval of the given BED file (0-based, half-open), applied
+        /// RC-symmetrically. The full genome text is unchanged, so SMEMs stay
+        /// byte-identical for reads served from the keep-set and positions
+        /// remain native genome coordinates. Unlike --mask-bed (which only
+        /// narrows the RMI training pairs), this shrinks the on-disk `.sa`.
+        /// Incompatible with --with-isa (the ISA hint needs the full SA).
+        #[arg(long, value_name = "PATH")]
+        keep_bed: Option<PathBuf>,
         /// Use a BED file as a training-weight prior. Training pairs whose SA
         /// position falls in any BED interval receive a weight of
         /// --prior-bed-weight (default 10.0); pairs outside receive weight 1.0.
@@ -210,6 +220,7 @@ impl Cli {
                 no_mask_n_runs,
                 mask_homopolymers,
                 mask_bed,
+                keep_bed,
                 prior_bed,
                 prior_bed_weight,
                 prior_fastq_histogram,
@@ -259,10 +270,22 @@ impl Cli {
                     prior_fastq_histogram.as_deref(),
                 )?;
 
+                // Guard: a tiered keep-mask cannot coexist with --with-isa (the
+                // ISA launch hint requires the full, unfiltered SA). This is a
+                // user-input violation, so preserve the crate's `InvalidInput`
+                // categorization rather than a generic error wrapper.
+                if keep_bed.is_some() && with_isa {
+                    return Err(crate::Error::InvalidInput {
+                        detail: "--keep-bed (tiered .sa) is incompatible with --with-isa".into(),
+                    }
+                    .into());
+                }
+
                 let mask = crate::train::mask_config_from_cli(
                     no_mask_n_runs,
                     mask_homopolymers,
                     mask_bed.as_deref(),
+                    keep_bed.as_deref(),
                 )
                 .with_context(|| "parsing mask options")?;
 
