@@ -202,6 +202,19 @@ impl LearnedIndex {
         (refpos < isa.num_entries()).then(|| isa.sa_index_at(refpos))
     }
 
+    /// The reference digest this index binds its `.kmt` sidecar to (64 hex
+    /// chars). Prefers the packed-reference SHA (`sa.pac_sha256`), falling back
+    /// to the reference SHA (`ref.sha256`) — the same precedence the load path
+    /// uses in [`kmt_matches`]. An out-of-crate `.kmt` builder must pass this as
+    /// the table's `ref_digest` for the sidecar to bind and load.
+    pub fn ref_digest_hex(&self) -> &str {
+        self.meta
+            .sa
+            .pac_sha256
+            .as_deref()
+            .unwrap_or(self.meta.ref_.sha256.as_str())
+    }
+
     /// Number of forward reference bases (`l_pac`). The 2× SA has `2*l_pac + 1`
     /// entries, so `l_pac = (sa_num - 1) / 2`. (Equals `meta.sa.l_pac` when set.)
     pub fn l_pac(&self) -> u64 {

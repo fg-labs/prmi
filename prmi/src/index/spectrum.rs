@@ -1181,7 +1181,7 @@ pub struct KmerTable {
 impl KmerTable {
     /// Borrow the table's components `(k, lo, hi)` for serialization to a
     /// `.kmt` file. `lo[m-1]` / `hi[m-1]` are the length-`m` bound arrays.
-    pub(crate) fn parts(&self) -> (u32, &[Vec<u64>], &[Vec<u64>]) {
+    pub fn parts(&self) -> (u32, &[Vec<u64>], &[Vec<u64>]) {
         (self.k, &self.lo, &self.hi)
     }
 }
