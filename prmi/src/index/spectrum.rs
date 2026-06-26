@@ -3578,11 +3578,15 @@ impl LearnedIndex {
         }
         let mut steppers: Vec<BwdStepper> = tasks.iter().map(|t| self.bwd_stepper_new(t)).collect();
         let mut mids: Vec<Option<u64>> = steppers.iter_mut().map(|s| s.next_probe(self)).collect();
+        // `key_at` returns `None` only for mode-1 sidecars; mode-2 (production) always
+        // has keys. Checking once avoids 16-byte `Option<u64>` elements in the hot
+        // buffer — store raw `u64` and reconstruct the `Option` at the call site.
+        let keys_present = self.sa_num() > 0 && self.key_at(0).is_some();
         // Per-round scratch buffers, allocated ONCE and reused (entries for
         // inactive tasks hold stale values but are never read — the advance loop
         // guards on `mids[i].is_some()`).
         let mut posv: Vec<u64> = vec![0; steppers.len()];
-        let mut keyv: Vec<Option<u64>> = vec![None; steppers.len()];
+        let mut keyv: Vec<u64> = vec![0; steppers.len()];
         loop {
             // Phase 1: batch the cold loads (independent -> memory-level parallelism).
             let mut any = false;
@@ -3591,7 +3595,7 @@ impl LearnedIndex {
                     any = true;
                     let (p, k) = self.sa_entry(mid);
                     posv[i] = p;
-                    keyv[i] = k;
+                    keyv[i] = k.unwrap_or(0);
                 }
             }
             if !any {
@@ -3600,7 +3604,14 @@ impl LearnedIndex {
             // Phase 2: advance every active task and fetch its next probe.
             for i in 0..steppers.len() {
                 if mids[i].is_some() {
-                    steppers[i].advance(self, posv[i], keyv[i], pac, enc, l_pac);
+                    steppers[i].advance(
+                        self,
+                        posv[i],
+                        if keys_present { Some(keyv[i]) } else { None },
+                        pac,
+                        enc,
+                        l_pac,
+                    );
                     mids[i] = steppers[i].next_probe(self);
                 }
             }
@@ -3697,20 +3708,30 @@ impl LearnedIndex {
                 active.push((i, mid));
             }
         }
+        // `key_at` returns `None` only for mode-1 sidecars; mode-2 (production) always
+        // has keys. Checking once avoids 16-byte `Option<u64>` elements in the hot
+        // buffer — store raw `u64` and reconstruct the `Option` at the call site.
+        let keys_present = self.sa_num() > 0 && self.key_at(0).is_some();
         let mut posv: Vec<u64> = vec![0; active.len()];
-        let mut keyv: Vec<Option<u64>> = vec![None; active.len()];
+        let mut keyv: Vec<u64> = vec![0; active.len()];
         while !active.is_empty() {
             // Phase 1: batch the cold loads (independent -> memory-level parallelism).
             for (r, &(_, mid)) in active.iter().enumerate() {
                 let (p, k) = self.sa_entry(mid);
                 posv[r] = p;
-                keyv[r] = k;
+                keyv[r] = k.unwrap_or(0);
             }
             // Phase 2: advance every active task, fetch its next probe, compact.
             let mut w = 0;
             for r in 0..active.len() {
                 let idx = active[r].0;
-                steppers[idx].advance(posv[r], keyv[r], pac, enc, l_pac);
+                steppers[idx].advance(
+                    posv[r],
+                    if keys_present { Some(keyv[r]) } else { None },
+                    pac,
+                    enc,
+                    l_pac,
+                );
                 if let Some(mid) = steppers[idx].next_probe() {
                     active[w] = (idx, mid);
                     w += 1;
@@ -3860,14 +3881,18 @@ impl LearnedIndex {
                 active.push((i, mid));
             }
         }
+        // `key_at` returns `None` only for mode-1 sidecars; mode-2 (production) always
+        // has keys. Checking once avoids 16-byte `Option<u64>` elements in the hot
+        // buffer — store raw `u64` and reconstruct the `Option` at the call site.
+        let keys_present = self.sa_num() > 0 && self.key_at(0).is_some();
         let mut posv: Vec<u64> = vec![0; active.len()];
-        let mut keyv: Vec<Option<u64>> = vec![None; active.len()];
+        let mut keyv: Vec<u64> = vec![0; active.len()];
         while !active.is_empty() {
             // Phase 1: batch the cold loads (independent -> memory-level parallelism).
             for (r, &(_, mid)) in active.iter().enumerate() {
                 let (p, k) = self.sa_entry(mid);
                 posv[r] = p;
-                keyv[r] = k;
+                keyv[r] = k.unwrap_or(0);
             }
             // Phase 2: advance every active task, fetch its next probe, and compact
             // (drop finished steppers) in place, preserving relative order.
@@ -3875,7 +3900,13 @@ impl LearnedIndex {
             for r in 0..active.len() {
                 let idx = active[r].0;
                 let st = steppers[idx].as_mut().expect("active stepper present");
-                st.advance(posv[r], keyv[r], pac, enc, l_pac);
+                st.advance(
+                    posv[r],
+                    if keys_present { Some(keyv[r]) } else { None },
+                    pac,
+                    enc,
+                    l_pac,
+                );
                 if let Some(mid) = st.next_probe() {
                     active[w] = (idx, mid);
                     w += 1;
@@ -4279,14 +4310,14 @@ impl LearnedIndex {
             let mid = lo + (hi - lo) / 2;
             let (lt, lcp) = probe(mid);
             if lt {
-                if best_true.is_none_or(|(i, _)| mid > i) {
-                    best_true = Some((mid, lcp));
-                }
+                // In a bisection `lo = mid+1`, so each successive true probe has a
+                // strictly larger `mid`; the most-recent true is always the largest.
+                best_true = Some((mid, lcp));
                 lo = mid + 1;
             } else {
-                if best_false.is_none_or(|(i, _)| mid < i) {
-                    best_false = Some((mid, lcp));
-                }
+                // Symmetrically, `hi = mid` means each successive false probe has a
+                // strictly smaller `mid`; the most-recent false is always the smallest.
+                best_false = Some((mid, lcp));
                 hi = mid;
             }
         }
