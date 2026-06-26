@@ -194,12 +194,15 @@ impl LearnedIndex {
     }
 
     /// Inverse suffix array: the SA index of reference position `refpos` (in the
-    /// 2× doubled-coordinate space). `None` if no `.isa` is loaded or
-    /// `refpos >= sa_num()`. This is the launch hint fed back as `est_hint` to
-    /// [`crate::index::spectrum::LearnedIndex::mem_search_from_hint`].
+    /// 2× doubled-coordinate space). `None` if no `.isa` is loaded, `refpos` is
+    /// out of range (dense), or `refpos` is not in the keep-set (sparse/tiered).
+    /// This is the launch hint fed back as `est_hint` to
+    /// [`crate::index::spectrum::LearnedIndex::mem_search_from_hint`]; a `None`
+    /// degrades to a cold/model launch (byte-identical — the hint only seeds the
+    /// search).
+    #[inline]
     pub fn isa_at(&self, refpos: u64) -> Option<u64> {
-        let isa = self.isa.as_ref()?;
-        (refpos < isa.num_entries()).then(|| isa.sa_index_at(refpos))
+        self.isa.as_ref()?.lookup(refpos)
     }
 
     /// The reference digest this index binds its `.kmt` sidecar to (64 hex

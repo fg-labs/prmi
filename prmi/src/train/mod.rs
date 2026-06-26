@@ -31,6 +31,7 @@ use crate::train::training_set::{
     keep_masked_training_set, masked_training_set, streamed_training_set,
 };
 use crate::train::verify::compute_error_distribution;
+use rayon::prelude::*;
 use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -349,16 +350,35 @@ fn build_sidecar_core(
 
     // .isa — optional inverse-suffix-array sidecar (the ISA launch hint). Built
     // directly from the SA permutation; independent of the `.sa` memory mode.
-    // A position-filtered `.sa` (Design Z) breaks the ISA's full-SA invariant
-    // (`inv[p]` is undefined for dropped positions, and its entry count would no
-    // longer match `sa_num`), so the ISA is skipped under a keep-mask — the
-    // search path already treats it as an optional launch hint.
-    if config.with_isa && keep.is_none() {
-        crate::sidecar::isa_file::write_isa_file(&paths.isa, &sa)?;
-    } else if config.with_isa {
-        log::warn!(
-            "--with-isa ignored: the ISA launch hint is unavailable for a tiered (keep-masked) .sa"
-        );
+    if config.with_isa {
+        match keep {
+            // Full index: dense inverse SA, indexed by reference position.
+            None => crate::sidecar::isa_file::write_isa_file(&paths.isa, &sa)?,
+            // Tiered (Design Z): a dense refpos-indexed ISA would be genome-scale
+            // even for a small keep-set. Instead emit a SPARSE ISA over exactly
+            // the kept positions, mapping each to its COMPACTED `.sa` rank (the
+            // rank space the tiered model predicts). The compacted rank is
+            // assigned in the SAME lex-order filtered scan the `.sa` write below
+            // uses, so the two agree; pairs are then sorted by refpos for the
+            // reader's binary search. Present reads' seed positions are in the
+            // keep-set by definition, so the launch-hint fast path applies; an
+            // off-keep position simply misses and falls back to a cold launch.
+            Some(_) => {
+                // Kept positions in SA (lex) order; an entry's index in this
+                // filtered sequence IS its compacted `.sa` rank (the `.sa` write
+                // below filters `sa` in the same order). Parallelise the scan
+                // (keep_pos is a per-entry binary search); rayon's `collect`
+                // preserves order, so the ranks match the serial result exactly.
+                let kept: Vec<u64> = sa.par_iter().copied().filter(|&p| keep_pos(p)).collect();
+                let mut pairs: Vec<(u64, u64)> = kept
+                    .par_iter()
+                    .enumerate()
+                    .map(|(rank, &refpos)| (refpos, rank as u64))
+                    .collect();
+                pairs.par_sort_unstable_by_key(|&(refpos, _)| refpos);
+                crate::sidecar::isa_file::write_tiered_isa_file(&paths.isa, &pairs)?;
+            }
+        }
     }
 
     // .sa — write the retained genome-region entries in the requested memory mode.
@@ -373,11 +393,23 @@ fn build_sidecar_core(
             w.finish()?;
         }
         MemoryMode::Mode2 => {
-            // Position + 32-mer key, 13 B/entry.
+            // Position + 32-mer key, 13 B/entry. `key_for_position_2x` (a 32-base
+            // window read per entry) is the CPU cost; the writer is a sequential
+            // BufWriter. Compute keys for each chunk's kept entries in parallel
+            // (rayon `collect` preserves order), then write the chunk in order.
+            // Chunking bounds peak memory to one chunk of (pos, key) pairs while
+            // keeping all cores busy — the dominant mode-2 build cost at scale.
+            const SA_KEY_CHUNK: usize = 1 << 22; // ~4M entries (~64 MB of pairs)
             let mut w = SaFileWriter::create_with_mode(&paths.sa, num_sa_entries, BPE_MODE2)?;
-            for &pos in sa.iter().filter(|&&pos| keep_pos(pos)) {
-                let key = key_for_position_2x(pos, &text);
-                w.write_entry_with_key(pos, key)?;
+            for chunk in sa.chunks(SA_KEY_CHUNK) {
+                let entries: Vec<(u64, u64)> = chunk
+                    .par_iter()
+                    .filter(|&&pos| keep_pos(pos))
+                    .map(|&pos| (pos, key_for_position_2x(pos, &text)))
+                    .collect();
+                for (pos, key) in entries {
+                    w.write_entry_with_key(pos, key)?;
+                }
             }
             w.finish()?;
         }

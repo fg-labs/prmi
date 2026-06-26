@@ -128,6 +128,93 @@ fn backward_hint_is_byte_identical() {
 }
 
 #[test]
+fn tiered_build_with_isa_inverts_compacted_sa_and_misses_off_keep() {
+    use prmi::train::mask::BedInterval;
+    let dir = tempfile::tempdir().unwrap();
+    let fa = dir.path().join("ref.fa");
+    let bases = write_fasta(&fa, 3000);
+    let prefix = dir.path().join("ref.prmi");
+    // Keep a strict sub-interval so the tiered .sa is a proper subset.
+    let mask = MaskConfig {
+        keep_bed: Some(vec![BedInterval {
+            start: 500,
+            end: 1500,
+        }]),
+        ..MaskConfig::default()
+    };
+    let cfg = TrainerConfig::default()
+        .with_memory_mode(MemoryMode::Mode2)
+        .with_isa(true);
+    build_sidecar_with_config(&fa, &prefix, None, mask, 1, Some(cfg)).unwrap();
+    let idx = LearnedIndex::open(&prefix).unwrap();
+
+    assert!(
+        idx.has_isa(),
+        "tiered build --with-isa must produce a loadable sparse .isa"
+    );
+    // Tiered: the compacted kept-entry count. Keep [500,1500) = 1000 forward
+    // positions, kept RC-symmetrically (their distinct RC images) plus the
+    // sentinel = exactly 2*1000 + 1 entries. An exact count catches a keep-mask
+    // that silently fails to apply (the loose band, and `< 2*l_pac+1`, did not).
+    let sa_num = idx.sa_num();
+    let expected_sa_num = 2 * (1500u64 - 500) + 1;
+    assert_eq!(
+        sa_num, expected_sa_num,
+        "tiered sa_num must equal kept forward positions + RC images + sentinel"
+    );
+    // The sparse ISA inverts the COMPACTED tiered SA: for every compacted rank i,
+    // isa_at(sa_position_for(i)) == i.
+    for i in 0..sa_num {
+        let refpos = idx.sa_position_for(i);
+        assert_eq!(
+            idx.isa_at(refpos),
+            Some(i),
+            "tiered isa_at(sa_position_for({i})) must recover the compacted rank"
+        );
+    }
+
+    // Independent oracle (mirrors isa_inverts_sa_and_hint_is_byte_identical): for
+    // reference windows fully inside the keep interval [500,1500), the ISA-hinted
+    // mem_search must be byte-identical to the model-launch (cold) search. This
+    // checks isa_at against a different code path, not just self-consistency.
+    let e = PacEncoding::Unpacked;
+    for start in (520..1400).step_by(37) {
+        let q = &bases[start..start + 60];
+        let m = idx.mem_search(q, &bases, e);
+        // q is copied from a reference window fully inside the keep interval
+        // [500,1500), so a zero-length match is itself a keep-mask/search
+        // regression — fail rather than silently skipping the sample.
+        assert_ne!(
+            m.match_len, 0,
+            "cold mem_search must hit an in-keep reference window at start={start}"
+        );
+        // Independent oracle: seed the hint from the KNOWN in-keep query
+        // coordinate `start` (not from `m.sa_start`, which would make the check
+        // self-referential on the very `mem_search` result it validates). `start`
+        // lies inside [500,1500), so its forward position is in the keep-set.
+        let hint = idx
+            .isa_at(start as u64)
+            .expect("the sampled forward start lies inside the keep-set");
+        let hinted = idx.mem_search_from_hint(q, hint, true, &bases, e);
+        assert_eq!(
+            hinted, m,
+            "tiered ISA hint must equal cold mem_search at start={start}"
+        );
+    }
+
+    // A doubled-coordinate position whose forward coordinate is outside the keep
+    // interval [500,1500) has no inverse-SA entry. Forward coord 100 < 500, and
+    // since 100 < l_pac (3000) it maps to itself (not an RC image), so it is not
+    // kept and isa_at must miss — the consumer then falls back to a cold launch.
+    let off_keep = 100u64;
+    assert!(
+        off_keep < 500,
+        "the off-keep probe must sit below the keep interval"
+    );
+    assert_eq!(idx.isa_at(off_keep), None, "off-keep refpos must miss");
+}
+
+#[test]
 fn default_build_has_no_isa() {
     let dir = tempfile::tempdir().unwrap();
     let (idx, _bases) = build(dir.path(), 1500, false);
