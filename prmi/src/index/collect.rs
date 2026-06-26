@@ -511,18 +511,29 @@ impl LearnedIndex {
         }
     }
 
-    /// Within-read two-stage sort (port of cpp:1833-1850, restricted to one rid).
-    /// Stage 1 is the per-rid restriction of the global `compare_smem`
-    /// (`m ASC, n DESC`); stage 2 is the per-rid `ks_introsort(mem_intv1_learned)`
-    /// by `(m<<32)|n` (`m ASC, n ASC`). Both C++ sorts are unstable, so for SMEMs
-    /// that share `(m, n)` the `(k, s)` order is the unstable-sort result and is NOT
-    /// derivable from the spec — this composition is deterministic but its tie order
-    /// is verified at the consumer box-gate.
-    // KNOWN OPEN: (m,n)-tie order vs the C++ unstable introsort (deferred to box-gate).
+    /// Within-read sort by `(m ASC, n ASC)` (port of cpp:1833-1850, restricted to one
+    /// rid). The C++ runs two unstable sorts back to back — stage 1 the global
+    /// `compare_smem` (`m ASC, n DESC`), stage 2 `ks_introsort(mem_intv1_learned)` by
+    /// `(m<<32)|n` (`m ASC, n ASC`). Stage 2 fully determines the order of SMEMs with
+    /// DISTINCT `(m, n)`; stage 1 could only reorder SMEMs that share BOTH `m` and `n`.
+    ///
+    /// Stage 1 is dropped because such a reorder is unobservable: every emitted SMEM's
+    /// `(k, s)` is `mem_search(read[m..=n])` (pass 1 `zz_right_emit`, pass 2
+    /// `zz_right_emit_reseed`, pass 3 `pass3_seed_one_pivot` each stamp the interval
+    /// recovered from the span). `mem_search` is a deterministic function of the span
+    /// content, so a fixed `(m, n)` determines a unique `(k, s)`; with `rid` constant
+    /// per read and `l == 0` always, two entries sharing `(m, n)` are equal in all six
+    /// fields. The multi-pass collection DOES emit such `(m, n)` duplicates (a reseed or
+    /// pass-3 round re-finding a pass-1 span — see `unsorted_mn_tie_census`, which finds
+    /// thousands), but every duplicate is a byte-identical copy, so permuting a tied
+    /// group is the identity on the output bytes. The single stage-2 sort is therefore
+    /// byte-identical to the C++ two-stage composition — including at the consumer
+    /// box-gate, since prmi's output bytes are unchanged. Guarded by
+    /// `unsorted_mn_ties_are_byte_identical` (every `(m, n)` tie is byte-identical) and
+    /// the `unsorted_mn_tie_census` (ties occur and are all identical).
     fn sort_within_read(smems: &mut [Smem]) {
-        // Stage 1: m ASC, n DESC.
-        smems.sort_unstable_by(|a, b| a.m.cmp(&b.m).then(b.n.cmp(&a.n)));
-        // Stage 2: m ASC, n ASC (dominates stage 1 for distinct (m,n)).
+        // m ASC, n ASC. (m,n) ties are byte-identical duplicates, so their relative
+        // order is immaterial — the dropped stage-1 (m ASC, n DESC) sort was dead code.
         smems.sort_unstable_by(|a, b| a.m.cmp(&b.m).then(a.n.cmp(&b.n)));
     }
 
@@ -2343,6 +2354,207 @@ mod tests {
         }
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    /// Deterministic large sweep counting how many `(m, n)` ties occur in the unsorted
+    /// per-read SMEM set across a corpus engineered to MAXIMIZE re-emission (highly
+    /// repetitive references → occ>1 spans that reseed and re-find pass-1 spans; reads
+    /// that are reference substrings/concatenations; the pass-3 round enabled). It both
+    /// (a) prints the tie tally as evidence for the M2 finding and (b) re-asserts every
+    /// tied group is byte-identical — the same load-bearing invariant the proptest
+    /// checks, here over a fixed, reproducible corpus. Run with `--nocapture` to see the
+    /// counts.
+    #[test]
+    fn unsorted_mn_tie_census() {
+        let enc = PacEncoding::Unpacked;
+        let mut total_reads = 0u64;
+        let mut total_smems = 0u64;
+        let mut tie_groups = 0u64; // (m,n) groups with >1 member
+        let mut tie_extra = 0u64; // total duplicate entries beyond the first per group
+
+        // `motif` repeated `reps` times.
+        let tandem = |motif: &[u8], reps: usize| -> Vec<u8> {
+            (0..reps).flat_map(|_| motif.iter().copied()).collect()
+        };
+        // A spread of references, leaning HARD into repetition so reseeds and pass 3
+        // re-emit spans that pass 1 already found (the only way an (m,n) tie can arise).
+        let refs: Vec<Vec<u8>> = vec![
+            // Tandem repeats of small motifs — maximal occ, maximal re-finding.
+            tandem(&[0, 1, 2, 3], 40),
+            tandem(&[0, 1], 80),
+            tandem(&[0, 0, 1, 1, 2, 2], 30),
+            tandem(&[0, 1, 0, 2, 0, 3], 30),
+            // Mixed: a repeat block embedded in pseudo-random context.
+            (0..200)
+                .map(|i| {
+                    if i % 60 < 30 {
+                        (i % 4) as u8
+                    } else {
+                        (((i as u64 * 2654435761) >> 13) % 4) as u8
+                    }
+                })
+                .collect(),
+            // Pseudo-random (low-occ) baseline for contrast.
+            (0..300u64)
+                .map(|i| {
+                    let h = i
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((h >> 33) % 4) as u8
+                })
+                .collect(),
+        ];
+
+        for fwd in &refs {
+            let (_dir, idx) = build_mode2(fwd);
+            // Reads: every reference substring of a few lengths, plus N-injected and
+            // doubled variants to force overlapping re-emission across passes.
+            let mut reads: Vec<Vec<u8>> = Vec::new();
+            for &len in &[8usize, 12, 20, 32, 48] {
+                let mut start = 0;
+                while start + len <= fwd.len() {
+                    reads.push(fwd[start..start + len].to_vec());
+                    start += 5;
+                }
+            }
+            // Doubled (a span occurs twice in-read → strong re-emission pressure).
+            for &len in &[10usize, 16, 24] {
+                if 2 * len <= fwd.len() {
+                    let mut r = fwd[0..len].to_vec();
+                    r.extend_from_slice(&fwd[0..len]);
+                    reads.push(r);
+                }
+            }
+            // N-injected substrings (exercise N boundaries between passes).
+            for &len in &[20usize, 36] {
+                if len < fwd.len() {
+                    let mut r = fwd[0..len].to_vec();
+                    r[len / 2] = 4; // N in the middle
+                    reads.push(r);
+                }
+            }
+
+            // Sweep the opts grid that drives reseeding and pass 3.
+            for &min_seed_len in &[1u32, 3, 5] {
+                for &split_len in &[2u32, 5, 9] {
+                    for &split_width in &[1i64, 3, 6] {
+                        for &max_mem_intv in &[0i64, 2, 5] {
+                            let opts = CollectOpts {
+                                min_seed_len,
+                                split_len,
+                                split_width,
+                                max_mem_intv,
+                            };
+                            for read in &reads {
+                                let unsorted = idx.collect_smems_unsorted(read, 0, &opts, fwd, enc);
+                                total_reads += 1;
+                                total_smems += unsorted.len() as u64;
+                                let mut by_mn: std::collections::HashMap<(u32, u32), Vec<Smem>> =
+                                    std::collections::HashMap::new();
+                                for s in &unsorted {
+                                    by_mn.entry((s.m, s.n)).or_default().push(*s);
+                                }
+                                for group in by_mn.values() {
+                                    if group.len() <= 1 {
+                                        continue;
+                                    }
+                                    tie_groups += 1;
+                                    tie_extra += (group.len() - 1) as u64;
+                                    let first = group[0];
+                                    for g in &group[1..] {
+                                        assert_eq!(
+                                            *g, first,
+                                            "(m,n) tie has DISTINCT entries — stage 1 is load-bearing"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "[M2 census] reads={} smems={} (m,n)-tie-groups={} extra-tied-entries={} \
+             (all ties byte-identical)",
+            total_reads, total_smems, tie_groups, tie_extra
+        );
+    }
+
+    proptest! {
+        // Large corpus: each case builds a fresh sidecar (costly) but sweeps the whole
+        // read. Override with `PROPTEST_CASES` for an even deeper fuzz.
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// M2 (PR6): the within-read sort's STAGE 1 (`m ASC, n DESC`) only changes the
+        /// order of SMEMs that share BOTH `m` and `n`. This proptest establishes that
+        /// any such `(m, n)` tie in the UNSORTED per-read SMEM set is between entries
+        /// that are BYTE-IDENTICAL — so reordering them (the only thing stage 1 can do)
+        /// cannot change the byte output, making stage 1 dead code.
+        ///
+        /// Why ties are byte-identical: every emitted SMEM's `(k, s)` is
+        /// `mem_search(read[m..=n])` (pass 1 `zz_right_emit`, pass 2
+        /// `zz_right_emit_reseed`, pass 3 `pass3_seed_one_pivot` all stamp the interval
+        /// recovered from the span; the field tests above re-recover `(k, s)` from
+        /// `read[m..=n]` for each pass). `mem_search` is a deterministic function of the
+        /// span content, so a fixed `(m, n)` determines a unique `(k, s)`; with `rid`
+        /// constant per read and `l == 0` always, two entries sharing `(m, n)` are equal
+        /// in all six fields. A multi-pass collection CAN emit the same span twice
+        /// (a reseed or pass 3 re-finding a pass-1 span), but every such duplicate is an
+        /// exact copy — never two DISTINCT `(k, s)` under one `(m, n)`.
+        ///
+        /// The corpus stresses reseeding/pass-3 re-emission: short repetitive refs
+        /// (occ > 1 → reseeds fire), reads with N, and the full opts sweep including
+        /// pass 3. A failure here (a tie with differing `(k, s)`) would be the M2
+        /// counterexample → keep both stages.
+        #[test]
+        fn unsorted_mn_ties_are_byte_identical(
+            // Short + repetitive refs maximize occ>1 spans → reseeds and pass-3 emits.
+            fwd in prop::collection::vec(0u8..=3, 24..160),
+            read in prop::collection::vec(0u8..=4, 1..70), // 4 = N
+            min_seed_len in 1u32..10,
+            split_len in 2u32..14,
+            split_width in 1i64..8,
+            max_mem_intv in 0i64..6,
+        ) {
+            let (_dir, idx) = build_mode2(&fwd);
+            let enc = PacEncoding::Unpacked;
+            let opts = CollectOpts { min_seed_len, split_len, split_width, max_mem_intv };
+
+            let unsorted = idx.collect_smems_unsorted(&read, 0, &opts, &fwd, enc);
+
+            // Group entries by (m, n) and inspect every group with >1 member.
+            let mut by_mn: std::collections::HashMap<(u32, u32), Vec<Smem>> =
+                std::collections::HashMap::new();
+            for s in &unsorted {
+                by_mn.entry((s.m, s.n)).or_default().push(*s);
+            }
+            for ((m, n), group) in &by_mn {
+                if group.len() <= 1 {
+                    continue;
+                }
+                // A tie: require every tied entry to be byte-identical to the first.
+                // This is the load-bearing assertion: if two entries share (m, n) but
+                // differ in (k, s) (or any field), stage 1's tie order would be
+                // observable and removing it would NOT be byte-identical. (The tie
+                // tally itself is reported deterministically by `unsorted_mn_tie_census`.)
+                let first = group[0];
+                for g in &group[1..] {
+                    prop_assert_eq!(
+                        *g, first,
+                        "(m,n)=({},{}) tie has DISTINCT entries {:?} vs {:?} \
+                         (read={:?}, opts={:?}) — stage 1 is NOT dead code",
+                        m, n, g, first, read, opts
+                    );
+                }
+                // Cross-check the shared (m, n) really maps to one interval via a fresh
+                // mem_search (an independent code path from the collector's stamping).
+                let recov = idx.mem_search(&read[*m as usize..=*n as usize], &fwd, enc);
+                prop_assert_eq!(recov.sa_start as i64, first.k, "(m,n) tie k != mem_search");
+                prop_assert_eq!(recov.occ as i64, first.s, "(m,n) tie s != mem_search");
+            }
         }
     }
 
