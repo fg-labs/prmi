@@ -123,16 +123,24 @@ fn unpack_packed_forward(pac: &[u8], start: u64, out: &mut [u8]) {
         i += 1;
         pos += 1;
     }
-    // Word-at-a-time middle: 8 packed bytes = 32 bases per step (`pos` is aligned).
-    while i + 32 <= n {
-        let base = pos >> 2;
-        let word = u64::from_le_bytes(pac[base..base + 8].try_into().unwrap());
-        for j in 0..8 {
-            let byte = (word >> (8 * j)) as u8;
-            out[i + 4 * j..i + 4 * j + 4].copy_from_slice(&UNPACK_LUT[byte as usize].to_le_bytes());
+    // Word-at-a-time middle: 8 packed bytes = 32 bases per step (`pos` aligned).
+    // Drive with chunks_exact_mut(32)/chunks_exact(8) so bounds are checked once at
+    // the slice split (known stride) instead of 9× per step (try_into + 8× i+4*j).
+    let mid_words = (n - i) / 32;
+    if mid_words > 0 {
+        let src_byte = pos >> 2;
+        let out_mid = &mut out[i..i + mid_words * 32];
+        let src_mid = &pac[src_byte..src_byte + mid_words * 8];
+        for (chunk_out, w) in out_mid.chunks_exact_mut(32).zip(src_mid.chunks_exact(8)) {
+            // chunks_exact(8) proves w.len() == 8; the try_into().unwrap() is infallible
+            // and LLVM elides the panic branch entirely.
+            let word = u64::from_le_bytes(w.try_into().unwrap());
+            for (k, slot) in chunk_out.chunks_exact_mut(4).enumerate() {
+                slot.copy_from_slice(&UNPACK_LUT[(word >> (8 * k)) as u8 as usize].to_le_bytes());
+            }
         }
-        i += 32;
-        pos += 32;
+        i += mid_words * 32;
+        pos += mid_words * 32;
     }
     // 4-base (1-byte) steps for the remaining whole bytes.
     while i + 4 <= n {

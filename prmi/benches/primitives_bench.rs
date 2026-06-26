@@ -304,6 +304,126 @@ fn bench_next_n(c: &mut Criterion) {
     g.finish();
 }
 
+// ── unpack_packed_forward: before/after middle-loop shapes ──────────────────
+//
+// `unpack_packed_forward` is private, so we inline-reimplement the two middle
+// loop shapes (before / after PR4) and bench them over a packed-encoded corpus
+// that is long enough (≥ 128 bases) to let the 32-base word loop dominate.
+// This mirrors the pattern used by `bench_next_n` above.
+//
+// The LUT is the same 256-entry table as in spectrum.rs (duplicated here so
+// the bench is self-contained). Each bench drives 32 packed words (32 × 32 =
+// 1 024 bases per decode call) across a corpus of 256 encoded sequences.
+
+/// 256-entry LUT: byte → four 2-bit bases as a little-endian u32.
+/// Bit layout: base0 in bits 6-7 (MSB), base3 in bits 0-1 (LSB) of the source
+/// byte. Entry `b` expands to `[base0, base1, base2, base3]` via `.to_le_bytes()`.
+const BENCH_UNPACK_LUT: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let byte = b as u32;
+        t[b] = ((byte >> 6) & 0x3)
+            | (((byte >> 4) & 0x3) << 8)
+            | (((byte >> 2) & 0x3) << 16)
+            | ((byte & 0x3) << 24);
+        b += 1;
+    }
+    t
+};
+
+/// Corpus of packed sequences. Each is `PAC_BYTES` bytes = `PAC_BYTES * 4` bases.
+const PAC_BYTES: usize = 256; // 1 024 bases = 32 full 32-base word-loop iterations
+const CORPUS_COUNT: usize = 256;
+
+fn make_packed_corpus() -> Vec<Vec<u8>> {
+    let mut state = 0xFEED_FACE_DEAD_BEEFu64;
+    (0..CORPUS_COUNT)
+        .map(|_| {
+            (0..PAC_BYTES)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 56) as u8
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Before (PR3 baseline): 9 bounds checks per 32-base step — try_into().unwrap()
+/// + 8× i+4*j slice indexing. Driven by the original while loop.
+#[inline(never)]
+fn unpack_middle_before(pac: &[u8], out: &mut [u8]) {
+    let n = out.len();
+    let mut i = 0usize;
+    let mut pos = 0usize;
+    while i + 32 <= n {
+        let base = pos >> 2;
+        let word = u64::from_le_bytes(pac[base..base + 8].try_into().unwrap());
+        for j in 0..8 {
+            let byte = (word >> (8 * j)) as u8;
+            out[i + 4 * j..i + 4 * j + 4]
+                .copy_from_slice(&BENCH_UNPACK_LUT[byte as usize].to_le_bytes());
+        }
+        i += 32;
+        pos += 32;
+    }
+}
+
+/// After (PR4): bounds checked once at the slice split via chunks_exact.
+#[inline(never)]
+fn unpack_middle_after(pac: &[u8], out: &mut [u8]) {
+    let n = out.len();
+    let i = 0usize;
+    let pos = 0usize;
+    let mid_words = (n - i) / 32;
+    if mid_words > 0 {
+        let src_byte = pos >> 2;
+        let out_mid = &mut out[i..i + mid_words * 32];
+        let src_mid = &pac[src_byte..src_byte + mid_words * 8];
+        for (chunk_out, w) in out_mid.chunks_exact_mut(32).zip(src_mid.chunks_exact(8)) {
+            let word = u64::from_le_bytes(w.try_into().unwrap());
+            for (k, slot) in chunk_out.chunks_exact_mut(4).enumerate() {
+                slot.copy_from_slice(
+                    &BENCH_UNPACK_LUT[(word >> (8 * k)) as u8 as usize].to_le_bytes(),
+                );
+            }
+        }
+    }
+}
+
+fn bench_unpack_packed(c: &mut Criterion) {
+    let corpus = make_packed_corpus();
+    let out_len = PAC_BYTES * 4; // 1 024 unpacked bases per call
+    let mut out = vec![0u8; out_len];
+    let total_bases: u64 = (corpus.len() * out_len) as u64;
+
+    let mut g = c.benchmark_group("unpack_packed_middle");
+    g.throughput(Throughput::Elements(total_bases));
+
+    g.bench_function("before_while_loop", |b| {
+        b.iter(|| {
+            for pac in &corpus {
+                unpack_middle_before(black_box(pac), black_box(&mut out));
+            }
+            black_box(&out);
+        });
+    });
+
+    g.bench_function("after_chunks_exact", |b| {
+        b.iter(|| {
+            for pac in &corpus {
+                unpack_middle_after(black_box(pac), black_box(&mut out));
+            }
+            black_box(&out);
+        });
+    });
+
+    g.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     let (_dir, idx) = build_index();
     eprintln!(
@@ -318,6 +438,7 @@ fn bench_all(c: &mut Criterion) {
     bench_reverse_complement_2bit(c);
     bench_tokenize_32mer(c);
     bench_next_n(c);
+    bench_unpack_packed(c);
 }
 
 criterion_group!(benches, bench_all);
