@@ -208,6 +208,102 @@ fn bench_tokenize_32mer(c: &mut Criterion) {
     g.finish();
 }
 
+// ── next_n: O(rlen²) → O(1) per-read distance precompute ───────────────────
+
+// Both kernels are `#[inline(never)]` so the comparison is symmetric: each is
+// measured across a real call boundary, and the optimizer cannot collapse the
+// O(rlen²) baseline (e.g. by CSE-ing the repeated scans) into something faster
+// than the per-pivot `fwd_qlen` calls it stands in for. The two prmi fns being
+// mirrored here are private, so the bench reimplements rather than exports them.
+
+/// Inline reimplementation of the old `fwd_qlen(read, p)` forward scan —
+/// the baseline (O(rlen²) over all pivots).
+#[inline(never)]
+fn next_n_scan(read: &[u8], p: usize) -> usize {
+    let rlen = read.len();
+    for (i, &b) in read.iter().enumerate().skip(p) {
+        if b >= 4 {
+            return i - p;
+        }
+    }
+    rlen - p
+}
+
+/// Inline reimplementation of `fill_next_n` (descending recurrence).
+#[inline(never)]
+fn fill_next_n_inline(read: &[u8], out: &mut Vec<u32>) {
+    let rlen = read.len();
+    out.clear();
+    out.resize(rlen + 1, 0);
+    for i in (0..rlen).rev() {
+        out[i] = if read[i] >= 4 { 0 } else { out[i + 1] + 1 };
+    }
+}
+
+fn bench_next_n(c: &mut Criterion) {
+    // A corpus of reads with scattered ambiguous (>=4) bases. `v` is the top 3
+    // bits (0..=7) and `v == 0` marks an N, so ~1 in 8 (12.5%) of bases are
+    // ambiguous. This is conservative: a high N-density makes each forward scan
+    // terminate early, shrinking the O(rlen²) baseline — realistic low-N reads
+    // (long N-free runs, full-length scans) show a LARGER speedup than measured.
+    let read_len = 150usize;
+    let num_reads = N;
+    let mut reads: Vec<Vec<u8>> = Vec::with_capacity(num_reads);
+    let mut state = 0xDEAD_BEEF_CAFE_BABEu64;
+    for _ in 0..num_reads {
+        let read: Vec<u8> = (0..read_len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let v = (state >> 61) as u8;
+                // v in 0..=7; v == 0 (~1 in 8) is ambiguous (4), rest are 0..=3
+                if v == 0 {
+                    4u8
+                } else {
+                    v & 3
+                }
+            })
+            .collect();
+        reads.push(read);
+    }
+
+    let total_pivots: u64 = reads.iter().map(|r| r.len() as u64).sum();
+
+    let mut g = c.benchmark_group("next_n");
+    g.throughput(Throughput::Elements(total_pivots));
+
+    // Baseline: O(rlen²) — repeated forward scan for every pivot.
+    g.bench_function("scan_all_pivots", |b| {
+        b.iter(|| {
+            let mut sum = 0u64;
+            for read in &reads {
+                for p in 0..read.len() {
+                    sum = sum.wrapping_add(next_n_scan(black_box(read), black_box(p)) as u64);
+                }
+            }
+            black_box(sum)
+        });
+    });
+
+    // Optimized: fill once per read (O(rlen)), then index O(1).
+    let mut next_n: Vec<u32> = Vec::new();
+    g.bench_function("fill_once_index", |b| {
+        b.iter(|| {
+            let mut sum = 0u64;
+            for read in &reads {
+                fill_next_n_inline(black_box(read), &mut next_n);
+                for p in 0..read.len() {
+                    sum = sum.wrapping_add(next_n[p] as u64);
+                }
+            }
+            black_box(sum)
+        });
+    });
+
+    g.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     let (_dir, idx) = build_index();
     eprintln!(
@@ -221,6 +317,7 @@ fn bench_all(c: &mut Criterion) {
     bench_reverse_complement_key(c);
     bench_reverse_complement_2bit(c);
     bench_tokenize_32mer(c);
+    bench_next_n(c);
 }
 
 criterion_group!(benches, bench_all);

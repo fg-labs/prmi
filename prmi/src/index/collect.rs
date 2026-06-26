@@ -223,6 +223,9 @@ pub struct CollectScratch {
     /// Reseed work-list (pivot, `min_intv`, optional ISA hint) selected from pass 1
     /// and consumed by pass 2.
     reseeds: Vec<(usize, i64, Option<ReseedHint>)>,
+    /// Per-read next-ambiguous-base distances (`next_n[p] == fwd_qlen(read, p)`),
+    /// refilled once at the top of each read and read O(1) by all three passes.
+    next_n: Vec<u32>,
 }
 
 impl CollectScratch {
@@ -557,14 +560,29 @@ impl LearnedIndex {
         let rlen = read.len();
         // Split the borrow so the emit buffer and the reseed work-list can be held as
         // disjoint `&mut Vec` (pass 2 drains `reseeds` while pushing into `smems`).
-        let CollectScratch { smems, reseeds } = scratch;
+        let CollectScratch {
+            smems,
+            reseeds,
+            next_n,
+        } = scratch;
         smems.clear();
         reseeds.clear();
+        fill_next_n(read, next_n);
 
         // ---- Pass 1: zigzag walk over all positions (min_intv = 1) ----
         let mut x = 0;
         while x < rlen {
-            self.zz_step1(read, rid, &mut x, 1, opts.min_seed_len, smems, pac, enc);
+            self.zz_step1(
+                read,
+                rid,
+                &mut x,
+                1,
+                opts.min_seed_len,
+                smems,
+                next_n,
+                pac,
+                enc,
+            );
         }
         let num1 = smems.len();
 
@@ -612,6 +630,7 @@ impl LearnedIndex {
                 min_intv,
                 opts.min_seed_len,
                 smems,
+                next_n,
                 hint,
                 pac,
                 enc,
@@ -630,6 +649,7 @@ impl LearnedIndex {
                     opts.max_mem_intv,
                     msl1,
                     smems,
+                    next_n,
                     pac,
                     enc,
                 );
@@ -719,6 +739,7 @@ impl LearnedIndex {
         min_intv: i64,
         min_seed_len: u32,
         out: &mut Vec<Smem>,
+        next_n: &[u32],
         pac: &[u8],
         enc: PacEncoding,
     ) {
@@ -762,7 +783,7 @@ impl LearnedIndex {
                     break; // cpp:945
                 }
                 // Right extension (EMITS), advance search_pivot.
-                let qlen = self.fwd_qlen(read, pivot);
+                let qlen = next_n[pivot] as usize;
                 let right = self.zz_right_emit(
                     read,
                     rid,
@@ -784,7 +805,7 @@ impl LearnedIndex {
             pivot = next_pivot; // cpp:959
         } else {
             // ---- left boundary: single right emit (cpp:960-971) ----
-            let qlen = self.fwd_qlen(read, pivot);
+            let qlen = next_n[pivot] as usize;
             let right = self.zz_right_emit(
                 read,
                 rid,
@@ -807,6 +828,7 @@ impl LearnedIndex {
 
     /// N-clamped forward window length from `p` (stop at the first `read[i] >= 4`),
     /// mirroring the consumer's `fwd_qlen` (cpp:907-913).
+    #[cfg(test)]
     #[inline]
     fn fwd_qlen(&self, read: &[u8], p: usize) -> usize {
         let rlen = read.len();
@@ -1033,6 +1055,7 @@ impl LearnedIndex {
         min_intv: i64,
         min_seed_len: u32,
         out: &mut Vec<Smem>,
+        next_n: &[u32],
         hint: Option<ReseedHint>,
         pac: &[u8],
         enc: PacEncoding,
@@ -1045,7 +1068,7 @@ impl LearnedIndex {
         let mut pivot = pivot;
         if pivot != 0 && read[pivot - 1] < 4 {
             // next_pivot from the ORIGINAL reseed pivot (cpp:1302-1306).
-            let qlen0 = self.fwd_qlen(read, pivot);
+            let qlen0 = next_n[pivot] as usize;
             // next_pivot needs only the length -> span-only (skip interval recovery).
             let fwd_ext = self
                 .reseed_bounded_fwd(read, pivot, qlen0, min_intv, false, hint, pac, enc)
@@ -1082,7 +1105,7 @@ impl LearnedIndex {
                 if next_pivot - pivot < msl {
                     break; // cpp:1324
                 }
-                let qlen = self.fwd_qlen(read, pivot);
+                let qlen = next_n[pivot] as usize;
                 let right = self.zz_right_emit_reseed(
                     read,
                     rid,
@@ -1104,7 +1127,7 @@ impl LearnedIndex {
             }
         } else {
             // Left boundary: single right emit (cpp:1340-1347).
-            let qlen = self.fwd_qlen(read, pivot);
+            let qlen = next_n[pivot] as usize;
             self.zz_right_emit_reseed(
                 read,
                 rid,
@@ -1145,6 +1168,7 @@ impl LearnedIndex {
         max_mem_intv: i64,
         min_seed_len_plus1: usize,
         out: &mut Vec<Smem>,
+        next_n: &[u32],
         pac: &[u8],
         enc: PacEncoding,
     ) -> usize {
@@ -1154,7 +1178,7 @@ impl LearnedIndex {
         if pivot >= rlen || read[pivot] >= 4 {
             return pivot + 1; // N / OOB (cpp:463-466)
         }
-        let qlen = self.fwd_qlen(read, pivot);
+        let qlen = next_n[pivot] as usize;
         let lstart = min_seed_len_plus1.max(2);
         let boundary = || {
             if pivot + qlen < rlen {
@@ -1279,6 +1303,23 @@ impl LearnedIndex {
         } else {
             pivot + qlen
         }
+    }
+}
+
+/// Precompute, for a read, the distance from each position to the next ambiguous
+/// base (`>= 4`). `out[p] == fwd_qlen(read, p)` for all `p in 0..=read.len()`:
+/// `out[rlen] = 0`, and descending `out[i] = if read[i] >= 4 { 0 } else { out[i+1] + 1 }`.
+/// Computed once per read; reused across all three SMEM passes so each former
+/// `fwd_qlen` rescan becomes an O(1) slice read. Reuses `out`'s capacity.
+fn fill_next_n(read: &[u8], out: &mut Vec<u32>) {
+    let rlen = read.len();
+    // Distances index into the read; a read longer than u32::MAX cannot occur
+    // for sequencing data and would truncate on the `as u32`/`as usize` casts.
+    debug_assert!(rlen <= u32::MAX as usize, "read too long for u32 next_n");
+    out.clear();
+    out.resize(rlen + 1, 0);
+    for i in (0..rlen).rev() {
+        out[i] = if read[i] >= 4 { 0 } else { out[i + 1] + 1 };
     }
 }
 
@@ -1453,8 +1494,20 @@ mod tests {
         let enc = PacEncoding::Unpacked;
         let mut out = Vec::new();
         let mut pivot = 0;
+        let mut next_n = Vec::new();
+        super::fill_next_n(read, &mut next_n);
         while pivot < read.len() {
-            idx.zz_step1(read, 0, &mut pivot, 1, min_seed_len, &mut out, fwd, enc);
+            idx.zz_step1(
+                read,
+                0,
+                &mut pivot,
+                1,
+                min_seed_len,
+                &mut out,
+                &next_n,
+                fwd,
+                enc,
+            );
         }
         out
     }
@@ -1471,8 +1524,20 @@ mod tests {
         let msl1 = min_seed_len as usize + 1;
         let mut out = Vec::new();
         let mut x = 0;
+        let mut next_n = Vec::new();
+        super::fill_next_n(read, &mut next_n);
         while x < read.len() {
-            x = idx.pass3_seed_one_pivot(read, 0, x, max_mem_intv, msl1, &mut out, fwd, enc);
+            x = idx.pass3_seed_one_pivot(
+                read,
+                0,
+                x,
+                max_mem_intv,
+                msl1,
+                &mut out,
+                &next_n,
+                fwd,
+                enc,
+            );
         }
         out
     }
@@ -1719,13 +1784,15 @@ mod tests {
 
             // Independent reseed selection + re-drive == the pass-2 tail.
             let mut expected_pass2: Vec<Smem> = Vec::new();
+            let mut nn = Vec::new();
+            super::fill_next_n(&read, &mut nn);
             for p in &pass1 {
                 let span = p.n + 1 - p.m;
                 if span < split_len || p.s > split_width {
                     continue;
                 }
                 let mid = ((p.m + p.n + 1) >> 1) as usize;
-                idx.zz_step1_reseed(&read, 0, mid, p.s + 1, min_seed_len, &mut expected_pass2, None, &fwd, enc);
+                idx.zz_step1_reseed(&read, 0, mid, p.s + 1, min_seed_len, &mut expected_pass2, &nn, None, &fwd, enc);
             }
             prop_assert_eq!(&unsorted[num1..], expected_pass2.as_slice(), "pass-2 tail mismatch");
 
@@ -1890,6 +1957,8 @@ mod tests {
         let mut expected = pass1_walk(idx, read, fwd, opts.min_seed_len);
         // Pass 2: reseed selection (transcribed) + zz_step1_reseed.
         let p1 = expected.clone();
+        let mut nn = Vec::new();
+        super::fill_next_n(read, &mut nn);
         for p in &p1 {
             let span = p.n + 1 - p.m;
             if span < opts.split_len || p.s > opts.split_width {
@@ -1903,6 +1972,7 @@ mod tests {
                 p.s + 1,
                 opts.min_seed_len,
                 &mut expected,
+                &nn,
                 None,
                 fwd,
                 enc,
@@ -2273,6 +2343,22 @@ mod tests {
         }
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    proptest! {
+        /// `fill_next_n` reproduces `fwd_qlen` at every position, for arbitrary reads
+        /// containing ambiguous (>=4) bases. Byte-identity contract for the next-N
+        /// memoization: every consumer that called `fwd_qlen(read, p)` now reads
+        /// `next_n[p]` and must get the identical value.
+        #[test]
+        fn fill_next_n_matches_fwd_qlen(read in proptest::collection::vec(0u8..=5, 0..200)) {
+            let mut nn: Vec<u32> = Vec::new();
+            super::fill_next_n(&read, &mut nn);
+            prop_assert_eq!(nn.len(), read.len() + 1);
+            for p in 0..=read.len() {
+                prop_assert_eq!(nn[p] as usize, fwd_qlen(&read, p), "mismatch at p={}", p);
+            }
         }
     }
 }
