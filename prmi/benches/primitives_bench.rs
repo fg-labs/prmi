@@ -424,6 +424,84 @@ fn bench_unpack_packed(c: &mut Criterion) {
     g.finish();
 }
 
+// ── bit_at reduction: before (%) vs after (Lemire) — Bb2 ───────────────────
+//
+// `bit_at` is private, so we inline both shapes here. Each bench drives
+// N=1024 `(h1, h2, i, num_bits)` probes; throughput is reported in probes.
+// The before/after bench is the Bb2 targeted comparison.
+
+/// `bit_at` baseline: combined % num_bits (true 64-bit division).
+#[inline(never)]
+fn bit_at_mod(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
+    let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
+    combined % num_bits
+}
+
+/// `bit_at` Lemire: (combined * num_bits) >> 64 (no division).
+#[inline(never)]
+fn bit_at_lemire(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
+    let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
+    (((combined as u128) * (num_bits as u128)) >> 64) as u64
+}
+
+fn bench_bit_at(c: &mut Criterion) {
+    // A corpus of N (h1, h2, i) triples with a representative num_bits.
+    // Use a realistic num_bits: BloomParams::for_keys(50_000, 0.01) ≈ 479,232 bits.
+    let num_bits: u64 = 479_296; // multiple of 64, near optimal for 50k keys at 1%
+    let mut state = 0xABCD_EF01_2345_6789u64;
+    let probes: Vec<(u64, u64, u32)> = (0..N)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let h1 = state;
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let h2 = state | 1;
+            let i = (state >> 60) as u32; // 0..15
+            (h1, h2, i)
+        })
+        .collect();
+
+    let mut g = c.benchmark_group("bit_at_reduction");
+    g.throughput(Throughput::Elements(probes.len() as u64));
+
+    // Before: true 64-bit division (Bb2 baseline).
+    g.bench_function("before_mod", |b| {
+        b.iter(|| {
+            let mut acc = 0u64;
+            for &(h1, h2, i) in &probes {
+                acc = acc.wrapping_add(bit_at_mod(
+                    black_box(h1),
+                    black_box(h2),
+                    black_box(i),
+                    black_box(num_bits),
+                ));
+            }
+            black_box(acc)
+        });
+    });
+
+    // After: Lemire multiply-shift (no division).
+    g.bench_function("after_lemire", |b| {
+        b.iter(|| {
+            let mut acc = 0u64;
+            for &(h1, h2, i) in &probes {
+                acc = acc.wrapping_add(bit_at_lemire(
+                    black_box(h1),
+                    black_box(h2),
+                    black_box(i),
+                    black_box(num_bits),
+                ));
+            }
+            black_box(acc)
+        });
+    });
+
+    g.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     let (_dir, idx) = build_index();
     eprintln!(
@@ -439,6 +517,7 @@ fn bench_all(c: &mut Criterion) {
     bench_tokenize_32mer(c);
     bench_next_n(c);
     bench_unpack_packed(c);
+    bench_bit_at(c);
 }
 
 criterion_group!(benches, bench_all);
