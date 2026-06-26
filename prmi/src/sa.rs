@@ -272,6 +272,12 @@ mod doubled_text_tests {
         assert_eq!(build_doubled_2x_text(&[]), vec![0u8]);
     }
 
+    // `build_doubled_2x_text` rejects out-of-range bases via `debug_assert!`, which
+    // is compiled out at `opt-level=3`, so this `should_panic` test only holds where
+    // debug assertions are active. Gating it on `cfg(debug_assertions)` keeps
+    // `cargo test --release` green (the release profile gained `lto`/`codegen-units`
+    // for the perf work; the assertion semantics are unchanged in debug builds).
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "out of range")]
     fn doubled_text_rejects_out_of_range_base() {
