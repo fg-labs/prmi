@@ -53,7 +53,7 @@ pub struct BedInterval {
     pub end: u64,
 }
 
-/// Parse a BED file into a sorted list of `BedInterval`s.
+/// Parse a BED file into a sorted, merged list of `BedInterval`s.
 ///
 /// Comment lines (`#`), track/browser header lines, and blank lines are
 /// silently skipped. Requires at least 3 whitespace-separated columns
@@ -61,10 +61,22 @@ pub struct BedInterval {
 /// intervals are concatenated genome-wide, matching the flat-genome
 /// coordinate space used by the trainer.
 ///
-/// Returns an error if any data line has fewer than 3 columns, or if
-/// start/end are not valid integers, or if `end <= start`.
+/// Per-line BED3 vs BED12 (decided by column count):
+/// - **BED3** (3–11 columns): keep the whole `[start, end)` interval. This is
+///   the canonical target / coarse-homology shape and is unchanged.
+/// - **BED12** (≥12 columns): keep ONLY the blocks. Columns 10/11/12 are
+///   `blockCount` / comma-separated `blockSizes` / comma-separated
+///   `blockStarts` (offsets relative to `start`); block `i` contributes
+///   `[start + blockStarts[i], start + blockStarts[i] + blockSizes[i])`. This
+///   lets the keep-set encode position-precise homology (e.g. length-1 / short
+///   contiguous-run k-mer start positions) compactly, one BED line per region.
 ///
-/// The returned vector is sorted by `start`.
+/// Returns an error if any data line has fewer than 3 columns, if start/end or
+/// any block field is not a valid integer, if `end <= start`, or if a BED12
+/// line's blocks are malformed (count mismatch, zero-length, or extending past
+/// `end`).
+///
+/// The returned vector is sorted by `start` and overlapping intervals merged.
 pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
     let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -114,7 +126,13 @@ pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
                 ),
             });
         }
-        out.push(BedInterval { start, end });
+        // A 12+-column line carries BED12 block fields (cols 10/11/12): keep
+        // only the blocks. Anything narrower is BED3: keep the whole interval.
+        if cols.len() >= 12 {
+            push_bed12_blocks(&mut out, &cols, start, end, lineno)?;
+        } else {
+            out.push(BedInterval { start, end });
+        }
     }
     out.sort_by_key(|i| i.start);
 
@@ -139,6 +157,105 @@ pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
     }
 
     Ok(out)
+}
+
+/// Parse the BED12 block fields of a single line and append one `BedInterval`
+/// per block to `out`.
+///
+/// `cols` is the whitespace-split line (already known to have ≥12 columns);
+/// `start`/`end` are the line's chromStart/chromEnd. Per the BED12 spec, column
+/// 10 (`cols[9]`) is `blockCount`, column 11 (`cols[10]`) is comma-separated
+/// `blockSizes`, and column 12 (`cols[11]`) is comma-separated `blockStarts`
+/// (offsets relative to `start`). A trailing comma (UCSC-style) is tolerated.
+/// Block `i` contributes `[start + starts[i], start + starts[i] + sizes[i])`.
+///
+/// Errors (all `InvalidInput`, with the 1-based line number) on a non-integer
+/// field, `blockCount == 0`, a size/start-count mismatch, a zero-length block,
+/// or a block extending past `end`.
+fn push_bed12_blocks(
+    out: &mut Vec<BedInterval>,
+    cols: &[&str],
+    start: u64,
+    end: u64,
+    lineno: usize,
+) -> Result<()> {
+    let err = |detail: String| Error::InvalidInput { detail };
+    let block_count: usize = cols[9].parse().map_err(|_| {
+        err(format!(
+            "BED parse error at line {}: bad blockCount {:?}",
+            lineno + 1,
+            cols[9]
+        ))
+    })?;
+    if block_count == 0 {
+        return Err(err(format!(
+            "BED parse error at line {}: blockCount is 0 (a BED12 line must have >=1 block)",
+            lineno + 1
+        )));
+    }
+    // Split a comma-separated u64 list, tolerating a single trailing comma.
+    let split_u64 = |field: &str, what: &str| -> Result<Vec<u64>> {
+        field
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<u64>().map_err(|_| {
+                    err(format!(
+                        "BED parse error at line {}: bad {} entry {:?}",
+                        lineno + 1,
+                        what,
+                        s
+                    ))
+                })
+            })
+            .collect()
+    };
+    let sizes = split_u64(cols[10], "blockSizes")?;
+    let starts = split_u64(cols[11], "blockStarts")?;
+    if sizes.len() != block_count || starts.len() != block_count {
+        return Err(err(format!(
+            "BED parse error at line {}: blockCount {} but got {} blockSizes and {} blockStarts",
+            lineno + 1,
+            block_count,
+            sizes.len(),
+            starts.len()
+        )));
+    }
+    for i in 0..block_count {
+        if sizes[i] == 0 {
+            return Err(err(format!(
+                "BED parse error at line {}: block {} has zero length",
+                lineno + 1,
+                i
+            )));
+        }
+        // Checked arithmetic: a malformed line with huge blockStart/blockSize
+        // could otherwise wrap and slip past the `be > end` bound check below.
+        let bs = start.checked_add(starts[i]);
+        let be = bs.and_then(|bs| bs.checked_add(sizes[i]));
+        let (bs, be) = match (bs, be) {
+            (Some(bs), Some(be)) => (bs, be),
+            _ => {
+                return Err(err(format!(
+                    "BED parse error at line {}: block {} coordinates overflow",
+                    lineno + 1,
+                    i
+                )))
+            }
+        };
+        if be > end {
+            return Err(err(format!(
+                "BED parse error at line {}: block {} [{}, {}) extends past chromEnd {}",
+                lineno + 1,
+                i,
+                bs,
+                be,
+                end
+            )));
+        }
+        out.push(BedInterval { start: bs, end: be });
+    }
+    Ok(())
 }
 
 /// Decide whether a doubled-text suffix-array position should be RETAINED by a
@@ -385,6 +502,123 @@ mod tests {
             covered_by_bed(&intervals, 50),
             "p=50 must be covered by the merged [10, 100) interval"
         );
+    }
+
+    // --- BED12 block parsing -------------------------------------------------
+
+    #[test]
+    fn parse_bed12_keeps_only_blocks_not_whole_span() {
+        // Line spans [100, 200) but declares 2 blocks: [100,110) and [150,170).
+        // BED12 keeps ONLY the blocks; the [110,150) and [170,200) gaps are out.
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t2\t10,20\t0,50").unwrap();
+        let intervals = parse_bed(f.path()).unwrap();
+        assert_eq!(
+            intervals.len(),
+            2,
+            "two disjoint blocks, not the whole span"
+        );
+        assert_eq!((intervals[0].start, intervals[0].end), (100, 110));
+        assert_eq!((intervals[1].start, intervals[1].end), (150, 170));
+        assert!(covered_by_bed(&intervals, 100));
+        assert!(covered_by_bed(&intervals, 109));
+        assert!(!covered_by_bed(&intervals, 110), "block1 end is exclusive");
+        assert!(!covered_by_bed(&intervals, 120), "inter-block gap not kept");
+        assert!(covered_by_bed(&intervals, 150));
+        assert!(covered_by_bed(&intervals, 169));
+        assert!(!covered_by_bed(&intervals, 170), "block2 end is exclusive");
+        assert!(
+            !covered_by_bed(&intervals, 199),
+            "span tail past last block not kept"
+        );
+    }
+
+    #[test]
+    fn parse_bed12_tolerates_trailing_comma() {
+        // UCSC writes blockSizes/blockStarts with a trailing comma.
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t2\t10,20,\t0,50,").unwrap();
+        let intervals = parse_bed(f.path()).unwrap();
+        assert_eq!(intervals.len(), 2);
+        assert_eq!((intervals[0].start, intervals[0].end), (100, 110));
+        assert_eq!((intervals[1].start, intervals[1].end), (150, 170));
+    }
+
+    #[test]
+    fn parse_bed12_length1_blocks_are_position_precise() {
+        // The k-mer-homology generator's shape: single-position blocks marking
+        // exact suffix-start positions. Two length-1 blocks at offsets 0 and 5.
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "chr1\t1000\t1010\tr\t0\t+\t1000\t1010\t0\t2\t1,1\t0,5").unwrap();
+        let intervals = parse_bed(f.path()).unwrap();
+        assert_eq!(intervals.len(), 2);
+        assert_eq!((intervals[0].start, intervals[0].end), (1000, 1001));
+        assert_eq!((intervals[1].start, intervals[1].end), (1005, 1006));
+        assert!(covered_by_bed(&intervals, 1000));
+        assert!(!covered_by_bed(&intervals, 1001));
+        assert!(covered_by_bed(&intervals, 1005));
+        assert!(!covered_by_bed(&intervals, 1004));
+    }
+
+    #[test]
+    fn parse_bed_mixed_bed3_and_bed12_lines() {
+        // BED3 line kept whole; BED12 line kept by blocks; both coexist + merge.
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "chr1\t0\t50").unwrap();
+        writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t1\t10\t0").unwrap();
+        let intervals = parse_bed(f.path()).unwrap();
+        assert_eq!(intervals.len(), 2);
+        assert_eq!((intervals[0].start, intervals[0].end), (0, 50));
+        assert_eq!((intervals[1].start, intervals[1].end), (100, 110));
+    }
+
+    #[test]
+    fn parse_bed12_rejects_block_count_mismatch() {
+        let mut f = NamedTempFile::new().unwrap();
+        // blockCount=2 but only one size/start each.
+        writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t2\t10\t0").unwrap();
+        let err = parse_bed(f.path()).unwrap_err();
+        assert!(format!("{err}").contains("blockCount"));
+    }
+
+    #[test]
+    fn parse_bed12_rejects_block_past_chrom_end() {
+        let mut f = NamedTempFile::new().unwrap();
+        // Block [100, 260) extends past chromEnd 200.
+        writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t1\t160\t0").unwrap();
+        let err = parse_bed(f.path()).unwrap_err();
+        assert!(format!("{err}").contains("extends past chromEnd"));
+    }
+
+    #[test]
+    fn parse_bed12_rejects_zero_block_count() {
+        let mut f = NamedTempFile::new().unwrap();
+        // 12 columns so the BED12 branch is taken, but blockCount is 0.
+        writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t0\t1\t0").unwrap();
+        let err = parse_bed(f.path()).unwrap_err();
+        assert!(format!("{err}").contains("blockCount is 0"));
+    }
+
+    #[test]
+    fn parse_bed12_rejects_overflowing_block_coords() {
+        let mut f = NamedTempFile::new().unwrap();
+        // blockStart near u64::MAX would wrap start+blockStart; must be rejected
+        // rather than slipping past the chromEnd bound via wraparound.
+        writeln!(
+            f,
+            "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t1\t10\t18446744073709551610"
+        )
+        .unwrap();
+        let err = parse_bed(f.path()).unwrap_err();
+        assert!(format!("{err}").contains("overflow"));
+    }
+
+    #[test]
+    fn parse_bed12_rejects_zero_length_block() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "chr1\t100\t200\tr\t0\t+\t100\t200\t0\t1\t0\t0").unwrap();
+        let err = parse_bed(f.path()).unwrap_err();
+        assert!(format!("{err}").contains("zero length"));
     }
 
     // --- covered_by_bed ------------------------------------------------------
