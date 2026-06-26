@@ -138,3 +138,24 @@ cargo build --release --features spectrum-probe-count --example profile_spectrum
 | Wall-time / backward call (corpus 1024×75 bp) | 126.5 µs | 24.2 µs | ~5.2× faster |
 
 The 53 probes/step ≈ 2 boundaries × log2(166 M) ≈ 2 × 26.5 confirms the reference searched the full SA; the model launch drops the median to 13 (≈ 2 × log2(2·err) for the windowed search) and shrinks the cold-probe count materially. Wall-time drops further than the probe ratio because the windowed probes are cache- and TLB-local rather than scattered across the 2 GB SA. Both probes/step AND wall-time drop on the real cold-SA case with all oracle tests green and a byte-identical trace on every chr17 anchor (2048/2048), so per the perf gate this is ACCEPTED. This is the gating learned-index win the consumers (bwa-mem3 hot-path item A / minibwa P1) asked for.
+
+---
+
+## Benchmark build profile and target-cpu
+
+`cargo bench` builds under Cargo's `bench` profile, which inherits its settings
+from `[profile.release]` — so the `lto = "thin"` and `codegen-units = 1` added
+there apply to the benches as well as the shipped library (verified: the bench
+rustc invocation carries `-C lto=thin -C codegen-units=1`). `target-cpu` is
+intentionally NOT pinned, so distributed artifacts stay portable (baseline
+x86-64 / aarch64).
+
+For host-tuned measurement, use `scripts/bench-native.sh`, which builds
+hermetically with exactly `RUSTFLAGS="-C target-cpu=native"` (it ignores any
+ambient `RUSTFLAGS` so a stale value can't change what is measured). Note: on
+Apple Silicon `native` selects `apple-mN` codegen the shipped baseline never
+receives — treat aarch64 numbers for scalar micro-changes as indicative only;
+the x86 floor (`x86-64-v3`) is the cost model of record. To bench a specific
+floor instead of native, run the bench directly with your own flags, e.g.
+`RUSTFLAGS="-C target-cpu=x86-64-v3" cargo bench -p prmi` (documented floor:
+`x86-64-v3` on x86, `neoverse-n1`/`v2` on Graviton).
