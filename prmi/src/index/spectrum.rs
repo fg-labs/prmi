@@ -1883,11 +1883,12 @@ impl LearnedIndex {
         // Recover the maximal interval [lo, hi) at depth max_len, seeded at hint.
         let qm = &query[..max_len];
         let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+        let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
         let mut lo = self.find_boundary(0, sa_num, hint, hint + 1, |mid| {
-            self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+            self.ref_less(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
         });
         let mut hi = self.find_boundary(lo, sa_num, hint, hint + 1, |mid| {
-            self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+            self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
         });
         let mut band_deepest = max_len as u64;
 
@@ -1922,11 +1923,12 @@ impl LearnedIndex {
             // (domain [0, lo + 1)) and its upper bound is ≥ hi.
             let pqm = &query[..m_parent as usize];
             let pqm_key = tokenize_32mer(pqm, pqm.len().min(KMER_LEN));
+            let (pqm_nbases, pqm_mask) = keyed_compare_mask(pqm.len());
             let new_lo = self.find_boundary(0, lo + 1, lo, lo + 1, |mid| {
-                self.ref_less(pqm, pqm_key, mid, pac, enc, l_pac)
+                self.ref_less(pqm, pqm_key, mid, pac, enc, l_pac, pqm_nbases, pqm_mask)
             });
             let new_hi = self.find_boundary(new_lo, sa_num, hi.saturating_sub(1), hi, |mid| {
-                self.shares_prefix(pqm, pqm_key, mid, pac, enc, l_pac)
+                self.shares_prefix(pqm, pqm_key, mid, pac, enc, l_pac, pqm_nbases, pqm_mask)
             });
             lo = new_lo;
             hi = new_hi;
@@ -2020,6 +2022,7 @@ impl LearnedIndex {
             }
             let qm = &query[..match_len as usize];
             let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+            let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
             // Recover `qm`'s interval by galloping from the insertion point `ip`
             // (which lies at the edge of that interval) rather than re-looking-up
             // `qm`'s key and re-searching the model window. `find_boundary` is
@@ -2027,10 +2030,10 @@ impl LearnedIndex {
             // the probe count — ~0 here for a unique deep match, vs ~log2(occ) when
             // a high-occ 32-mer prefix's loose window brackets the wide block.
             let lower = self.find_boundary(0, sa_num, ip, ip, |mid| {
-                self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+                self.ref_less(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
             let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
-                self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+                self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
             return MemMatch {
                 match_len,
@@ -2114,11 +2117,12 @@ impl LearnedIndex {
             }
             let qm = &query[..match_len as usize];
             let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+            let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
             let lower = self.find_boundary(0, sa_num, ip, ip, |mid| {
-                self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+                self.ref_less(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
             let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
-                self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+                self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
             return MemMatch {
                 match_len,
@@ -2182,10 +2186,13 @@ impl LearnedIndex {
         }
         let qm = &query[..match_len as usize];
         let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+        let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
         // In-interval seed: `ip` is the insertion point (interval edge), so the
         // in-interval row is whichever of `{ip-1, ip}` shares the maximal prefix
         // (see `mem_search_backward_truncated_span_rc`).
-        let seed = if ip > 0 && self.shares_prefix(qm, qm_key, ip - 1, pac, enc, l_pac) {
+        let seed = if ip > 0
+            && self.shares_prefix(qm, qm_key, ip - 1, pac, enc, l_pac, qm_nbases, qm_mask)
+        {
             ip - 1
         } else {
             ip
@@ -2197,13 +2204,13 @@ impl LearnedIndex {
         let mut upper = seed + 1;
         while lower > 0
             && upper - lower <= max_intv
-            && self.shares_prefix(qm, qm_key, lower - 1, pac, enc, l_pac)
+            && self.shares_prefix(qm, qm_key, lower - 1, pac, enc, l_pac, qm_nbases, qm_mask)
         {
             lower -= 1;
         }
         while upper < sa_num
             && upper - lower <= max_intv
-            && self.shares_prefix(qm, qm_key, upper, pac, enc, l_pac)
+            && self.shares_prefix(qm, qm_key, upper, pac, enc, l_pac, qm_nbases, qm_mask)
         {
             upper += 1;
         }
@@ -2279,11 +2286,12 @@ impl LearnedIndex {
         let sa_num = self.sa_num();
         let qm = &query[..match_len as usize];
         let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+        let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
         let lower = self.find_boundary(0, sa_num, hint, hint + 1, |mid| {
-            self.ref_less(qm, qm_key, mid, pac, enc, l_pac)
+            self.ref_less(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
         });
         let upper = self.find_boundary(lower, sa_num, hint, hint + 1, |mid| {
-            self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac)
+            self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
         });
         MemMatch {
             match_len,
@@ -2446,14 +2454,15 @@ impl LearnedIndex {
         // P = read[anchor_end - match_len .. anchor_end].
         let p_slice = &read[anchor_end - match_len as usize..anchor_end];
         let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+        let (p_nbases, p_mask) = keyed_compare_mask(p_slice.len());
         let (pred, err) = self.lookup(p_key);
         let win_lo = pred.saturating_sub(err);
         let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
         let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
-            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
-            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         MemMatch {
             match_len,
@@ -2606,7 +2615,10 @@ impl LearnedIndex {
         // shares the maximal prefix (`ip - 1` if it does, else `ip`); one probe.
         let sm = &q[..span_max as usize];
         let sm_key = tokenize_32mer(sm, sm.len().min(KMER_LEN));
-        let seed = if ip > 0 && self.shares_prefix(sm, sm_key, ip - 1, pac, enc, l_pac) {
+        let (sm_nbases, sm_mask) = keyed_compare_mask(sm.len());
+        let seed = if ip > 0
+            && self.shares_prefix(sm, sm_key, ip - 1, pac, enc, l_pac, sm_nbases, sm_mask)
+        {
             ip - 1
         } else {
             ip
@@ -2619,15 +2631,16 @@ impl LearnedIndex {
         // a `tokenize_32mer` per length step — the dominant instruction cost here.
         let expand = |l: u64, lo: &mut u64, hi: &mut u64| {
             let p = &q[..l as usize];
+            let (p_nbases, p_mask) = keyed_compare_mask(p.len());
             while *lo > 0
                 && *hi - *lo < min_intv
-                && self.shares_prefix(p, q_key, *lo - 1, pac, enc, l_pac)
+                && self.shares_prefix(p, q_key, *lo - 1, pac, enc, l_pac, p_nbases, p_mask)
             {
                 *lo -= 1;
             }
             while *hi < sa_num
                 && *hi - *lo < min_intv
-                && self.shares_prefix(p, q_key, *hi, pac, enc, l_pac)
+                && self.shares_prefix(p, q_key, *hi, pac, enc, l_pac, p_nbases, p_mask)
             {
                 *hi += 1;
             }
@@ -2647,16 +2660,19 @@ impl LearnedIndex {
         // Neighbors outside the span_max interval share < span_max, so cap LCPs at
         // span_max-1.
         let lcap = (span_max as u32).saturating_sub(1);
+        let (q_nbases, q_mask) = keyed_compare_mask(q.len());
         let lcp_lo = |lo: u64| {
             if lo > 0 {
-                self.lcp_at(q, q_key, lo - 1, pac, enc, l_pac).min(lcap)
+                self.lcp_at(q, q_key, lo - 1, pac, enc, l_pac, q_nbases, q_mask)
+                    .min(lcap)
             } else {
                 0
             }
         };
         let lcp_hi = |hi: u64| {
             if hi < sa_num {
-                self.lcp_at(q, q_key, hi, pac, enc, l_pac).min(lcap)
+                self.lcp_at(q, q_key, hi, pac, enc, l_pac, q_nbases, q_mask)
+                    .min(lcap)
             } else {
                 0
             }
@@ -3026,16 +3042,28 @@ impl LearnedIndex {
         let mut lo = maximal.sa_start;
         let mut hi = hi0;
         let mut occ = hi - lo;
+        let (query_nbases, query_mask) = keyed_compare_mask(query.len());
         let lcp_lo = |lo: u64| {
             if lo > 0 {
-                self.lcp_at(query, q_key, lo - 1, pac, enc, l_pac).min(lcap)
+                self.lcp_at(
+                    query,
+                    q_key,
+                    lo - 1,
+                    pac,
+                    enc,
+                    l_pac,
+                    query_nbases,
+                    query_mask,
+                )
+                .min(lcap)
             } else {
                 0
             }
         };
         let lcp_hi = |hi: u64| {
             if hi < sa_num {
-                self.lcp_at(query, q_key, hi, pac, enc, l_pac).min(lcap)
+                self.lcp_at(query, q_key, hi, pac, enc, l_pac, query_nbases, query_mask)
+                    .min(lcap)
             } else {
                 0
             }
@@ -3077,11 +3105,12 @@ impl LearnedIndex {
         }
         let p = &query[..best_len];
         let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
+        let (p_nbases, p_mask) = keyed_compare_mask(p.len());
         let lower = self.find_boundary(0, sa_num, lo, lo, |mid| {
-            self.ref_less(p, p_key, mid, pac, enc, l_pac)
+            self.ref_less(p, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         let upper = self.find_boundary(lower, sa_num, hi, hi, |mid| {
-            self.shares_prefix(p, p_key, mid, pac, enc, l_pac)
+            self.shares_prefix(p, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         MemMatch {
             match_len: best_len as u64,
@@ -3251,15 +3280,16 @@ impl LearnedIndex {
             };
         }
         let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+        let (p_nbases, p_mask) = keyed_compare_mask(p_slice.len());
         // Tight seed from the inverse SA when present (the exact SA index of P at
         // this locus); otherwise the hint itself — `find_boundary` expands on a
         // miss, so the seed only affects speed, never the boundary it returns.
         let seed = self.isa_at(p_anchor - left_ext).unwrap_or(hint);
         let lower = self.find_boundary(0, sa_num, seed, seed + 1, |mid| {
-            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         let upper = self.find_boundary(lower, sa_num, seed, seed + 1, |mid| {
-            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         MemMatch {
             match_len,
@@ -3332,6 +3362,7 @@ impl LearnedIndex {
             let p_start = pivot - 1 - left_ext as usize;
             let p_slice = &read[p_start..anchor_end];
             let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+            let (p_nbases, p_mask) = keyed_compare_mask(p_slice.len());
 
             // Seed window from the k-mer table: the EXACT SA interval of P's first
             // `min(|P|, k)` bases (a superset of P's interval — P extends it), with
@@ -3341,10 +3372,10 @@ impl LearnedIndex {
             let (win_lo, win_hi) = (table.lo(m, w), table.hi(m, w));
 
             let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
-                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
             });
             let upper = self.find_boundary(lower, sa_num, win_hi, win_hi, |mid| {
-                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
             });
 
             if upper <= lower {
@@ -3435,12 +3466,13 @@ impl LearnedIndex {
             let p_start = pivot - left_ext as usize;
             let p_slice = &read[p_start..anchor_end];
             let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+            let (p_nbases, p_mask) = keyed_compare_mask(p_slice.len());
             let seed = self.isa_at(p_anchor - left_ext).unwrap_or(hint);
             let lower = self.find_boundary(0, sa_num, seed, seed + 1, |mid| {
-                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+                self.ref_less(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
             });
             let upper = self.find_boundary(lower, sa_num, seed, seed + 1, |mid| {
-                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+                self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
             });
             if upper <= lower {
                 break; // diverged hint: pattern absent (shorter trace, caller's gate)
@@ -3988,6 +4020,7 @@ impl LearnedIndex {
         seed_override: Option<fn(u64) -> (u64, u64)>,
     ) -> Option<(u64, u64)> {
         let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+        let (p_nbases, p_mask) = keyed_compare_mask(p_slice.len());
         let (pred, err) = match seed_override {
             Some(f) => f(p_key),
             None => self.lookup(p_key),
@@ -4004,10 +4037,10 @@ impl LearnedIndex {
         let win_lo = pred.saturating_sub(err);
         let win_hi = pred.saturating_add(err).saturating_add(1).min(sa_num);
         let lower = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
-            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac)
+            self.ref_less(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
-            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac)
+            self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         if upper <= lower {
             None
@@ -4295,7 +4328,7 @@ impl LearnedIndex {
 
     /// One lower-bound probe: is the suffix at SA index `mid` lexicographically less
     /// than `p_slice`? Reads `sa_position_for(mid)` (the cold DRAM hit) and the stored
-    /// key, then runs the keyed 2× compare.
+    /// key, then runs the keyed 2× compare with the caller-precomputed mask.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     fn ref_less(
@@ -4306,11 +4339,14 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
         l_pac: u64,
+        nbases: usize,
+        mask: u64,
     ) -> bool {
         bump_probe();
         let (pos, key) = self.sa_entry(mid);
-        let (ref_less, _) =
-            compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
+        let (ref_less, _) = compare_query_vs_suffix_2x_keyed_with_mask(
+            p_slice, p_key, key, pos, pac, enc, l_pac, nbases, mask,
+        );
         ref_less
     }
 
@@ -4326,10 +4362,14 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
         l_pac: u64,
+        nbases: usize,
+        mask: u64,
     ) -> bool {
         bump_probe();
         let (pos, key) = self.sa_entry(mid);
-        let (_, lcp) = compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
+        let (_, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
+            p_slice, p_key, key, pos, pac, enc, l_pac, nbases, mask,
+        );
         (lcp as usize) >= p_slice.len()
     }
 
@@ -4345,10 +4385,14 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
         l_pac: u64,
+        nbases: usize,
+        mask: u64,
     ) -> u32 {
         bump_probe();
         let (pos, key) = self.sa_entry(mid);
-        let (_, lcp) = compare_query_vs_suffix_2x_keyed(p_slice, p_key, key, pos, pac, enc, l_pac);
+        let (_, lcp) = compare_query_vs_suffix_2x_keyed_with_mask(
+            p_slice, p_key, key, pos, pac, enc, l_pac, nbases, mask,
+        );
         lcp
     }
 
@@ -4425,6 +4469,7 @@ impl LearnedIndex {
             }
         };
         let mut ml: u32 = 0;
+        let (q_nbases, q_mask) = keyed_compare_mask(q.len());
         let ip = if trusted {
             // Trusted model window: bsearch the window first, skip the gallop
             // edge-checks, and reuse the bsearch's `ip-1`/`ip` probes as the neighbor
@@ -4433,7 +4478,9 @@ impl LearnedIndex {
                 self.forward_boundary_windowed(sa_num, win_lo, win_hi, |mid| {
                     bump_probe();
                     let (pos, key) = self.sa_entry(mid);
-                    compare_query_vs_suffix_2x_keyed(q, q_key, key, pos, pac, enc, l_pac)
+                    compare_query_vs_suffix_2x_keyed_with_mask(
+                        q, q_key, key, pos, pac, enc, l_pac, q_nbases, q_mask,
+                    )
                 });
             if ip > 0 {
                 ml = ml.max(lcp_lo);
@@ -4444,13 +4491,13 @@ impl LearnedIndex {
             ip
         } else {
             let ip = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
-                self.ref_less(q, q_key, mid, pac, enc, l_pac)
+                self.ref_less(q, q_key, mid, pac, enc, l_pac, q_nbases, q_mask)
             });
             if ip > 0 {
-                ml = ml.max(self.lcp_at(q, q_key, ip - 1, pac, enc, l_pac));
+                ml = ml.max(self.lcp_at(q, q_key, ip - 1, pac, enc, l_pac, q_nbases, q_mask));
             }
             if ip < sa_num {
-                ml = ml.max(self.lcp_at(q, q_key, ip, pac, enc, l_pac));
+                ml = ml.max(self.lcp_at(q, q_key, ip, pac, enc, l_pac, q_nbases, q_mask));
             }
             ip
         };
@@ -4535,13 +4582,14 @@ impl LearnedIndex {
             let p_end = pivot + anchor_len_usize;
             let p_slice = &read[p_start..p_end];
             let p_key = tokenize_32mer(p_slice, p_slice.len().min(KMER_LEN));
+            let (p_nbases, p_mask) = keyed_compare_mask(p_slice.len());
 
             // Lower bound over the FULL [0, sa_num).
             let mut lo = 0u64;
             let mut hi = sa_num;
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                if self.ref_less(p_slice, p_key, mid, pac, enc, l_pac) {
+                if self.ref_less(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask) {
                     lo = mid + 1;
                 } else {
                     hi = mid;
@@ -4553,7 +4601,7 @@ impl LearnedIndex {
             let mut c_hi = sa_num;
             while c_lo < c_hi {
                 let mid = c_lo + (c_hi - c_lo) / 2;
-                if self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac) {
+                if self.shares_prefix(p_slice, p_key, mid, pac, enc, l_pac, p_nbases, p_mask) {
                     c_lo = mid + 1;
                 } else {
                     c_hi = mid;
