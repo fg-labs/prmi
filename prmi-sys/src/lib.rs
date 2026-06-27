@@ -556,8 +556,8 @@ pub struct prmi_smem_step_t {
 /// with the same three `u64` fields in the same order, so an output buffer of
 /// one can be filled in place as a slice of the other (used by the `*_fill`
 /// paths below to avoid an intermediate `Vec`). This assertion guards
-/// size/alignment; the field order is asserted by inspection and the `#[repr(C)]`
-/// on both types (see `SmemStep`'s doc comment).
+/// size/alignment AND each field's offset, so a field reorder of either struct
+/// cannot silently break the `copy_from_slice` reinterpret path.
 const _: () = {
     assert!(
         core::mem::size_of::<prmi_smem_step_t>()
@@ -566,6 +566,20 @@ const _: () = {
     assert!(
         core::mem::align_of::<prmi_smem_step_t>()
             == core::mem::align_of::<prmi::index::spectrum::SmemStep>()
+    );
+    // Pin the field order: the reinterpret copies bytes, so each field must sit at
+    // the same offset in both structs.
+    assert!(
+        core::mem::offset_of!(prmi_smem_step_t, sa_start)
+            == core::mem::offset_of!(prmi::index::spectrum::SmemStep, sa_start)
+    );
+    assert!(
+        core::mem::offset_of!(prmi_smem_step_t, occ_count)
+            == core::mem::offset_of!(prmi::index::spectrum::SmemStep, occ_count)
+    );
+    assert!(
+        core::mem::offset_of!(prmi_smem_step_t, match_len)
+            == core::mem::offset_of!(prmi::index::spectrum::SmemStep, match_len)
     );
 };
 
@@ -958,16 +972,11 @@ unsafe fn write_fwd_task_steps(
         // — UB — is never reached).
         return false;
     }
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
-    };
-    for (slot, s) in dst.iter_mut().zip(steps.iter()) {
-        *slot = prmi_smem_step_t {
-            sa_start: s.sa_start,
-            occ_count: s.occ_count,
-            match_len: s.match_len,
-        };
-    }
+    // `out_steps_as_smemstep` reinterprets the output buffer as `&mut [SmemStep]`;
+    // `copy_from_slice` then writes all steps in one call (layout equivalence is
+    // compile-time asserted above).
+    let dst = unsafe { out_steps_as_smemstep(steps_arena.add(t.steps_off as usize), steps.len()) };
+    dst.copy_from_slice(steps);
     false
 }
 
@@ -1205,16 +1214,11 @@ unsafe fn write_bwd_task_steps(
         // — UB — is never reached).
         return false;
     }
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(steps_arena.add(t.steps_off as usize), steps.len())
-    };
-    for (slot, s) in dst.iter_mut().zip(steps.iter()) {
-        *slot = prmi_smem_step_t {
-            sa_start: s.sa_start,
-            occ_count: s.occ_count,
-            match_len: s.match_len,
-        };
-    }
+    // `out_steps_as_smemstep` reinterprets the output buffer as `&mut [SmemStep]`;
+    // `copy_from_slice` then writes all steps in one call (layout equivalence is
+    // compile-time asserted above).
+    let dst = unsafe { out_steps_as_smemstep(steps_arena.add(t.steps_off as usize), steps.len()) };
+    dst.copy_from_slice(steps);
     false
 }
 
@@ -1362,9 +1366,12 @@ unsafe fn backward_spectrum_batch_impl(
                 })
                 .collect();
             let all_steps = h.idx.backward_spectrum_lockstep(&bwd_tasks, pac_slice, enc);
-            for (i, steps) in all_steps.iter().enumerate() {
-                if unsafe { write_bwd_task_steps(steps_arena, &tasks_s[i], steps, &mut out_ns[i]) }
-                {
+            debug_assert_eq!(all_steps.len(), tasks_s.len());
+            // `zip` (not indexing) keeps the three collections paired safely.
+            for ((t, out_ns_i), steps) in
+                tasks_s.iter().zip(out_ns.iter_mut()).zip(all_steps.iter())
+            {
+                if unsafe { write_bwd_task_steps(steps_arena, t, steps, out_ns_i) } {
                     overflow = true;
                 }
             }

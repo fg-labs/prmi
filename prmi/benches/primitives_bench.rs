@@ -208,6 +208,303 @@ fn bench_tokenize_32mer(c: &mut Criterion) {
     g.finish();
 }
 
+// ── next_n: O(rlen²) → O(1) per-read distance precompute ───────────────────
+
+// Both kernels are `#[inline(never)]` so the comparison is symmetric: each is
+// measured across a real call boundary, and the optimizer cannot collapse the
+// O(rlen²) baseline (e.g. by CSE-ing the repeated scans) into something faster
+// than the per-pivot `fwd_qlen` calls it stands in for. The two prmi fns being
+// mirrored here are private, so the bench reimplements rather than exports them.
+
+/// Inline reimplementation of the old `fwd_qlen(read, p)` forward scan —
+/// the baseline (O(rlen²) over all pivots).
+#[inline(never)]
+fn next_n_scan(read: &[u8], p: usize) -> usize {
+    let rlen = read.len();
+    for (i, &b) in read.iter().enumerate().skip(p) {
+        if b >= 4 {
+            return i - p;
+        }
+    }
+    rlen - p
+}
+
+/// Inline reimplementation of `fill_next_n` (descending recurrence).
+#[inline(never)]
+fn fill_next_n_inline(read: &[u8], out: &mut Vec<u32>) {
+    let rlen = read.len();
+    out.clear();
+    out.resize(rlen + 1, 0);
+    for i in (0..rlen).rev() {
+        out[i] = if read[i] >= 4 { 0 } else { out[i + 1] + 1 };
+    }
+}
+
+fn bench_next_n(c: &mut Criterion) {
+    // A corpus of reads with scattered ambiguous (>=4) bases. `v` is the top 3
+    // bits (0..=7) and `v == 0` marks an N, so ~1 in 8 (12.5%) of bases are
+    // ambiguous. This is conservative: a high N-density makes each forward scan
+    // terminate early, shrinking the O(rlen²) baseline — realistic low-N reads
+    // (long N-free runs, full-length scans) show a LARGER speedup than measured.
+    let read_len = 150usize;
+    let num_reads = N;
+    let mut reads: Vec<Vec<u8>> = Vec::with_capacity(num_reads);
+    let mut state = 0xDEAD_BEEF_CAFE_BABEu64;
+    for _ in 0..num_reads {
+        let read: Vec<u8> = (0..read_len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let v = (state >> 61) as u8;
+                // v in 0..=7; v == 0 (~1 in 8) is ambiguous (4), rest are 0..=3
+                if v == 0 {
+                    4u8
+                } else {
+                    v & 3
+                }
+            })
+            .collect();
+        reads.push(read);
+    }
+
+    let total_pivots: u64 = reads.iter().map(|r| r.len() as u64).sum();
+
+    let mut g = c.benchmark_group("next_n");
+    g.throughput(Throughput::Elements(total_pivots));
+
+    // Baseline: O(rlen²) — repeated forward scan for every pivot.
+    g.bench_function("scan_all_pivots", |b| {
+        b.iter(|| {
+            let mut sum = 0u64;
+            for read in &reads {
+                for p in 0..read.len() {
+                    sum = sum.wrapping_add(next_n_scan(black_box(read), black_box(p)) as u64);
+                }
+            }
+            black_box(sum)
+        });
+    });
+
+    // Optimized: fill once per read (O(rlen)), then index O(1).
+    let mut next_n: Vec<u32> = Vec::new();
+    g.bench_function("fill_once_index", |b| {
+        b.iter(|| {
+            let mut sum = 0u64;
+            for read in &reads {
+                fill_next_n_inline(black_box(read), &mut next_n);
+                // Intentionally mirrors the production index-by-position loop shape to
+                // benchmark fill_next_n + indexed access vs. the per-pivot scan baseline.
+                #[allow(clippy::needless_range_loop)]
+                for p in 0..read.len() {
+                    sum = sum.wrapping_add(next_n[p] as u64);
+                }
+            }
+            black_box(sum)
+        });
+    });
+
+    g.finish();
+}
+
+// ── unpack_packed_forward: before/after middle-loop shapes ──────────────────
+//
+// `unpack_packed_forward` is private, so we inline-reimplement the two middle
+// loop shapes (before / after PR4) and bench them over a packed-encoded corpus
+// that is long enough (≥ 128 bases) to let the 32-base word loop dominate.
+// This mirrors the pattern used by `bench_next_n` above.
+//
+// The LUT is the same 256-entry table as in spectrum.rs (duplicated here so
+// the bench is self-contained). Each bench drives 32 packed words (32 × 32 =
+// 1 024 bases per decode call) across a corpus of 256 encoded sequences.
+
+/// 256-entry LUT: byte → four 2-bit bases as a little-endian u32.
+/// Bit layout: base0 in bits 6-7 (MSB), base3 in bits 0-1 (LSB) of the source
+/// byte. Entry `b` expands to `[base0, base1, base2, base3]` via `.to_le_bytes()`.
+const BENCH_UNPACK_LUT: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let byte = b as u32;
+        t[b] = ((byte >> 6) & 0x3)
+            | (((byte >> 4) & 0x3) << 8)
+            | (((byte >> 2) & 0x3) << 16)
+            | ((byte & 0x3) << 24);
+        b += 1;
+    }
+    t
+};
+
+/// Corpus of packed sequences. Each is `PAC_BYTES` bytes = `PAC_BYTES * 4` bases.
+const PAC_BYTES: usize = 256; // 1 024 bases = 32 full 32-base word-loop iterations
+const CORPUS_COUNT: usize = 256;
+
+fn make_packed_corpus() -> Vec<Vec<u8>> {
+    let mut state = 0xFEED_FACE_DEAD_BEEFu64;
+    (0..CORPUS_COUNT)
+        .map(|_| {
+            (0..PAC_BYTES)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 56) as u8
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Before (PR3 baseline): 9 bounds checks per 32-base step — try_into().unwrap()
+/// + 8× i+4*j slice indexing. Driven by the original while loop.
+#[inline(never)]
+fn unpack_middle_before(pac: &[u8], out: &mut [u8]) {
+    let n = out.len();
+    let mut i = 0usize;
+    let mut pos = 0usize;
+    while i + 32 <= n {
+        let base = pos >> 2;
+        let word = u64::from_le_bytes(pac[base..base + 8].try_into().unwrap());
+        for j in 0..8 {
+            let byte = (word >> (8 * j)) as u8;
+            out[i + 4 * j..i + 4 * j + 4]
+                .copy_from_slice(&BENCH_UNPACK_LUT[byte as usize].to_le_bytes());
+        }
+        i += 32;
+        pos += 32;
+    }
+}
+
+/// After (PR4): bounds checked once at the slice split via chunks_exact.
+#[inline(never)]
+fn unpack_middle_after(pac: &[u8], out: &mut [u8]) {
+    let n = out.len();
+    let i = 0usize;
+    let pos = 0usize;
+    let mid_words = (n - i) / 32;
+    if mid_words > 0 {
+        let src_byte = pos >> 2;
+        let out_mid = &mut out[i..i + mid_words * 32];
+        let src_mid = &pac[src_byte..src_byte + mid_words * 8];
+        for (chunk_out, w) in out_mid.chunks_exact_mut(32).zip(src_mid.chunks_exact(8)) {
+            let word = u64::from_le_bytes(w.try_into().unwrap());
+            for (k, slot) in chunk_out.chunks_exact_mut(4).enumerate() {
+                slot.copy_from_slice(
+                    &BENCH_UNPACK_LUT[(word >> (8 * k)) as u8 as usize].to_le_bytes(),
+                );
+            }
+        }
+    }
+}
+
+fn bench_unpack_packed(c: &mut Criterion) {
+    let corpus = make_packed_corpus();
+    let out_len = PAC_BYTES * 4; // 1 024 unpacked bases per call
+    let mut out = vec![0u8; out_len];
+    let total_bases: u64 = (corpus.len() * out_len) as u64;
+
+    let mut g = c.benchmark_group("unpack_packed_middle");
+    g.throughput(Throughput::Elements(total_bases));
+
+    g.bench_function("before_while_loop", |b| {
+        b.iter(|| {
+            for pac in &corpus {
+                unpack_middle_before(black_box(pac), black_box(&mut out));
+            }
+            black_box(&out);
+        });
+    });
+
+    g.bench_function("after_chunks_exact", |b| {
+        b.iter(|| {
+            for pac in &corpus {
+                unpack_middle_after(black_box(pac), black_box(&mut out));
+            }
+            black_box(&out);
+        });
+    });
+
+    g.finish();
+}
+
+// ── bit_at reduction: before (%) vs after (Lemire) — Bb2 ───────────────────
+//
+// `bit_at` is private, so we inline both shapes here. Each bench drives
+// N=1024 `(h1, h2, i, num_bits)` probes; throughput is reported in probes.
+// The before/after bench is the Bb2 targeted comparison.
+
+/// `bit_at` baseline: combined % num_bits (true 64-bit division).
+#[inline(never)]
+fn bit_at_mod(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
+    let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
+    combined % num_bits
+}
+
+/// `bit_at` Lemire: (combined * num_bits) >> 64 (no division).
+#[inline(never)]
+fn bit_at_lemire(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
+    let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
+    (((combined as u128) * (num_bits as u128)) >> 64) as u64
+}
+
+fn bench_bit_at(c: &mut Criterion) {
+    // A corpus of N (h1, h2, i) triples with a representative num_bits.
+    // Use a realistic num_bits: BloomParams::for_keys(50_000, 0.01) ≈ 479,232 bits.
+    let num_bits: u64 = 479_296; // multiple of 64, near optimal for 50k keys at 1%
+    let mut state = 0xABCD_EF01_2345_6789u64;
+    let probes: Vec<(u64, u64, u32)> = (0..N)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let h1 = state;
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let h2 = state | 1;
+            let i = (state >> 60) as u32; // 0..15
+            (h1, h2, i)
+        })
+        .collect();
+
+    let mut g = c.benchmark_group("bit_at_reduction");
+    g.throughput(Throughput::Elements(probes.len() as u64));
+
+    // Before: true 64-bit division (Bb2 baseline).
+    g.bench_function("before_mod", |b| {
+        b.iter(|| {
+            let mut acc = 0u64;
+            for &(h1, h2, i) in &probes {
+                acc = acc.wrapping_add(bit_at_mod(
+                    black_box(h1),
+                    black_box(h2),
+                    black_box(i),
+                    black_box(num_bits),
+                ));
+            }
+            black_box(acc)
+        });
+    });
+
+    // After: Lemire multiply-shift (no division).
+    g.bench_function("after_lemire", |b| {
+        b.iter(|| {
+            let mut acc = 0u64;
+            for &(h1, h2, i) in &probes {
+                acc = acc.wrapping_add(bit_at_lemire(
+                    black_box(h1),
+                    black_box(h2),
+                    black_box(i),
+                    black_box(num_bits),
+                ));
+            }
+            black_box(acc)
+        });
+    });
+
+    g.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     let (_dir, idx) = build_index();
     eprintln!(
@@ -221,6 +518,9 @@ fn bench_all(c: &mut Criterion) {
     bench_reverse_complement_key(c);
     bench_reverse_complement_2bit(c);
     bench_tokenize_32mer(c);
+    bench_next_n(c);
+    bench_unpack_packed(c);
+    bench_bit_at(c);
 }
 
 criterion_group!(benches, bench_all);

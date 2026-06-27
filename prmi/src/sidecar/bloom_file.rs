@@ -43,6 +43,33 @@
 //!
 //! [`present_anchor_any`]: crate::index::LearnedIndex::present_anchor_any
 //!
+//! # Bit-selection: Lemire multiply-shift reduction
+//!
+//! [`bit_at`] maps a 64-bit combined hash into `[0, num_bits)` using Lemire's
+//! multiply-shift reduction:
+//!
+//! ```text
+//! bit = (combined as u128 * num_bits as u128) >> 64
+//! ```
+//!
+//! This is division-free (no `%` instruction), uniform over any `num_bits`, and
+//! deterministic across writer and reader — both call the same `bit_at`, so a
+//! self-consistent `.blm` has no false negatives.
+//!
+//! **`.blm` rebuild requirement.** The Lemire reduction selects *different* bits
+//! than the prior `combined % num_bits` form for the same key, so the on-disk
+//! `.blm` body bytes differ between builds using different prmi binaries. The
+//! shared header layout and `FORMAT_VERSION` are unchanged — bumping the shared
+//! `FORMAT_VERSION` (used by `.sa`, `.l1`, `.l2`, `.blm`, …) to guard a bloom-only
+//! change would invalidate all sidecars and force a full index rebuild. Instead a
+//! `.blm` written by a binary using a different reduction is **rejected on open**
+//! via the [`BLOOM_BODY_VERSION`] field (header byte 20): its bits would otherwise
+//! be stale, producing bloom false negatives — harmless on the `mem_search`-confirmed
+//! any-window gate, but the unconfirmed `bloom_first` gate would surface them as
+//! silently mis-routed reads. Rejecting drops the bloom so the gate degrades to the
+//! exact first-window path (`present_anchor`); a `.blm` is a build artifact
+//! regenerated per index build. The bloom is an accelerator, not a correctness oracle.
+//!
 //! # Layout
 //!
 //! An 80-byte header followed by the bit array (`ceil(num_bits / 8)` bytes):
@@ -53,7 +80,7 @@
 //! | 4  | version | u32 | [`FORMAT_VERSION`] |
 //! | 8  | num_bits | u64 | bit-array length (always a multiple of 64) |
 //! | 16 | num_hashes | u32 | k (double-hashing probe count) |
-//! | 20 | _reserved | u32 | zero |
+//! | 20 | body_version | u32 | [`BLOOM_BODY_VERSION`] — bit_at reduction scheme (rejected on mismatch) |
 //! | 24 | num_keys | u64 | inserted key count (provenance / sizing only) |
 //! | 32 | sa_num | u64 | tiered `.sa` entry count this bloom was built for (binding) |
 //! | 40 | ref_digest | [u8; 32] | reference content hash (binding; same digest as `.kmt`) |
@@ -90,6 +117,15 @@ use std::sync::Arc;
 /// Size of the `.blm` binary header, in bytes (includes the `sa_num`,
 /// `ref_digest`, and `keyset_digest` fields that bind the bloom to its index).
 pub const BLM_FILE_HEADER_BYTES: usize = 80;
+
+/// `.blm` body-version (header byte 20): the bit-selection reduction scheme used
+/// to build the bit array. Distinct from the shared `FORMAT_VERSION` (header
+/// layout) — it discriminates the `bit_at` reduction so a `.blm` whose body bits
+/// were written by a binary using a different reduction is rejected on open
+/// rather than served with stale bits. `1` = Lemire multiply-shift. A `.blm`
+/// written before this field existed has `0` here (the zeroed reserved field) and
+/// is therefore rejected. Bump this whenever `bit_at`'s mapping changes.
+pub const BLOOM_BODY_VERSION: u32 = 1;
 
 /// Bloom-filter sizing: bit-array length and probe count, derived from the key
 /// count and a target false-positive rate via the textbook optimal formulas.
@@ -160,15 +196,20 @@ fn key_hashes(key: u64) -> (u64, u64) {
     (h1, h2)
 }
 
-/// The `i`-th bit position from a key's `(h1, h2)` pair: `(h1 + i · h2) mod
-/// num_bits`. Caller guarantees `num_bits > 0`.
+/// The `i`-th bit position from a key's `(h1, h2)` pair: `(h1 + i · h2)`
+/// reduced uniformly into `[0, num_bits)` via Lemire multiply-shift.
+/// Caller guarantees `num_bits > 0`.
 #[inline]
 fn bit_at(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
-    // h1 + i*h2 in wrapping u64 arithmetic, then reduced mod num_bits. Wrapping is
-    // fine: the reduction makes the absolute value irrelevant, only the residue
-    // matters, and it is deterministic across write/read.
     let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
-    combined % num_bits
+    // Lemire reduction: (combined * num_bits) >> 64, computed in u128. Maps
+    // uniformly into [0, num_bits) with no division. num_bits is a multiple of
+    // 64 (NOT a power of two in general), so `& (num_bits - 1)` is not safe;
+    // this form works for any num_bits. Replaces `combined % num_bits`.
+    //
+    // Before: combined % num_bits  (~20-40 cycles, one true 64-bit div per probe)
+    // After:  (combined as u128 * num_bits as u128) >> 64  (mul + shift, ~3-5 cycles)
+    (((combined as u128) * (num_bits as u128)) >> 64) as u64
 }
 
 /// Build a bloom filter over `keys` sized per `params` and write it to `path`,
@@ -198,7 +239,8 @@ pub fn write_bloom_file(
     ref_digest: &[u8; 32],
 ) -> Result<u64> {
     // `BloomParams` fields are public, so a caller can bypass `for_keys` and pass
-    // `num_bits == 0` (which would panic the `% num_bits` in `bit_at`) or a
+    // `num_bits == 0` (a degenerate zero-size filter — `bit_at`'s multiply-shift
+    // maps everything to bit 0 rather than panicking, but it is still invalid) or a
     // `num_hashes` outside the writer's `[1, 32]` contract (which `open()` would
     // then reject). Fail closed here rather than emit an unloadable `.blm`. These
     // are writer-contract invariants on internally generated params, hence
@@ -251,7 +293,8 @@ pub fn write_bloom_file(
     LittleEndian::write_u32(&mut mmap[4..8], FORMAT_VERSION);
     LittleEndian::write_u64(&mut mmap[8..16], params.num_bits);
     LittleEndian::write_u32(&mut mmap[16..20], params.num_hashes);
-    // bytes 20..24 reserved (zero from set_len)
+    // bytes 20..24: bloom body-version (bit_at reduction scheme); see BLOOM_BODY_VERSION.
+    LittleEndian::write_u32(&mut mmap[20..24], BLOOM_BODY_VERSION);
     LittleEndian::write_u64(&mut mmap[24..32], num_keys);
     LittleEndian::write_u64(&mut mmap[32..40], sa_num);
     mmap[40..72].copy_from_slice(ref_digest);
@@ -431,7 +474,7 @@ impl BloomFileReader {
                 "bloom byte index {byte} out of range (body {} bytes)",
                 self.num_bits / 8
             );
-            // SAFETY: `bit < num_bits` (modular reduction) and the body is
+            // SAFETY: `bit < num_bits` (Lemire multiply-shift maps into `[0, num_bits)`) and the body is
             // `num_bits / 8` valid bytes (validated at open), so `byte` is in
             // range — the debug_assert above checks it in debug builds (this is a
             // hot per-probe read, so the bound stays debug-only in release).
@@ -467,6 +510,22 @@ fn validate_blm_header(data: &[u8], path: &Path) -> Result<(u64, u32, u64, u64, 
         return Err(Error::UnsupportedVersion {
             found: version,
             expected: FORMAT_VERSION,
+        });
+    }
+    // Body-version (byte 20): the bit_at reduction scheme. A `.blm` whose body
+    // bits were written by a binary with a different reduction (or before this
+    // field existed, i.e. `0`) must be rejected — otherwise its stale bits would
+    // produce bloom false negatives, which the unconfirmed `bloom_first` gate
+    // would surface as silently mis-routed reads. Reject here so the loader drops
+    // the bloom and the gate degrades to the exact first-window path.
+    let body_version = LittleEndian::read_u32(&data[20..24]);
+    if body_version != BLOOM_BODY_VERSION {
+        return Err(Error::SizeMismatch {
+            file: path.to_path_buf(),
+            detail: format!(
+                ".blm body-version {body_version} != expected {BLOOM_BODY_VERSION} \
+                 (built by an incompatible prmi binary; rebuild the index's .blm)"
+            ),
         });
     }
     let num_bits = LittleEndian::read_u64(&data[8..16]);
@@ -579,6 +638,7 @@ mod tests {
             }
         }
         let rate = fp as f64 / trials as f64;
+        eprintln!("bloom FP rate (Lemire): {rate:.4} ({fp}/{trials}, target ~0.01)");
         assert!(
             rate < 0.05,
             "empirical fp rate {rate} unexpectedly high (target 1%)"
@@ -636,15 +696,50 @@ mod tests {
         LittleEndian::write_u32(&mut header[4..8], FORMAT_VERSION);
         LittleEndian::write_u64(&mut header[8..16], 1024); // claims 128 body bytes
         LittleEndian::write_u32(&mut header[16..20], 4);
+        LittleEndian::write_u32(&mut header[20..24], BLOOM_BODY_VERSION); // pass the body-version check
         std::fs::write(&path, &header).unwrap(); // body missing
         let err = BloomFileReader::open(&path).unwrap_err();
         assert!(matches!(err, Error::SizeMismatch { .. }), "got: {err:?}");
     }
 
     #[test]
+    fn bloom_rejects_stale_body_version() {
+        // A `.blm` whose body bits were written by a binary with a different
+        // `bit_at` reduction (or before the body-version field existed, i.e. `0`)
+        // must be rejected on open — otherwise its stale bits cause bloom false
+        // negatives on the unconfirmed `bloom_first` gate.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stale.blm");
+        write_bloom_file(
+            &path,
+            3,
+            [1u64, 2, 3],
+            BloomParams::for_keys(3, 0.01),
+            3,
+            &[0u8; 32],
+        )
+        .unwrap();
+        // Sanity: as written it opens fine.
+        assert!(BloomFileReader::open(&path).is_ok());
+        // Corrupt the body-version (byte 20) to a stale value and confirm rejection.
+        for stale in [0u32, 2, 99] {
+            let mut bytes = std::fs::read(&path).unwrap();
+            LittleEndian::write_u32(&mut bytes[20..24], stale);
+            std::fs::write(&path, &bytes).unwrap();
+            let err = BloomFileReader::open(&path).unwrap_err();
+            assert!(
+                matches!(err, Error::SizeMismatch { .. })
+                    && format!("{err}").contains("body-version"),
+                "stale body-version {stale} must be rejected, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn write_bloom_file_rejects_invalid_params() {
         // `BloomParams` fields are public, so guard against out-of-contract values
-        // that would panic `probe` (num_bits==0) or emit an unloadable file.
+        // that are invalid (num_bits==0 — a degenerate zero-size filter) or would
+        // emit an unloadable file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.blm");
         for bad in [
@@ -692,6 +787,7 @@ mod tests {
         LittleEndian::write_u32(&mut buf[4..8], FORMAT_VERSION);
         LittleEndian::write_u64(&mut buf[8..16], 64);
         LittleEndian::write_u32(&mut buf[16..20], 33); // > 32
+        LittleEndian::write_u32(&mut buf[20..24], BLOOM_BODY_VERSION); // pass the body-version check
         std::fs::write(&path, &buf).unwrap();
         let err = BloomFileReader::open(&path).unwrap_err();
         assert!(matches!(err, Error::SizeMismatch { .. }), "got: {err:?}");
