@@ -2335,7 +2335,8 @@ pub unsafe extern "C" fn prmi_collect_smems(
 /// # Safety
 /// `handle` must come from [`prmi_open`]/[`prmi_open_shm`]. `read` must be valid for
 /// `read_len` bytes (or NULL iff `read_len == 0`); `pac` must be valid for
-/// `ceil(pac_num_bases / 4)` bytes.
+/// `ceil(pac_num_bases / 4)` bytes, or NULL iff `pac_num_bases == 0` (the
+/// canonical empty PAC, which maps to an empty slice).
 #[no_mangle]
 pub unsafe extern "C" fn prmi_present(
     handle: *const prmi_index_t,
@@ -2345,7 +2346,10 @@ pub unsafe extern "C" fn prmi_present(
     pac_num_bases: u64,
 ) -> c_int {
     clear_last_error();
-    if handle.is_null() || pac.is_null() {
+    // `pac == NULL` is allowed ONLY for the canonical empty PAC (`pac_num_bases
+    // == 0`), which maps to an empty slice below; a NULL with a nonzero length is
+    // a contract violation.
+    if handle.is_null() || (pac.is_null() && pac_num_bases != 0) {
         set_last_error("prmi_present: null pointer");
         return -1;
     }
@@ -2390,7 +2394,14 @@ pub unsafe extern "C" fn prmi_present(
             return -2;
         }
     };
-    let pac_slice = unsafe { std::slice::from_raw_parts(pac, pac_bytes) };
+    // `from_raw_parts` requires a non-null, aligned pointer even for len 0, so the
+    // empty PAC (`pac_bytes == 0`, which `pac == NULL` is allowed for) maps to a
+    // genuine empty slice rather than `from_raw_parts(NULL, 0)` (UB).
+    let pac_slice: &[u8] = if pac_bytes == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pac, pac_bytes) }
+    };
     let enc = prmi::index::smem::PacEncoding::Packed {
         num_bases: pac_num_bases,
     };
@@ -2404,5 +2415,266 @@ pub unsafe extern "C" fn prmi_present(
             set_last_error("prmi_present: internal panic");
             -3
         }
+    }
+}
+
+/// Bloom-accelerated ANY-window tiered-dispatch gate (Design-Z item-6 follow-up).
+/// Wraps [`prmi::index::collect::LearnedIndex::present_anchor_bloom`].
+///
+/// When the sidecar carries a `.blm` (built via `prmi build --with-bloom`), this
+/// tests EVERY N-free 32-mer window against the bloom and confirms each hit with
+/// one `mem_search`, so it routes exactly the reads the exact any-window gate
+/// would — recovering the ~46–48% of *servable* reads the first-window
+/// [`prmi_present`] mis-routes to the fallback — without paying a locate on every
+/// window of a truly-absent read. When no `.blm` is loaded it falls back to the
+/// cheap first-window gate (identical to [`prmi_present`]), so it is a safe
+/// drop-in replacement.
+///
+/// Arguments and safety requirements are identical to [`prmi_present`]. Returns
+/// `1` present, `0` absent, or a negative error code: `-1` null/invalid pointer,
+/// `-2` invalid `read_len`/`pac_num_bases` or PAC metadata mismatch (length, or
+/// `pac_num_bases != l_pac`), `-3` internal panic.
+///
+/// # Safety
+/// `handle` must come from [`prmi_open`]/[`prmi_open_shm`]. `read` must be valid
+/// for `read_len` bytes (or NULL iff `read_len == 0`); `pac` must be valid for
+/// `ceil(pac_num_bases / 4)` bytes, or NULL iff `pac_num_bases == 0` (the
+/// canonical empty PAC, which maps to an empty slice).
+#[no_mangle]
+pub unsafe extern "C" fn prmi_present_bloom(
+    handle: *const prmi_index_t,
+    read: *const u8,
+    read_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+) -> c_int {
+    clear_last_error();
+    // `pac == NULL` is allowed only for the canonical empty PAC (`pac_num_bases
+    // == 0`); a NULL with nonzero length is a contract violation.
+    if handle.is_null() || (pac.is_null() && pac_num_bases != 0) {
+        set_last_error("prmi_present_bloom: null pointer");
+        return -1;
+    }
+    if read_len < 0 {
+        set_last_error("prmi_present_bloom: invalid read_len");
+        return -2;
+    }
+    if read.is_null() && read_len != 0 {
+        set_last_error("prmi_present_bloom: null read with nonzero read_len");
+        return -1;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    // Mirror `prmi_present`: reject a `pac_num_bases` that disagrees with the
+    // index's `l_pac` BEFORE building the slice. `packed_pac_bytes` only guards
+    // platform narrowing, not a too-short caller buffer, so without this an
+    // oversized `pac_num_bases` makes `from_raw_parts` over-read (UB) before
+    // `present_anchor_bloom`'s internal `validate_packed_pac` ever runs.
+    let l_pac = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.idx.l_pac())) {
+        Ok(v) => v,
+        Err(_) => {
+            set_last_error("prmi_present_bloom: internal panic");
+            return -3;
+        }
+    };
+    if pac_num_bases != l_pac {
+        set_last_error("prmi_present_bloom: pac_num_bases does not match index l_pac");
+        return -2;
+    }
+    let r: &[u8] = if read_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(read, read_len as usize) }
+    };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error("prmi_present_bloom: pac_num_bases too large for this platform");
+            return -2;
+        }
+    };
+    // Empty PAC maps to a real empty slice, not `from_raw_parts(NULL, 0)` (UB).
+    let pac_slice: &[u8] = if pac_bytes == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pac, pac_bytes) }
+    };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.idx.present_anchor_bloom(r, pac_slice, enc)
+    }));
+    match res {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => {
+            set_last_error("prmi_present_bloom: internal panic");
+            -3
+        }
+    }
+}
+
+/// Shared body for the cheap first-window presence-gate FFI entrypoints (Lever 2:
+/// [`prmi_present_bloom_first`], [`prmi_present_exact`]). Validates the pointers,
+/// builds the `read`/`pac` slices, and runs `gate` under `catch_unwind`. `name` is
+/// the entrypoint name used in error messages. Returns `1`/`0`/`<0` with exactly
+/// the same codes and contract as [`prmi_present`].
+///
+/// # Safety
+/// Same requirements as [`prmi_present`]: `handle` from [`prmi_open`]/[`prmi_open_shm`];
+/// `read` valid for `read_len` bytes (or NULL iff `read_len == 0`); `pac` valid for
+/// `ceil(pac_num_bases / 4)` bytes, or NULL iff `pac_num_bases == 0` (the
+/// canonical empty PAC, which maps to an empty slice).
+unsafe fn present_gate_first_window(
+    name: &str,
+    handle: *const prmi_index_t,
+    read: *const u8,
+    read_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+    gate: impl Fn(&LearnedIndex, &[u8], &[u8], prmi::index::smem::PacEncoding) -> bool,
+) -> c_int {
+    clear_last_error();
+    // `pac == NULL` is allowed only for the canonical empty PAC (`pac_num_bases
+    // == 0`); a NULL with nonzero length is a contract violation.
+    if handle.is_null() || (pac.is_null() && pac_num_bases != 0) {
+        set_last_error(&format!("{name}: null pointer"));
+        return -1;
+    }
+    if read_len < 0 {
+        set_last_error(&format!("{name}: invalid read_len"));
+        return -2;
+    }
+    if read.is_null() && read_len != 0 {
+        set_last_error(&format!("{name}: null read with nonzero read_len"));
+        return -1;
+    }
+    let h = unsafe { Handle::as_ref(handle) };
+    // Mirror `prmi_present`: reject a `pac_num_bases` that disagrees with the
+    // index's `l_pac` BEFORE building the slice (covers both gate entrypoints that
+    // route through this helper). `packed_pac_bytes` only guards platform
+    // narrowing, not a too-short caller buffer, so an oversized `pac_num_bases`
+    // would otherwise make `from_raw_parts` over-read (UB).
+    let l_pac = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.idx.l_pac())) {
+        Ok(v) => v,
+        Err(_) => {
+            set_last_error(&format!("{name}: internal panic"));
+            return -3;
+        }
+    };
+    if pac_num_bases != l_pac {
+        set_last_error(&format!("{name}: pac_num_bases does not match index l_pac"));
+        return -2;
+    }
+    let r: &[u8] = if read_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(read, read_len as usize) }
+    };
+    let pac_bytes = match packed_pac_bytes(pac_num_bases) {
+        Some(b) => b,
+        None => {
+            set_last_error(&format!(
+                "{name}: pac_num_bases too large for this platform"
+            ));
+            return -2;
+        }
+    };
+    // Empty PAC maps to a real empty slice, not `from_raw_parts(NULL, 0)` (UB).
+    let pac_slice: &[u8] = if pac_bytes == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pac, pac_bytes) }
+    };
+    let enc = prmi::index::smem::PacEncoding::Packed {
+        num_bases: pac_num_bases,
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gate(&h.idx, r, pac_slice, enc)
+    }));
+    match res {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => {
+            set_last_error(&format!("{name}: internal panic"));
+            -3
+        }
+    }
+}
+
+/// Cheap FIRST-WINDOW BLOOM dispatch gate (Design-Z Lever 2, A1). Wraps
+/// [`prmi::index::collect::LearnedIndex::present_anchor_bloom_first`].
+///
+/// Makes the SAME routing decision as [`prmi_present`] (first N-free 32-mer window
+/// only) but replaces that window's `mem_search` locate with a single in-memory
+/// bloom probe — a few hash ops, no SA/pac access, index-size-independent. No false
+/// negatives over the keep-set; ≈`fp_rate` false positives (built at 0.01), which
+/// the Design-Z consumer's present-read fallback (`--prmi-present-fallback`) absorbs
+/// harmlessly. When no `.blm` is loaded it falls back to the exact first-window
+/// [`prmi_present`], so it is a safe drop-in.
+///
+/// Arguments and safety requirements are identical to [`prmi_present`]. Returns
+/// `1` present, `0` absent, or a negative error code: `-1` null/invalid pointer,
+/// `-2` invalid `read_len`/`pac_num_bases` or PAC metadata mismatch (length, or
+/// `pac_num_bases != l_pac`), `-3` internal panic.
+///
+/// # Safety
+/// See [`prmi_present`].
+#[no_mangle]
+pub unsafe extern "C" fn prmi_present_bloom_first(
+    handle: *const prmi_index_t,
+    read: *const u8,
+    read_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+) -> c_int {
+    unsafe {
+        present_gate_first_window(
+            "prmi_present_bloom_first",
+            handle,
+            read,
+            read_len,
+            pac,
+            pac_num_bases,
+            |idx, r, pac_slice, enc| idx.present_anchor_bloom_first(r, pac_slice, enc),
+        )
+    }
+}
+
+/// Cheap EXACT first-window dispatch gate (Design-Z Lever 2, A2). Wraps
+/// [`prmi::index::collect::LearnedIndex::present_anchor_exact`].
+///
+/// Makes the SAME routing decision and produces the SAME verdict as [`prmi_present`]
+/// (`mem_search(window).match_len >= 32` on the first N-free window) but via
+/// `kmer_exists`, which skips `mem_search`'s two interval-recovery gallops the gate
+/// never reads — exact (no false positives) and modestly cheaper than the
+/// `mem_search` first-window gate. Use when the bloom A1 gate's false positives are
+/// not acceptable and the per-read gate cost still matters.
+///
+/// Arguments and safety requirements are identical to [`prmi_present`]. Returns
+/// `1` present, `0` absent, or a negative error code: `-1` null/invalid pointer,
+/// `-2` invalid `read_len`/`pac_num_bases` or PAC metadata mismatch (length, or
+/// `pac_num_bases != l_pac`), `-3` internal panic.
+///
+/// # Safety
+/// See [`prmi_present`].
+#[no_mangle]
+pub unsafe extern "C" fn prmi_present_exact(
+    handle: *const prmi_index_t,
+    read: *const u8,
+    read_len: c_int,
+    pac: *const u8,
+    pac_num_bases: u64,
+) -> c_int {
+    unsafe {
+        present_gate_first_window(
+            "prmi_present_exact",
+            handle,
+            read,
+            read_len,
+            pac,
+            pac_num_bases,
+            |idx, r, pac_slice, enc| idx.present_anchor_exact(r, pac_slice, enc),
+        )
     }
 }

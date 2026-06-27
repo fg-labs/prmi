@@ -108,6 +108,32 @@ pub struct TrainerConfig {
     /// no `.isa`. Costs ~+5 B per SA entry on disk (~+32 GB at hg38) — opt-in via
     /// `prmi build --with-isa`.
     pub with_isa: bool,
+
+    /// If `true`, also emit a `.blm` bloom-filter sidecar over the keep-set's
+    /// 32-mer keys — the Design-Z any-window dispatch gate
+    /// ([`crate::index::LearnedIndex::present_anchor_bloom`]). `false` (default)
+    /// builds no `.blm`. Meaningful for a tiered `--keep-bed` build (the bloom is
+    /// then small and cache-resident); opt-in via `prmi build --with-bloom`.
+    pub with_bloom: bool,
+
+    /// Target false-positive rate for the `.blm` bloom gate (used only when
+    /// `with_bloom`). Controls bloom size and probe count via the optimal
+    /// formulas; a false positive only costs an extra confirming `mem_search`
+    /// (never a wrong verdict), so a modest default is fine. Defaults to `0.01`.
+    pub bloom_fp_rate: f64,
+
+    /// Design-Z Lever 3: pad the `.blm` routing key set by this many bases on each
+    /// side of every keep-bed interval, while leaving the `.sa` keep-mask TIGHT.
+    /// This DECOUPLES routing (the bloom) from seeding (the SA): the wider bloom
+    /// routes capture-boundary / flank-starting reads to the on-target index (whose
+    /// in-target windows still seed; the 5' flank soft-clips), recovering recall
+    /// WITHOUT the 3.3× SA bloat that padding the keep-bed itself would cause.
+    /// `0` (default) keeps the bloom coupled to the keep-set (prior behavior).
+    /// Used only when `with_bloom` and a `keep_bed` is set. Padding is in the flat
+    /// concatenated-genome coordinate space; intervals are clamped to
+    /// `[0, l_pac)` and merged (a ±pad straddling a chromosome junction may add a
+    /// few cross-boundary keys, harmless to the best-effort/confirmed gate).
+    pub routing_pad: u64,
 }
 
 impl Default for TrainerConfig {
@@ -120,6 +146,9 @@ impl Default for TrainerConfig {
             memory_mode: MemoryMode::Mode1,
             kmer_table_k: None,
             with_isa: false,
+            with_bloom: false,
+            bloom_fp_rate: 0.01,
+            routing_pad: 0,
         }
     }
 }
@@ -152,6 +181,26 @@ impl TrainerConfig {
     /// sidecar (the ISA launch hint).
     pub fn with_isa(self, with_isa: bool) -> Self {
         Self { with_isa, ..self }
+    }
+
+    /// Return a copy of this config that also emits a `.blm` bloom-filter sidecar
+    /// (the any-window dispatch gate) at the given target false-positive rate.
+    pub fn with_bloom(self, bloom_fp_rate: f64) -> Self {
+        Self {
+            with_bloom: true,
+            bloom_fp_rate,
+            ..self
+        }
+    }
+
+    /// Return a copy of this config that pads the `.blm` routing key set by `pad`
+    /// bases on each side of the keep-bed intervals (Design-Z Lever 3), leaving the
+    /// `.sa` keep-mask tight. See [`TrainerConfig::routing_pad`].
+    pub fn with_routing_pad(self, pad: u64) -> Self {
+        Self {
+            routing_pad: pad,
+            ..self
+        }
     }
 }
 

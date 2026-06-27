@@ -25,3 +25,7 @@ pub const KMT_MAGIC: u32 = u32::from_le_bytes(*b"PMKT");
 /// Magic for the optional `.isa` inverse-suffix-array file header
 /// (ASCII "PMIS", little-endian).
 pub const ISA_MAGIC: u32 = u32::from_le_bytes(*b"PMIS");
+
+/// Magic for the optional `.blm` bloom-filter file header (the Design-Z
+/// any-window dispatch gate; ASCII "PMBL", little-endian).
+pub const BLM_MAGIC: u32 = u32::from_le_bytes(*b"PMBL");

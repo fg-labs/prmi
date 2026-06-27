@@ -129,6 +129,15 @@ pub struct Sa {
     /// `None` for FASTA-sourced (non-byte-identical) builds.
     #[serde(default)]
     pub pac_sha256: Option<String>,
+    /// Order-independent fingerprint of the routing key set the `.blm` bloom gate
+    /// was built over, as a 16-char hex `u64` (stored as a string because TOML
+    /// integers are `i64` and the digest spans the full `u64` range). `Some` only
+    /// for `--with-bloom` builds. The loader requires a loaded `.blm`'s
+    /// `keyset_digest` to equal this, so a bloom built over a different
+    /// keep-set/routing-pad of the same reference (same `sa_num` + `ref_digest`) is
+    /// rejected. `None` for builds without a bloom gate.
+    #[serde(default)]
+    pub bloom_keyset_digest: Option<String>,
 }
 
 /// Default value for [`Sa::mode`] when deserialising older sidecars that

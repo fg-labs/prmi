@@ -45,7 +45,7 @@ pub struct MaskConfig {
 }
 
 /// A single half-open reference interval `[start, end)` from a BED file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BedInterval {
     /// 0-based start position (inclusive).
     pub start: u64,
@@ -157,6 +157,44 @@ pub fn parse_bed(path: &Path) -> Result<Vec<BedInterval>> {
     }
 
     Ok(out)
+}
+
+/// Pad every interval by `pad` bases on each side, clamp to `[0, l_pac)`, then
+/// sort and merge — the Design-Z Lever 3 routing-bloom key region.
+///
+/// The result is in the sorted + merged form [`covered_by_bed`] /
+/// [`keep_doubled_pos`] require (the binary search only inspects the immediately
+/// preceding interval, so overlaps MUST be coalesced). `pad == 0` returns the
+/// input sorted + merged. Each interval's start saturates at `0` and its end
+/// clamps at `l_pac`; merging coalesces flanks that now overlap. Intervals that
+/// clamp to empty (`end <= start`) are dropped.
+pub fn pad_and_merge(intervals: &[BedInterval], pad: u64, l_pac: u64) -> Vec<BedInterval> {
+    let mut out: Vec<BedInterval> = intervals
+        .iter()
+        .map(|iv| BedInterval {
+            start: iv.start.saturating_sub(pad),
+            end: iv.end.saturating_add(pad).min(l_pac),
+        })
+        .filter(|iv| iv.end > iv.start)
+        .collect();
+    out.sort_by_key(|i| i.start);
+    // Merge overlapping intervals (the invariant covered_by_bed relies on),
+    // matching parse_bed's merge.
+    if out.len() > 1 {
+        let mut merged: Vec<BedInterval> = Vec::with_capacity(out.len());
+        for iv in out {
+            match merged.last_mut() {
+                Some(last) if iv.start < last.end => {
+                    if iv.end > last.end {
+                        last.end = iv.end;
+                    }
+                }
+                _ => merged.push(iv),
+            }
+        }
+        out = merged;
+    }
+    out
 }
 
 /// Parse the BED12 block fields of a single line and append one `BedInterval`
@@ -418,6 +456,55 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    // --- pad_and_merge (Lever 3) ---------------------------------------------
+
+    #[test]
+    fn pad_and_merge_pads_clamps_and_merges() {
+        let iv = |s, e| BedInterval { start: s, end: e };
+        let l_pac = 1000u64;
+
+        // pad=0 is sort+merge only (idempotent on a single interval).
+        assert_eq!(pad_and_merge(&[iv(100, 200)], 0, l_pac), vec![iv(100, 200)]);
+
+        // Padding expands both sides, clamped to [0, l_pac).
+        assert_eq!(pad_and_merge(&[iv(100, 200)], 50, l_pac), vec![iv(50, 250)]);
+
+        // Start saturates at 0; end clamps at l_pac.
+        assert_eq!(pad_and_merge(&[iv(10, 990)], 50, l_pac), vec![iv(0, 1000)]);
+
+        // Two intervals whose padded flanks now overlap are merged into one.
+        assert_eq!(
+            pad_and_merge(&[iv(100, 200), iv(260, 300)], 40, l_pac),
+            vec![iv(60, 340)],
+            "padded flanks overlapping at 240/220 must coalesce"
+        );
+
+        // Disjoint even after padding stay separate.
+        assert_eq!(
+            pad_and_merge(&[iv(100, 200), iv(500, 600)], 20, l_pac),
+            vec![iv(80, 220), iv(480, 620)]
+        );
+
+        // Unsorted input is sorted first.
+        assert_eq!(
+            pad_and_merge(&[iv(500, 600), iv(100, 200)], 0, l_pac),
+            vec![iv(100, 200), iv(500, 600)]
+        );
+    }
+
+    #[test]
+    fn pad_and_merge_padded_region_covers_flank() {
+        // A position in the flank (just before a keep interval) is NOT covered by
+        // the tight set but IS covered after padding — the Lever 3 routing recovery.
+        let iv = |s, e| BedInterval { start: s, end: e };
+        let tight = vec![iv(2048, 6144)];
+        let l_pac = 8192u64;
+        assert!(!covered_by_bed(&tight, 2020), "flank pos outside tight set");
+        let padded = pad_and_merge(&tight, 64, l_pac);
+        assert!(covered_by_bed(&padded, 2020), "flank pos inside padded set");
+        assert!(!covered_by_bed(&padded, 1900), "beyond pad still excluded");
+    }
 
     // --- parse_bed -----------------------------------------------------------
 

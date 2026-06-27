@@ -16,6 +16,7 @@ pub mod spectrum;
 use crate::error::{Error, Result};
 use crate::index::lookup::lookup_core;
 use crate::index::shm::{read_shm_blob, write_shm_blob, ShmBlob};
+use crate::sidecar::bloom_file::BloomFileReader;
 use crate::sidecar::isa_file::IsaFileReader;
 use crate::sidecar::kmt_file::KmtFileReader;
 use crate::sidecar::meta::Meta;
@@ -41,6 +42,21 @@ pub struct LearnedIndex {
     /// `mem_search` fast path). `None` for sidecars built without `--with-isa`,
     /// or loaded via `open_shm` (the shm blob does not carry the `.isa`).
     isa: Option<IsaFileReader>,
+    /// Optional bloom filter over the routing 32-mer keys — the Design-Z dispatch
+    /// gate ([`Self::present_anchor_bloom`] any-window, and the Lever 2
+    /// [`Self::present_anchor_bloom_first`] cheap first-window gate). The member set
+    /// is the keep-set's full-window 32-mers by default, or — under Lever 3
+    /// (`prmi build --routing-pad`) — the PADDED keep-set's, a SUPERSET of what the
+    /// tight `.sa` can seed. The "no false negatives over the keep-set" property
+    /// holds either way (superset ⊇ tight); but with a padded bloom the unconfirmed
+    /// `bloomfw` gate's verdict is NO LONGER identical to the any-window gate's — it
+    /// routes flank reads the tight `.sa` cannot seed (rescued by Lever 0). The
+    /// confirmed `anywin` gate still matches the tight `.sa` exactly. `None` for
+    /// sidecars built without `--with-bloom`. Carried in the shm blob and loaded by
+    /// `open_shm` too (the M3 fix), so a shared index keeps the bloom gate.
+    /// Best-effort: a corrupt/stale `.blm` is ignored and the gate falls back to
+    /// the first-window `present_anchor`.
+    bloom: Option<BloomFileReader>,
 }
 
 const _ASSERT_SEND_SYNC: fn() = || {
@@ -72,6 +88,13 @@ impl LearnedIndex {
         // and a wrong hint only degrades to a fall-back launch (the consumer
         // gates on the returned `match_len`), never to a wrong answer.
         let isa = load_isa_best_effort(&paths.isa, &sa);
+        // Optional `.blm` bloom gate. Best-effort AND reference-bound (like
+        // `.kmt`): a `.blm` whose `sa_num`/`ref_digest` mismatch this sidecar is
+        // ignored, because a stale bloom can omit current keep-set keys (a false
+        // negative that would drop servable reads on the unconfirmed `bloom_first`
+        // path); absent/corrupt/mismatched all degrade the gate to the first-window
+        // `present_anchor`.
+        let bloom = load_bloom_best_effort(&paths.bloom, &meta, &sa);
         Ok(Self {
             meta,
             sa,
@@ -79,6 +102,7 @@ impl LearnedIndex {
             l2,
             kmt,
             isa,
+            bloom,
         })
     }
 
@@ -158,6 +182,12 @@ impl LearnedIndex {
         // The shm blob does not carry the `.isa`; ISA launch is file-backed only
         // (`open`). `has_isa()` is therefore false for shm-opened indexes.
         let isa = None;
+        // Optional `.blm` bloom gate carried as a 6th blob component (`blm_len == 0`
+        // for blobs written before the bloom existed, or from sidecars built without
+        // `--with-bloom`). Loading is best-effort AND reference-bound, exactly as in
+        // `open`: a corrupt slice OR a `sa_num`/`ref_digest` mismatch is ignored with
+        // a warning and the gate degrades to the first-window `present_anchor`.
+        let bloom = load_bloom_from_shm_best_effort(&blob, &meta, &sa);
         Ok(Self {
             meta,
             sa,
@@ -165,6 +195,7 @@ impl LearnedIndex {
             l2,
             kmt,
             isa,
+            bloom,
         })
     }
 
@@ -191,6 +222,20 @@ impl LearnedIndex {
     /// can supply `mem_search`'s no-search launch hint via [`Self::isa_at`]).
     pub fn has_isa(&self) -> bool {
         self.isa.is_some()
+    }
+
+    /// `true` if a valid `.blm` bloom gate is loaded (so
+    /// [`Self::present_anchor_bloom`] uses the any-window bloom+confirm path
+    /// rather than the first-window `present_anchor` fallback).
+    pub fn has_bloom(&self) -> bool {
+        self.bloom.is_some()
+    }
+
+    /// Probe the bloom gate for one 32-mer `key`. `None` if no `.blm` is loaded;
+    /// `Some(true)` if the key is POSSIBLY in the keep-set (caller must confirm),
+    /// `Some(false)` if DEFINITELY absent. Exposed for the gate and diagnostics.
+    pub(crate) fn bloom_contains(&self, key: u64) -> Option<bool> {
+        self.bloom.as_ref().map(|b| b.contains(key))
     }
 
     /// Inverse suffix array: the SA index of reference position `refpos` (in the
@@ -446,6 +491,40 @@ fn load_isa_best_effort(isa_path: &Path, sa: &SaFileReader) -> Option<IsaFileRea
     }
 }
 
+/// Load the optional `.blm` bloom gate, returning `None` (silently when absent —
+/// the common no-`--with-bloom` case — with a warning on any other error). The
+/// gate IS reference-bound (like `.kmt`): a `.blm` whose `sa_num`/`ref_digest` do
+/// not match this sidecar is ignored, because a stale bloom can omit current
+/// keep-set keys (a false negative that would drop servable reads on the
+/// unconfirmed `bloom_first` path).
+fn load_bloom_best_effort(
+    bloom_path: &Path,
+    meta: &Meta,
+    sa: &SaFileReader,
+) -> Option<BloomFileReader> {
+    let r = match BloomFileReader::open(bloom_path) {
+        Ok(r) => r,
+        // Absent is the common case (built without `--with-bloom`) — silent. Do
+        // NOT use `Path::exists()`, which also reports `false` on inaccessible
+        // metadata and would mask a real failure.
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return None;
+        }
+        Err(e) => {
+            log::warn!("prmi: ignoring .blm ({e}); any-window bloom gate unavailable");
+            return None;
+        }
+    };
+    if bloom_matches(&r, meta, sa) {
+        Some(r)
+    } else {
+        log::warn!(
+            "prmi: .blm does not match this sidecar (sa_num/reference); any-window bloom gate unavailable"
+        );
+        None
+    }
+}
+
 /// Load the optional `.kmt` carried inside an shm blob, returning `None` (with a
 /// warning on any problem) when it is absent, corrupt, or bound to a different
 /// reference. Mirrors [`load_kmt_best_effort`] for the file-backed open path.
@@ -474,6 +553,38 @@ fn load_kmt_from_shm_best_effort(
     }
 }
 
+/// Load the optional `.blm` bloom gate carried inside an shm blob, returning
+/// `None` (with a warning on a corrupt slice or a mismatch) when it is absent,
+/// unreadable, or bound to a different reference. Mirrors [`load_bloom_best_effort`]
+/// for the file-backed open path: reference-bound via `sa_num`/`ref_digest`, since
+/// a stale bloom can omit current keep-set keys (a false negative on the
+/// unconfirmed `bloom_first` path).
+fn load_bloom_from_shm_best_effort(
+    blob: &ShmBlob,
+    meta: &Meta,
+    sa: &SaFileReader,
+) -> Option<BloomFileReader> {
+    if blob.blm_len == 0 {
+        return None;
+    }
+    let r = match BloomFileReader::from_shm_slice(blob.mmap.clone(), blob.blm_offset, blob.blm_len)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("prmi: ignoring shm .blm ({e}); using the first-window present gate");
+            return None;
+        }
+    };
+    if bloom_matches(&r, meta, sa) {
+        Some(r)
+    } else {
+        log::warn!(
+            "prmi: shm .blm does not match this sidecar (sa_num/reference); using the first-window present gate"
+        );
+        None
+    }
+}
+
 /// `true` if the k-mer table `r` is bound to this sidecar: its `sa_num` matches
 /// the `.sa` and its reference digest matches the `.meta` (preferring the packed
 /// reference SHA `sa.pac_sha256`, falling back to the reference SHA `ref.sha256`).
@@ -487,6 +598,32 @@ fn kmt_matches(r: &KmtFileReader, meta: &Meta, sa: &SaFileReader) -> bool {
         .unwrap_or(meta.ref_.sha256.as_str());
     let meta_digest = crate::sidecar::kmt_file::hex32(meta_hex);
     r.sa_num() == sa.num_entries() && meta_digest.as_ref() == Some(r.ref_digest())
+}
+
+/// `true` if the bloom gate `r` is bound to this sidecar. Extends the
+/// [`kmt_matches`] contract (matching `sa_num` + reference digest) with the
+/// `keyset_digest`: the `.blm`'s routing-key-set fingerprint must equal the one
+/// `.meta` recorded for this build. A stale bloom — a different reference, OR the
+/// same reference with a different keep-set/routing-pad (which `sa_num` +
+/// `ref_digest` alone cannot tell apart) — can OMIT current keys, a false negative
+/// that would silently drop servable reads on the unconfirmed `bloom_first` path,
+/// so an unbound `.blm` must be ignored rather than trusted.
+fn bloom_matches(r: &BloomFileReader, meta: &Meta, sa: &SaFileReader) -> bool {
+    let meta_hex = meta
+        .sa
+        .pac_sha256
+        .as_deref()
+        .unwrap_or(meta.ref_.sha256.as_str());
+    let meta_digest = crate::sidecar::kmt_file::hex32(meta_hex);
+    // `bloom_keyset_digest` is stored in `.meta` as a 16-char hex `u64`.
+    let meta_keyset = meta
+        .sa
+        .bloom_keyset_digest
+        .as_deref()
+        .and_then(|h| u64::from_str_radix(h, 16).ok());
+    r.sa_num() == sa.num_entries()
+        && meta_digest.as_ref() == Some(r.ref_digest())
+        && meta_keyset == Some(r.keyset_digest())
 }
 
 fn cross_validate(
