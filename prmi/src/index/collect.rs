@@ -2476,6 +2476,10 @@ mod tests {
             }
         }
 
+        assert!(
+            tie_groups > 0,
+            "census corpus no longer produces (m,n) ties — guard would pass vacuously"
+        );
         eprintln!(
             "[M2 census] reads={} smems={} (m,n)-tie-groups={} extra-tied-entries={} \
              (all ties byte-identical)",
@@ -2568,6 +2572,9 @@ mod tests {
             let mut nn: Vec<u32> = Vec::new();
             super::fill_next_n(&read, &mut nn);
             prop_assert_eq!(nn.len(), read.len() + 1);
+            // Intentionally mirrors the production index-by-position loop shape to
+            // cross-check fill_next_n vs fwd_qlen at every position p.
+            #[allow(clippy::needless_range_loop)]
             for p in 0..=read.len() {
                 prop_assert_eq!(nn[p] as usize, fwd_qlen(&read, p), "mismatch at p={}", p);
             }

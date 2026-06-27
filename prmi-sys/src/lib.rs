@@ -1366,6 +1366,7 @@ unsafe fn backward_spectrum_batch_impl(
                 })
                 .collect();
             let all_steps = h.idx.backward_spectrum_lockstep(&bwd_tasks, pac_slice, enc);
+            debug_assert_eq!(all_steps.len(), tasks_s.len());
             // `zip` (not indexing) keeps the three collections paired safely.
             for ((t, out_ns_i), steps) in
                 tasks_s.iter().zip(out_ns.iter_mut()).zip(all_steps.iter())

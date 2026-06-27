@@ -293,6 +293,9 @@ fn bench_next_n(c: &mut Criterion) {
             let mut sum = 0u64;
             for read in &reads {
                 fill_next_n_inline(black_box(read), &mut next_n);
+                // Intentionally mirrors the production index-by-position loop shape to
+                // benchmark fill_next_n + indexed access vs. the per-pivot scan baseline.
+                #[allow(clippy::needless_range_loop)]
                 for p in 0..read.len() {
                     sum = sum.wrapping_add(next_n[p] as u64);
                 }
