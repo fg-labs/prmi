@@ -313,6 +313,15 @@ The 32-mer key constraint is unchanged — long reads use 32-base prefixes at ea
 
 v0.1 exposes both single-key and batch C APIs. `prmi_smem_range_batch` (unpacked pac) and `prmi_smem_range_batch_packed` (2-bit packed pac) accept a flat `count * 32` byte buffer of queries and three parallel `out_k`/`out_l`/`out_s` arrays of `count` u64s each. The single-key `prmi_smem_range` and `prmi_smem_range_packed` functions are preserved unchanged. Both single-key and batch paths delegate to the same SIMD-accelerated `resolve_one` inner loop and produce bit-identical results.
 
+## Environment variables
+
+The production library reads exactly one runtime environment variable, **`PRMI_ISA`**
+(presence-only; enables the byte-identity-safe ISA reseed fast-path in the fused SMEM
+collector when a `.isa` sidecar is present). All other `PRMI_*`/`FIX_*` variables are
+read only by the benchmark, example, and fixture-generator binaries and have no effect
+on a linked consumer. See [docs/environment-variables.md](docs/environment-variables.md)
+for the complete, audited list with values, defaults, and effects.
+
 ## Repeat masking
 
 Real-genome references contain degenerate regions (N-runs, homopolymers, tandem repeats) that collapse many SA positions to identical 32-mer keys. Training on those positions inflates `max_error_bound` without improving lookup quality for meaningful queries. Three masking flags let the trainer skip degenerate (key, SA-index) pairs:
