@@ -2037,10 +2037,15 @@ impl LearnedIndex {
             // seed-independent, so `lower` is byte-identical; the seed only sets
             // the probe count — ~0 here for a unique deep match, vs ~log2(occ) when
             // a high-occ 32-mer prefix's loose window brackets the wide block.
-            let lower = self.find_boundary(0, sa_num, ip, ip, |mid| {
+            // Recover the interval by bounded outward walks from `ip` (the index
+            // the caller already reached) instead of galloping from `[0, sa_num)`:
+            // `occ_lower` walks DOWN and `occ_upper` walks UP, each probing every
+            // interval position once. Byte-identical to the galloping `find_boundary`
+            // (real occurrence intervals are tiny), just far fewer probes.
+            let lower = self.occ_lower(ip, sa_num, |mid| {
                 self.ref_less(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
-            let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
+            let upper = self.occ_upper(ip, sa_num, |mid| {
                 self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
             return MemMatch {
@@ -2126,10 +2131,15 @@ impl LearnedIndex {
             let qm = &query[..match_len as usize];
             let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
             let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
-            let lower = self.find_boundary(0, sa_num, ip, ip, |mid| {
+            // Recover the interval by bounded outward walks from `ip` (the index
+            // the caller already reached) instead of galloping from `[0, sa_num)`:
+            // `occ_lower` walks DOWN and `occ_upper` walks UP, each probing every
+            // interval position once. Byte-identical to the galloping `find_boundary`
+            // (real occurrence intervals are tiny), just far fewer probes.
+            let lower = self.occ_lower(ip, sa_num, |mid| {
                 self.ref_less(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
-            let upper = self.find_boundary(lower, sa_num, lower, lower, |mid| {
+            let upper = self.occ_upper(ip, sa_num, |mid| {
                 self.shares_prefix(qm, qm_key, mid, pac, enc, l_pac, qm_nbases, qm_mask)
             });
             return MemMatch {
@@ -3114,10 +3124,15 @@ impl LearnedIndex {
         let p = &query[..best_len];
         let p_key = tokenize_32mer(p, p.len().min(KMER_LEN));
         let (p_nbases, p_mask) = keyed_compare_mask(p.len());
-        let lower = self.find_boundary(0, sa_num, lo, lo, |mid| {
+        // The truncation walk already extended `[lo, hi)` outward until `occ >=
+        // min_intv`, and every added position shares `query[..best_len]`, so
+        // `[lo, hi) ⊆ [lower, upper)`. Recover by walking DOWN from `lo` and UP
+        // from `hi` — skipping the covered span and, critically, dropping the
+        // expensive full-SA `find_boundary(0, sa_num, …)` gallop. Byte-identical.
+        let lower = self.occ_lower(lo, sa_num, |mid| {
             self.ref_less(p, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
-        let upper = self.find_boundary(lower, sa_num, hi, hi, |mid| {
+        let upper = self.occ_upper(hi, sa_num, |mid| {
             self.shares_prefix(p, p_key, mid, pac, enc, l_pac, p_nbases, p_mask)
         });
         MemMatch {
@@ -4169,6 +4184,50 @@ impl LearnedIndex {
         self.prefetch_sa(mid + 1 + (hi - mid - 1) / 2); // next mid if we branch toward hi
     }
 
+    /// Recover the lower interval boundary by a bounded linear walk DOWN from
+    /// `start` (an index inside the occurrence interval), delegating the tail to
+    /// the galloping [`find_boundary`] only past `OCC_LINEAR_CAP`. Byte-identical
+    /// to `find_boundary(0, sa_num, start, start, ref_less)`: real occurrence
+    /// intervals are tiny (occ p99 == 4), so the linear walk covers ~all of them
+    /// in a handful of adjacent probes instead of a `log2(sa_num)` gallop.
+    #[inline]
+    fn occ_lower(&self, start: u64, sa_num: u64, mut ref_less: impl FnMut(u64) -> bool) -> u64 {
+        const OCC_LINEAR_CAP: u64 = 8;
+        let s = start.min(sa_num);
+        // Walk down while the neighbour below is still in-region (`!ref_less`).
+        let mut l = s;
+        while l > 0 && s - l < OCC_LINEAR_CAP && !ref_less(l - 1) {
+            l -= 1;
+        }
+        // Cap reached while still in-region: gallop the remainder over `[0, l)`.
+        // `l-1` is in-region, so the boundary lies below `l` and is unchanged.
+        if l > 0 && s - l >= OCC_LINEAR_CAP && !ref_less(l - 1) {
+            return self.find_boundary(0, l, l - 1, l, &mut ref_less);
+        }
+        l
+    }
+
+    /// Recover the upper interval boundary by a bounded linear walk UP from
+    /// `lower` (an index inside the interval), delegating the tail to the
+    /// galloping [`find_boundary`] only past `OCC_LINEAR_CAP`. Byte-identical to
+    /// `find_boundary(lower, sa_num, lower, lower, shares)`.
+    #[inline]
+    fn occ_upper(&self, lower: u64, sa_num: u64, mut shares: impl FnMut(u64) -> bool) -> u64 {
+        const OCC_LINEAR_CAP: u64 = 8;
+        // Start at `lower` itself: `find_boundary` returns `lower` when
+        // `shares(lower)` is false (degenerate/occ-0); the occ>=1 case advances.
+        let mut u = lower;
+        while u < sa_num && u - lower < OCC_LINEAR_CAP && shares(u) {
+            u += 1;
+        }
+        // Cap reached while still matching: gallop the remainder. `u` shares the
+        // prefix, so it is a valid in-interval seed; the boundary is unchanged.
+        if u < sa_num && u - lower >= OCC_LINEAR_CAP && shares(u) {
+            return self.find_boundary(u, sa_num, u, u, &mut shares);
+        }
+        u
+    }
+
     /// Find the boundary index in `[domain_lo, domain_hi)` — the first index `i`
     /// where the monotone predicate `go_right(i)` is `false` — seeded from the model
     /// window `[seed_lo, seed_hi)` with exponential expand-on-miss.
@@ -5044,6 +5103,72 @@ mod keyed_tests {
         .unwrap();
         let idx = LearnedIndex::open(&prefix).unwrap();
         (dir, idx)
+    }
+
+    #[test]
+    fn occ_lower_equals_find_boundary_lower() {
+        let e = PacEncoding::Unpacked;
+        for seed in [1u32, 3, 9, 21, 55, 101] {
+            let fwd: Vec<u8> = (0..320u32)
+                .map(|i| ((i.wrapping_add(seed).wrapping_mul(2_246_822_519) >> 7) & 3) as u8)
+                .collect();
+            let (_dir, idx) = build_mode2(&fwd);
+            let sa_num = idx.sa_num();
+            let l_pac = idx.l_pac();
+            let read: Vec<u8> = (0..160u32)
+                .map(|i| ((i.wrapping_mul(65_537).wrapping_add(seed) >> 2) & 3) as u8)
+                .collect();
+            for start in 0..read.len() {
+                for len in [8usize, 16, 24, 40, 64] {
+                    let end = (start + len).min(read.len());
+                    if end <= start {
+                        continue;
+                    }
+                    let q = &read[start..end];
+                    let q_key = tokenize_32mer(q, q.len().min(KMER_LEN));
+                    let (match_len, ip) = idx.forward_maximal_len(q, q_key, sa_num, &fwd, e, l_pac);
+                    if match_len == 0 {
+                        continue;
+                    }
+                    let qm = &q[..match_len as usize];
+                    let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+                    let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
+                    let gallop = idx.find_boundary(0, sa_num, ip, ip, |mid| {
+                        idx.ref_less(qm, qm_key, mid, &fwd, e, l_pac, qm_nbases, qm_mask)
+                    });
+                    let linear = idx.occ_lower(ip, sa_num, |mid| {
+                        idx.ref_less(qm, qm_key, mid, &fwd, e, l_pac, qm_nbases, qm_mask)
+                    });
+                    assert_eq!(
+                        linear, gallop,
+                        "occ_lower != find_boundary (seed {seed} start {start} len {len} ml {match_len} ip {ip})"
+                    );
+                    // The re-walk-eliminating change: occ_upper started at `ip`
+                    // (skipping [lower, ip] that occ_lower already walked) must equal
+                    // occ_upper started at `lower`. Same upper boundary.
+                    let up_from_lower = idx.occ_upper(linear, sa_num, |mid| {
+                        idx.shares_prefix(qm, qm_key, mid, &fwd, e, l_pac, qm_nbases, qm_mask)
+                    });
+                    // Pin occ_upper to the galloping find_boundary oracle directly,
+                    // mirroring the occ_lower assertion above: occ_upper(lower) must
+                    // equal find_boundary(lower, sa_num, lower, lower, shares).
+                    let up_gallop = idx.find_boundary(linear, sa_num, linear, linear, |mid| {
+                        idx.shares_prefix(qm, qm_key, mid, &fwd, e, l_pac, qm_nbases, qm_mask)
+                    });
+                    assert_eq!(
+                        up_from_lower, up_gallop,
+                        "occ_upper != find_boundary (seed {seed} start {start} len {len} ml {match_len} ip {ip} lower {linear})"
+                    );
+                    let up_from_ip = idx.occ_upper(ip, sa_num, |mid| {
+                        idx.shares_prefix(qm, qm_key, mid, &fwd, e, l_pac, qm_nbases, qm_mask)
+                    });
+                    assert_eq!(
+                        up_from_ip, up_from_lower,
+                        "occ_upper(ip) != occ_upper(lower) (seed {seed} start {start} len {len} ml {match_len} ip {ip} lower {linear})"
+                    );
+                }
+            }
+        }
     }
 
     /// Reference with structure a uniform-random reference lacks — so queries hit
