@@ -61,6 +61,90 @@ pub fn tokenize_32mer(bases: &[u8], len: usize) -> u64 {
     key
 }
 
+/// Build the per-position rolling forward 32-mer key cache for a 2-bit-coded read.
+///
+/// `keys[i]` is byte-identical to `tokenize_32mer(&read[i..], min(KMER_LEN, read.len() - i))`
+/// for every `i` in `0..read.len()`, but the whole vector is produced in a single
+/// `O(read.len())` right-to-left pass instead of one 32-iteration `tokenize_32mer`
+/// per position. This lets a forward search at pivot `i` read `keys[i]` instead of
+/// re-tokenizing `read[i..]`.
+///
+/// Recurrence (MSB-first, matching [`tokenize_32mer`]): `keys[i]` is `keys[i + 1]`
+/// shifted right by one 2-bit field, with `read[i]` inserted into the top field
+/// (bits 63..62) and the new lowest field (bits 1..0) set to `read[i + 31]` when
+/// that base exists, else the `BASE_T` pad. `read[i + 1]`'s field, which was the
+/// top field of `keys[i + 1]`, correctly lands one field lower.
+///
+/// This function is **panic-free on `N` (and any byte `>= 4`)**: every base is masked
+/// with `& 0b11` before it enters a key, so an `N` position produces a defined but
+/// arbitrary key value rather than panicking. That is exactly what the collect hot
+/// path needs: it builds the cache over the WHOLE read (which may contain `N`), but
+/// a key `keys[i]` is only ever consumed when the forward query at pivot `i` has
+/// `len >= KMER_LEN`, which guarantees the window `read[i..i + 32]` is `N`-free (a
+/// forward query is clamped at the next `N`, so `len >= 32` implies no `N` in the
+/// first 32 bases). For any position whose 32-mer window straddles an `N`, the key
+/// is garbage — but the caller's `len >= KMER_LEN` guard means that key is never read.
+///
+/// For an `N`-free window, `keys[i]` is byte-identical to
+/// `tokenize_32mer(&read[i..], min(KMER_LEN, read.len() - i))`; the masking only
+/// changes the (unused) values at `N`-straddling positions.
+///
+/// Returns an empty vector for an empty read.
+#[inline]
+pub fn rolling_forward_keys(bases: &[u8]) -> Vec<u64> {
+    let mut keys = Vec::new();
+    rolling_forward_keys_into(bases, &mut keys);
+    keys
+}
+
+/// In-place variant of [`rolling_forward_keys`] that fills `keys` rather than
+/// allocating a fresh `Vec`.
+///
+/// `keys` is cleared and resized to `bases.len()` before filling; when its
+/// capacity already covers the read (the steady state on a reused scratch
+/// buffer) no allocation occurs, so the collect hot path stays allocation-free
+/// once warmed up. The written contents are byte-identical to
+/// `rolling_forward_keys(bases)` — see that function for the recurrence and the
+/// `N`-safety contract.
+#[inline]
+pub fn rolling_forward_keys_into(bases: &[u8], keys: &mut Vec<u64>) {
+    // The all-T pad field (value 0b11) used for positions with no base (past the read end).
+    const T_FIELD: u64 = BASE_T as u64;
+    let n = bases.len();
+    // Reuse the existing allocation: `clear` + `resize` grows to `n` zeros without
+    // reallocating whenever `keys.capacity() >= n`.
+    keys.clear();
+    keys.resize(n, 0u64);
+    if n == 0 {
+        return;
+    }
+    // Seed the last position directly. `read[n-1]` may be an `N`: mask to 2 bits so the
+    // top field is defined (garbage for `N`, but only positions with a full `N`-free
+    // 32-mer window are ever consumed by the guarded caller). The low 62 bits are the
+    // T-pad, matching `tokenize_32mer(&read[n-1..], 1)` for a real base.
+    let top_shift = 2 * (KMER_LEN - 1);
+    let t_pad_low = (1u64 << top_shift) - 1;
+    keys[n - 1] = (((bases[n - 1] & 0b11) as u64) << top_shift) | t_pad_low;
+    for i in (0..n - 1).rev() {
+        // Mask to 2 bits: `N` (4) and any stray byte become a defined base so the
+        // rolling build never panics. Keys at `N`-straddling positions are unused.
+        let b0 = (bases[i] & 0b11) as u64;
+        // Shift the successor's window down by one field; the successor's top field
+        // (`read[i+1]`) moves into bits 61..60, its lowest field falls off.
+        let shifted = keys[i + 1] >> 2;
+        // Insert `read[i]` into the top field (bits 63..62).
+        let top = b0 << (2 * (KMER_LEN - 1));
+        // The new lowest field is `read[i+31]` if it exists (window is full), else T-pad.
+        let low_field = if i + KMER_LEN <= n {
+            (bases[i + KMER_LEN - 1] & 0b11) as u64
+        } else {
+            T_FIELD
+        };
+        // `shifted` has its low field zeroed by the >>2; OR in the correct low base.
+        keys[i] = top | (shifted & !0b11u64) | low_field;
+    }
+}
+
 /// Reverse-complement a 32-mer key (2-bit packed, MSB-first; same convention
 /// as `tokenize_32mer`). The query has `len` valid bases occupying the high
 /// `2*len` bits; the trailing `(32 - len) * 2` low bits are T-pads.
@@ -242,6 +326,119 @@ mod tests {
                 reverse_complement_key(reverse_complement_key(normalized, len), len),
                 normalized
             );
+        }
+    }
+
+    #[test]
+    fn rolling_forward_keys_empty_is_empty() {
+        assert!(rolling_forward_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn rolling_forward_keys_hand_computed_short() {
+        // Read shorter than 32: every position is a T-padded prefix.
+        let read = [0u8, 1, 2, 3, 0]; // A C G T A
+        let keys = rolling_forward_keys(&read);
+        assert_eq!(keys.len(), read.len());
+        for i in 0..read.len() {
+            let want = tokenize_32mer(&read[i..], KMER_LEN.min(read.len() - i));
+            assert_eq!(keys[i], want, "position {i}");
+        }
+    }
+
+    #[test]
+    fn rolling_forward_keys_into_matches_allocating_variant() {
+        // The `_into` variant is byte-identical to `rolling_forward_keys` for reads
+        // shorter than, equal to, and longer than the 32-mer window (incl. empty).
+        for len in [0usize, 1, 5, 32, 33, 80] {
+            let read: Vec<u8> = (0..len).map(|i| ((i * 7 + 1) & 0x3) as u8).collect();
+            let mut buf = Vec::new();
+            rolling_forward_keys_into(&read, &mut buf);
+            assert_eq!(buf, rolling_forward_keys(&read), "len {len}");
+        }
+    }
+
+    #[test]
+    fn rolling_forward_keys_into_reuses_buffer_without_reallocating() {
+        // A warmed buffer (capacity from the first, longest read) must not reallocate
+        // when refilled for equal-or-shorter reads: the collect hot path relies on the
+        // scratch staying allocation-free once warmed up.
+        let long: Vec<u8> = (0..80).map(|i| ((i * 3 + 1) & 0x3) as u8).collect();
+        let mut buf = Vec::new();
+        rolling_forward_keys_into(&long, &mut buf);
+        let cap = buf.capacity();
+        let ptr = buf.as_ptr();
+        for len in [80usize, 64, 32, 1, 0] {
+            let read: Vec<u8> = (0..len).map(|i| ((i * 5 + 2) & 0x3) as u8).collect();
+            rolling_forward_keys_into(&read, &mut buf);
+            assert_eq!(buf.len(), len);
+            assert_eq!(buf.capacity(), cap, "capacity grew at len {len}");
+            assert_eq!(buf.as_ptr(), ptr, "buffer reallocated at len {len}");
+        }
+    }
+
+    #[test]
+    fn rolling_forward_keys_exactly_32() {
+        // A read of exactly 32 bases: keys[0] is the full window, later positions
+        // shrink and T-pad.
+        let read: Vec<u8> = (0..32).map(|i| ((i * 7 + 1) & 0x3) as u8).collect();
+        let keys = rolling_forward_keys(&read);
+        for i in 0..read.len() {
+            let want = tokenize_32mer(&read[i..], KMER_LEN.min(read.len() - i));
+            assert_eq!(keys[i], want, "position {i}");
+        }
+        // keys[0] must equal a direct full-window tokenize.
+        assert_eq!(keys[0], tokenize_32mer(&read, 32));
+    }
+
+    proptest! {
+        /// The rolling cache is byte-identical to a fresh `tokenize_32mer` at every
+        /// position, for reads both shorter and longer than the 32-mer window,
+        /// including offsets right up against the read end. This is the byte-identity
+        /// contract the collect hot path relies on to substitute `keys[pivot]` for a
+        /// re-tokenize of `read[pivot..]`.
+        #[test]
+        fn rolling_forward_keys_equals_tokenize_at_every_offset(
+            read in proptest::collection::vec(0u8..4, 0usize..80)
+        ) {
+            let keys = rolling_forward_keys(&read);
+            prop_assert_eq!(keys.len(), read.len());
+            for i in 0..read.len() {
+                let want = tokenize_32mer(&read[i..], KMER_LEN.min(read.len() - i));
+                prop_assert_eq!(keys[i], want, "offset {} of len {}", i, read.len());
+            }
+        }
+
+        /// With `N` (`4`) present the build must (a) never panic and (b) stay
+        /// byte-identical to `tokenize_32mer` at every position whose full 32-mer
+        /// window is `N`-free — which is exactly the set the guarded collect caller
+        /// consumes (`query.len() >= KMER_LEN` implies no `N` in the first 32 bases).
+        /// Positions whose 32-mer window straddles an `N` are allowed to differ; the
+        /// caller never reads those keys.
+        #[test]
+        fn rolling_forward_keys_n_safe_and_identical_on_n_free_windows(
+            read in proptest::collection::vec(0u8..5, 0usize..90)
+        ) {
+            // (a) no panic even with N bytes.
+            let keys = rolling_forward_keys(&read);
+            prop_assert_eq!(keys.len(), read.len());
+            let n = read.len();
+            for i in 0..n {
+                let window_len = KMER_LEN.min(n - i);
+                // The window `read[i..i+window_len]` is what a forward query at pivot `i`
+                // would tokenize. If it is N-free, the guarded caller may use keys[i]; it
+                // must then equal a fresh tokenize.
+                let n_free = read[i..i + window_len].iter().all(|&b| b < 4);
+                // The caller only ever uses keys[i] when the query fills the window
+                // (window_len == KMER_LEN); restrict the identity check to that guarded set.
+                if n_free && window_len == KMER_LEN {
+                    let want = tokenize_32mer(&read[i..i + window_len], window_len);
+                    prop_assert_eq!(
+                        keys[i], want,
+                        "N-free full window at offset {} of len {} must match", i, n
+                    );
+                }
+            }
         }
     }
 }

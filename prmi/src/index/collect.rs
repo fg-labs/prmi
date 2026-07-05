@@ -25,6 +25,7 @@
 //! drops below `max_mem_intv` — byte-identical to the cold `forward_spectrum`
 //! reference walk (the `pass3_seed_one_pivot_spectrum` oracle).
 
+use crate::encoding::{tokenize_32mer, KMER_LEN};
 use crate::index::smem::PacEncoding;
 use crate::index::LearnedIndex;
 
@@ -226,6 +227,14 @@ pub struct CollectScratch {
     /// Per-read next-ambiguous-base distances (`next_n[p] == fwd_qlen(read, p)`),
     /// refilled once at the top of each read and read O(1) by all three passes.
     next_n: Vec<u32>,
+    /// Per-read rolling forward 32-mer key cache: `fwd_keys[p]` is byte-identical to
+    /// `tokenize_32mer(&read[p..], min(32, read.len() - p))` for every `N`-free 32-mer
+    /// window (see [`crate::encoding::rolling_forward_keys`]). Built once per read (one
+    /// `O(read.len())` pass) and consumed by the forward searches at each pivot in
+    /// place of a per-pivot re-tokenize. Only read under a `query.len() >= KMER_LEN`
+    /// guard, which guarantees the window is `N`-free and the cached key equals a
+    /// fresh tokenize.
+    fwd_keys: Vec<u64>,
 }
 
 impl CollectScratch {
@@ -575,10 +584,18 @@ impl LearnedIndex {
             smems,
             reseeds,
             next_n,
+            fwd_keys,
         } = scratch;
         smems.clear();
         reseeds.clear();
         fill_next_n(read, next_n);
+        // Build the per-read rolling forward 32-mer key cache once (O(read.len())) into
+        // the reused scratch buffer (allocation-free once warmed up). `read` may contain
+        // `N` (`4`); `rolling_forward_keys_into` is `N`-safe (masks each base) and every
+        // use site guards with `query.len() >= KMER_LEN`, so only `N`-free full-window
+        // keys are ever read (see the `fwd_keys` field doc).
+        crate::encoding::rolling_forward_keys_into(read, fwd_keys);
+        let fwd_keys: &[u64] = fwd_keys;
 
         // ---- Pass 1: zigzag walk over all positions (min_intv = 1) ----
         let mut x = 0;
@@ -591,6 +608,7 @@ impl LearnedIndex {
                 opts.min_seed_len,
                 smems,
                 next_n,
+                fwd_keys,
                 pac,
                 enc,
             );
@@ -642,6 +660,7 @@ impl LearnedIndex {
                 opts.min_seed_len,
                 smems,
                 next_n,
+                fwd_keys,
                 hint,
                 pac,
                 enc,
@@ -714,6 +733,7 @@ impl LearnedIndex {
         min_intv: i64,
         min_seed_len: u32,
         out: &mut Vec<Smem>,
+        fwd_keys: &[u64],
         pac: &[u8],
         enc: PacEncoding,
     ) -> usize {
@@ -722,7 +742,24 @@ impl LearnedIndex {
         if qlen == 0 {
             return 0;
         }
-        let m = self.mem_search(&read[pivot..pivot + qlen], pac, enc);
+        let query = &read[pivot..pivot + qlen];
+        // Reuse the rolling forward key when the query fills the 32-mer window.
+        // BYTE-IDENTICAL: `qlen = next_n[pivot]` is clamped at the next `N`, so
+        // `qlen >= KMER_LEN` ⇒ `read[pivot..pivot+32]` is `N`-free, and then
+        // `fwd_keys[pivot] == tokenize_32mer(query, 32)`. When `qlen < KMER_LEN`
+        // (an `N` within 32bp or the read end) the key would be a shorter T-padded
+        // value, so re-tokenize (`None`), exactly as before.
+        let query_key = if qlen >= KMER_LEN {
+            Some(fwd_keys[pivot])
+        } else {
+            None
+        };
+        debug_assert!(
+            query_key.is_none()
+                || query_key == Some(tokenize_32mer(query, query.len().min(KMER_LEN))),
+            "zz_right_emit: rolling key != fresh tokenize at pivot {pivot}"
+        );
+        let m = self.mem_search_keyed(query, query_key, pac, enc);
         let match_len = m.match_len as usize;
         if m.match_len >= min_seed_len as u64 && m.occ as i64 >= min_intv {
             out.push(Smem {
@@ -751,6 +788,7 @@ impl LearnedIndex {
         min_seed_len: u32,
         out: &mut Vec<Smem>,
         next_n: &[u32],
+        fwd_keys: &[u64],
         pac: &[u8],
         enc: PacEncoding,
     ) {
@@ -803,6 +841,7 @@ impl LearnedIndex {
                     min_intv,
                     min_seed_len,
                     out,
+                    fwd_keys,
                     pac,
                     enc,
                 );
@@ -825,6 +864,7 @@ impl LearnedIndex {
                 min_intv,
                 min_seed_len,
                 out,
+                fwd_keys,
                 pac,
                 enc,
             );
@@ -924,6 +964,7 @@ impl LearnedIndex {
         min_intv: i64,
         want_interval: bool,
         hint: Option<ReseedHint>,
+        fwd_keys: &[u64],
         pac: &[u8],
         enc: PacEncoding,
     ) -> (usize, u64, u64, usize) {
@@ -939,9 +980,23 @@ impl LearnedIndex {
         // the hint is good the insertion search collapses to ~1-2 probes, skipping the
         // model launch. No trust path, no maximality confirm, no fallback decision.
         let q = &read[pivot..pivot + qlen];
+        // Reuse the rolling forward key when the query fills the 32-mer window.
+        // BYTE-IDENTICAL: `qlen` is `N`-clamped, so `qlen >= KMER_LEN` ⇒
+        // `read[pivot..pivot+32]` is `N`-free and `fwd_keys[pivot] == tokenize_32mer(q, 32)`.
+        // Both the warm-start/cold forward search AND the occ-truncation below tokenize
+        // the SAME `q`, so both take the same key.
+        let query_key = if qlen >= KMER_LEN {
+            Some(fwd_keys[pivot])
+        } else {
+            None
+        };
+        debug_assert!(
+            query_key.is_none() || query_key == Some(tokenize_32mer(q, q.len().min(KMER_LEN))),
+            "reseed_bounded_fwd: rolling key != fresh tokenize at pivot {pivot}"
+        );
         let mm = match self.reseed_isa_hint(pivot, hint) {
-            Some(h) => self.mem_search_warmstart(q, h, pac, enc),
-            None => self.mem_search(q, pac, enc),
+            Some(h) => self.mem_search_warmstart_keyed(q, query_key, h, pac, enc),
+            None => self.mem_search_keyed(q, query_key, pac, enc),
         };
         let lmax = mm.match_len as usize;
         if lmax == 0 {
@@ -954,8 +1009,9 @@ impl LearnedIndex {
         // walk the forward interval outward from the maximal (one model launch + a
         // capped linear scan), then recover the crossing interval only when the
         // caller needs it. Byte-identical (same L*, exact interval).
-        let t = self.forward_truncate_below_maximal(
-            &read[pivot..pivot + qlen],
+        let t = self.forward_truncate_below_maximal_keyed(
+            q,
+            query_key,
             mm,
             min_intv as u64,
             want_interval,
@@ -1027,6 +1083,7 @@ impl LearnedIndex {
         min_intv: i64,
         min_seed_len: u32,
         out: &mut Vec<Smem>,
+        fwd_keys: &[u64],
         hint: Option<ReseedHint>,
         pac: &[u8],
         enc: PacEncoding,
@@ -1035,7 +1092,7 @@ impl LearnedIndex {
             return 0;
         }
         let (emit_len, emit_sa, emit_occ, lmax) =
-            self.reseed_bounded_fwd(read, pivot, qlen, min_intv, true, hint, pac, enc);
+            self.reseed_bounded_fwd(read, pivot, qlen, min_intv, true, hint, fwd_keys, pac, enc);
         if emit_len >= min_seed_len as usize && emit_occ > 0 {
             out.push(Smem {
                 rid,
@@ -1067,6 +1124,7 @@ impl LearnedIndex {
         min_seed_len: u32,
         out: &mut Vec<Smem>,
         next_n: &[u32],
+        fwd_keys: &[u64],
         hint: Option<ReseedHint>,
         pac: &[u8],
         enc: PacEncoding,
@@ -1082,7 +1140,9 @@ impl LearnedIndex {
             let qlen0 = next_n[pivot] as usize;
             // next_pivot needs only the length -> span-only (skip interval recovery).
             let fwd_ext = self
-                .reseed_bounded_fwd(read, pivot, qlen0, min_intv, false, hint, pac, enc)
+                .reseed_bounded_fwd(
+                    read, pivot, qlen0, min_intv, false, hint, fwd_keys, pac, enc,
+                )
                 .0;
             let mut next_pivot = pivot + if fwd_ext > 0 { fwd_ext } else { 1 };
             if next_pivot > rlen {
@@ -1125,6 +1185,7 @@ impl LearnedIndex {
                     min_intv,
                     min_seed_len,
                     out,
+                    fwd_keys,
                     hint,
                     pac,
                     enc,
@@ -1147,6 +1208,7 @@ impl LearnedIndex {
                 min_intv,
                 min_seed_len,
                 out,
+                fwd_keys,
                 hint,
                 pac,
                 enc,
@@ -1507,6 +1569,7 @@ mod tests {
         let mut pivot = 0;
         let mut next_n = Vec::new();
         super::fill_next_n(read, &mut next_n);
+        let fwd_keys = crate::encoding::rolling_forward_keys(read);
         while pivot < read.len() {
             idx.zz_step1(
                 read,
@@ -1516,6 +1579,7 @@ mod tests {
                 min_seed_len,
                 &mut out,
                 &next_n,
+                &fwd_keys,
                 fwd,
                 enc,
             );
@@ -1703,11 +1767,13 @@ mod tests {
         ) {
             let (_dir, idx) = build_mode2(&fwd);
             let enc = PacEncoding::Unpacked;
+            let fwd_keys = crate::encoding::rolling_forward_keys(&read);
             for pivot in 0..read.len() {
                 let qlen = fwd_qlen(&read, pivot);
                 let mut out: Vec<Smem> = Vec::new();
-                let ret_ml =
-                    idx.zz_right_emit(&read, 7, pivot, qlen, min_intv, min_seed_len, &mut out, &fwd, enc);
+                let ret_ml = idx.zz_right_emit(
+                    &read, 7, pivot, qlen, min_intv, min_seed_len, &mut out, &fwd_keys, &fwd, enc,
+                );
 
                 // Reference: a direct mem_search + gate (independent of zz_right_emit's branch).
                 let m = if qlen == 0 {
@@ -1797,13 +1863,14 @@ mod tests {
             let mut expected_pass2: Vec<Smem> = Vec::new();
             let mut nn = Vec::new();
             super::fill_next_n(&read, &mut nn);
+            let fk = crate::encoding::rolling_forward_keys(&read);
             for p in &pass1 {
                 let span = p.n + 1 - p.m;
                 if span < split_len || p.s > split_width {
                     continue;
                 }
                 let mid = ((p.m + p.n + 1) >> 1) as usize;
-                idx.zz_step1_reseed(&read, 0, mid, p.s + 1, min_seed_len, &mut expected_pass2, &nn, None, &fwd, enc);
+                idx.zz_step1_reseed(&read, 0, mid, p.s + 1, min_seed_len, &mut expected_pass2, &nn, &fk, None, &fwd, enc);
             }
             prop_assert_eq!(&unsorted[num1..], expected_pass2.as_slice(), "pass-2 tail mismatch");
 
@@ -1970,6 +2037,7 @@ mod tests {
         let p1 = expected.clone();
         let mut nn = Vec::new();
         super::fill_next_n(read, &mut nn);
+        let fk = crate::encoding::rolling_forward_keys(read);
         for p in &p1 {
             let span = p.n + 1 - p.m;
             if span < opts.split_len || p.s > opts.split_width {
@@ -1984,6 +2052,7 @@ mod tests {
                 opts.min_seed_len,
                 &mut expected,
                 &nn,
+                &fk,
                 None,
                 fwd,
                 enc,

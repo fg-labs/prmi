@@ -2043,6 +2043,25 @@ impl LearnedIndex {
     /// `match_len == 0` (and `sa_start/occ == 0`) when `query` is empty or
     /// `query[0]` does not occur.
     pub fn mem_search(&self, query: &[u8], pac: &[u8], enc: PacEncoding) -> MemMatch {
+        self.mem_search_keyed(query, None, pac, enc)
+    }
+
+    /// [`mem_search`](Self::mem_search) with an OPTIONAL precomputed forward 32-mer
+    /// key. `query_key = Some(k)` MUST equal
+    /// `tokenize_32mer(query, min(32, query.len()))` — e.g. a
+    /// [`rolling_forward_keys`](crate::encoding::rolling_forward_keys) cache entry read
+    /// under a `query.len() >= 32` guard (the guard makes the window `N`-free, so the
+    /// cached key equals a fresh tokenize). `None` re-tokenizes internally. BYTE-
+    /// IDENTICAL either way; the key only lets the SMEM collector pay one
+    /// `O(read.len())` rolling tokenize per read instead of one `tokenize_32mer` per
+    /// pivot.
+    pub fn mem_search_keyed(
+        &self,
+        query: &[u8],
+        query_key: Option<u64>,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
         let zero = MemMatch {
             match_len: 0,
             sa_start: 0,
@@ -2070,14 +2089,32 @@ impl LearnedIndex {
         if self.kmt.is_none() {
             let sa_num = self.sa_num();
             let l_pac = self.l_pac();
-            let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+            // `query_key` is used as the ACTUAL forward-compare key (not a seed like
+            // `hint`), so a wrong `Some(k)` silently yields a non-byte-identical result
+            // in release. Guard the caller contract in-function so misuse is caught even
+            // when a `pub`-primitive call site omits its own `debug_assert`.
+            debug_assert!(
+                query_key.is_none()
+                    || query_key == Some(tokenize_32mer(query, query.len().min(KMER_LEN))),
+                "mem_search_keyed: query_key != fresh tokenize_32mer(query)"
+            );
+            let query_key =
+                query_key.unwrap_or_else(|| tokenize_32mer(query, query.len().min(KMER_LEN)));
             let (match_len, ip) =
                 self.forward_maximal_len(query, query_key, sa_num, pac, enc, l_pac);
             if match_len == 0 {
                 return zero;
             }
             let qm = &query[..match_len as usize];
-            let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+            // When the maximal match fills the 32-mer window, `qm`'s key is the full-32
+            // key, i.e. `query_key` (both pack the same first 32 bases). Reuse it and
+            // skip a `tokenize_32mer`; otherwise (`match_len < 32`) the key is a shorter
+            // T-padded value and must be recomputed. Byte-identical either way.
+            let qm_key = if match_len as usize >= KMER_LEN {
+                query_key
+            } else {
+                tokenize_32mer(qm, qm.len().min(KMER_LEN))
+            };
             let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
             // Recover `qm`'s interval by galloping from the insertion point `ip`
             // (which lies at the edge of that interval) rather than re-looking-up
@@ -2145,6 +2182,21 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
     ) -> MemMatch {
+        self.mem_search_warmstart_keyed(query, None, hint, pac, enc)
+    }
+
+    /// [`mem_search_warmstart`](Self::mem_search_warmstart) with an OPTIONAL precomputed
+    /// forward 32-mer key (see [`mem_search_keyed`](Self::mem_search_keyed) for the
+    /// `Some`/`None` contract). Byte-identical; the key only amortizes the per-pivot
+    /// tokenize for the reseed forward search.
+    pub fn mem_search_warmstart_keyed(
+        &self,
+        query: &[u8],
+        query_key: Option<u64>,
+        hint: u64,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
         let zero = MemMatch {
             match_len: 0,
             sa_start: 0,
@@ -2169,7 +2221,16 @@ impl LearnedIndex {
         if self.kmt.is_none() {
             let sa_num = self.sa_num();
             let l_pac = self.l_pac();
-            let query_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+            // Guard the caller-key contract in-function (see `mem_search_keyed`): a wrong
+            // `Some(k)` is used as the actual compare key and would silently break
+            // byte-identity in release. `hint` is a seed and is deliberately unchecked.
+            debug_assert!(
+                query_key.is_none()
+                    || query_key == Some(tokenize_32mer(query, query.len().min(KMER_LEN))),
+                "mem_search_warmstart_keyed: query_key != fresh tokenize_32mer(query)"
+            );
+            let query_key =
+                query_key.unwrap_or_else(|| tokenize_32mer(query, query.len().min(KMER_LEN)));
             let seed_win = Some((hint, hint.saturating_add(1)));
             let (match_len, ip) = self
                 .forward_maximal_len_seeded(query, query_key, sa_num, pac, enc, l_pac, seed_win);
@@ -2177,7 +2238,13 @@ impl LearnedIndex {
                 return zero;
             }
             let qm = &query[..match_len as usize];
-            let qm_key = tokenize_32mer(qm, qm.len().min(KMER_LEN));
+            // Reuse the full-32 `query_key` as `qm`'s key when the match fills the
+            // window (see `mem_search_keyed`); byte-identical.
+            let qm_key = if match_len as usize >= KMER_LEN {
+                query_key
+            } else {
+                tokenize_32mer(qm, qm.len().min(KMER_LEN))
+            };
             let (qm_nbases, qm_mask) = keyed_compare_mask(qm.len());
             // Recover the interval by bounded outward walks from `ip` (the index
             // the caller already reached) instead of galloping from `[0, sa_num)`:
@@ -3047,6 +3114,33 @@ impl LearnedIndex {
         pac: &[u8],
         enc: PacEncoding,
     ) -> MemMatch {
+        self.forward_truncate_below_maximal_keyed(
+            query,
+            None,
+            maximal,
+            min_intv,
+            want_interval,
+            pac,
+            enc,
+        )
+    }
+
+    /// [`forward_truncate_below_maximal`](Self::forward_truncate_below_maximal) with an
+    /// OPTIONAL precomputed forward 32-mer key (see
+    /// [`mem_search_keyed`](Self::mem_search_keyed) for the `Some`/`None` contract).
+    /// Byte-identical; the key amortizes the per-pivot tokenize for the reseed
+    /// occ-truncation, which tokenizes the SAME `query` as the reseed forward search.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_truncate_below_maximal_keyed(
+        &self,
+        query: &[u8],
+        query_key: Option<u64>,
+        maximal: MemMatch,
+        min_intv: u64,
+        want_interval: bool,
+        pac: &[u8],
+        enc: PacEncoding,
+    ) -> MemMatch {
         let zero = MemMatch {
             match_len: 0,
             sa_start: 0,
@@ -3089,7 +3183,17 @@ impl LearnedIndex {
         // comparator masks it to `p.len() == l`, so reusing it is byte-identical to
         // re-tokenizing `query[..l]` (bases beyond `l` are masked off; for `l > 32`
         // the >32 tail reads the `p` slice). Drops a `tokenize_32mer` per length step.
-        let q_key = tokenize_32mer(query, query.len().min(KMER_LEN));
+        // Take the caller's precomputed key when supplied (the reseed passes the same
+        // rolling key it used for the forward search), else tokenize once here.
+        // Guard the caller-key contract in-function (see `mem_search_keyed`): the key is
+        // the actual masked compare key, so a wrong `Some(k)` silently breaks
+        // byte-identity in release.
+        debug_assert!(
+            query_key.is_none()
+                || query_key == Some(tokenize_32mer(query, query.len().min(KMER_LEN))),
+            "forward_truncate_below_maximal_keyed: query_key != fresh tokenize_32mer(query)"
+        );
+        let q_key = query_key.unwrap_or_else(|| tokenize_32mer(query, query.len().min(KMER_LEN)));
         // Neighbor-LCP scan (replaces the O(lmax-L*) per-length walk). occ(L) changes
         // only at the LCP of `query` with the SA suffixes just outside the interval;
         // extend the larger-LCP side until occ >= min_intv. L* = the LCP at which occ
