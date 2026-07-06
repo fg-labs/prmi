@@ -460,6 +460,40 @@ impl SaFileReader {
         (position, key)
     }
 
+    /// `true` if entries carry an inline 32-mer key (mode 2/3, `bytes_per_entry >= 13`).
+    #[inline(always)]
+    pub fn has_keys(&self) -> bool {
+        self.bytes_per_entry >= BPE_MODE2
+    }
+
+    /// Hot-loop combined `(position, key)` read for a keyed (mode-2/3) SA entry.
+    /// Skips [`Self::entry`]'s release-mode bounds `assert`, mode branch, and
+    /// `Option` wrap — the boundary-search probe loop guarantees `i < num_entries`
+    /// and checks `has_keys()` ONCE before iterating. Safe to call (the pointer
+    /// read is contained in this module's unsafe island); `debug_assert`s catch
+    /// contract violations in debug builds. `#[inline(always)]` so the caller's
+    /// tight loop pays no call overhead.
+    #[inline(always)]
+    pub fn entry_keyed(&self, i: u64) -> (u64, u64) {
+        debug_assert!(i < self.num_entries, "entry_keyed index out of range");
+        debug_assert!(
+            self.bytes_per_entry >= BPE_MODE2,
+            "entry_keyed on keyless SA"
+        );
+        let base = SA_FILE_HEADER_BYTES + (i as usize) * self.bytes_per_entry;
+        // SAFETY: caller guarantees `i < num_entries` and keyed mode, so
+        // `[base, base+13)` lies within the mmap validated at open (same invariant
+        // as `entry`/`position`, just without the redundant release assert).
+        unsafe {
+            let pos_bytes: &[u8; BPE_MODE1] = &*(self.data_ptr.add(base) as *const [u8; BPE_MODE1]);
+            let key_bytes: &[u8; 8] = &*(self.data_ptr.add(base + BPE_MODE1) as *const [u8; 8]);
+            (
+                unpack_position(pos_bytes),
+                LittleEndian::read_u64(key_bytes),
+            )
+        }
+    }
+
     /// Return the stored ISA (inverse suffix array) value at SA index `i`, if
     /// this file was built in mode 3. Returns `None` for modes 1 and 2.
     ///

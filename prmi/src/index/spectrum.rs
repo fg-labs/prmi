@@ -433,6 +433,54 @@ pub(crate) fn compare_query_vs_suffix_2x_keyed_with_mask(
     }
 }
 
+/// [`compare_query_vs_suffix_2x_keyed_with_mask`] for a caller that already read
+/// the inline `stored_key` (mode-2/3), so it takes `u64` not `Option<u64>` — the
+/// hot keyed boundary loop. Byte-identical: same sentinel guard, same first-32 key
+/// XOR, same tail; only the `Option` match is gone. `#[inline(always)]` so it folds
+/// into the boundary-search probe loop.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) fn compare_query_vs_suffix_2x_keyed_with_mask_k(
+    query: &[u8],
+    query_key: u64,
+    stored_key: u64,
+    sa_pos: u64,
+    pac: &[u8],
+    enc: PacEncoding,
+    l_pac: u64,
+    nbases: usize,
+    mask: u64,
+) -> (bool, u32) {
+    // Sentinel guard: the stored key is a true 32-mer only with >= 32 real doubled
+    // bases at `sa_pos`; otherwise fall to the safe vectorized pac compare.
+    if sa_pos + KMER_LEN as u64 > 2 * l_pac {
+        return compare_query_vs_suffix_2x(query, sa_pos, pac, enc, l_pac);
+    }
+    if nbases == 0 {
+        return (false, 0);
+    }
+    let xor = (query_key ^ stored_key) & mask;
+    if xor != 0 {
+        let idx = (xor.leading_zeros() / 2) as usize;
+        let shift = 2 * (KMER_LEN - 1 - idx) as u32;
+        let qb = (query_key >> shift) & 0x3;
+        let rb = (stored_key >> shift) & 0x3;
+        return (rb < qb, idx as u32);
+    }
+    if query.len() <= KMER_LEN {
+        (false, query.len() as u32)
+    } else {
+        let (ref_less, tail_lcp) = compare_query_vs_suffix_2x(
+            &query[KMER_LEN..],
+            sa_pos + KMER_LEN as u64,
+            pac,
+            enc,
+            l_pac,
+        );
+        (ref_less, KMER_LEN as u32 + tail_lcp)
+    }
+}
+
 /// Test/profiling-only SA-probe counter (a cold `sa_position_for` read per probe).
 ///
 /// Enabled by the `spectrum-probe-count` feature; OFF by default so the production
@@ -4309,107 +4357,30 @@ impl LearnedIndex {
         while lo < hi {
             self.prefetch_bsearch(lo, hi);
             let mid = lo + (hi - lo) / 2;
-            if go_right(mid) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+            // Branchless (`csel` via select_unpredictable): the direction test is a
+            // ~50/50 coin flip near the boundary, so a branch mispredicts ~half the
+            // probes; the conditional-select keeps the cold SA read the only stall.
+            let gr = go_right(mid);
+            let m1 = mid + 1;
+            lo = core::hint::select_unpredictable(gr, m1, lo);
+            hi = core::hint::select_unpredictable(gr, hi, mid);
         }
         lo
     }
 
-    /// Windowed twin of [`find_boundary`](Self::find_boundary) for the TRUSTED model
-    /// window: binary-search the model window `[win_lo, win_hi)` FIRST, skipping
-    /// `find_boundary`'s two gallop edge-check probes — bwa-meme's
-    /// `CURR_SEARCH_METHOD==1` windowed search.
+    /// Galloping boundary search over `[0, sa_num)` seeded at `[win_lo, win_hi)`, then
+    /// the two neighbor LCP probes (one `probe` per `find_boundary` step plus one at
+    /// each neighbor). The seed is chosen by the caller
+    /// ([`forward_maximal_len_seeded`](Self::forward_maximal_len_seeded)): a unit
+    /// `[center, center+1)` window for the cache-local point gallop on a narrow model
+    /// window, or the whole `[pred-err, pred+err+1)` for a wide one.
     ///
-    /// The model window `[pred-err, pred+err+1)` is a verified bound (the trainer's
-    /// verify pass), but `find_boundary` still gallops to stay correct for an
-    /// out-of-window boundary. `go_right` (`ref_less`) is MONOTONE over the SA, so if
-    /// the window bsearch converges to an `ip` STRICTLY inside `(lo0, hi0)` —
-    /// `go_right(ip-1)` true and `go_right(ip)` false, both probed by the bsearch —
-    /// then `ip` IS the global boundary over `[0, sa_num)`, and the neighbor LCPs are
-    /// exactly the bsearch's probes at `ip-1`/`ip`. Returns `(ip, lcp(ip-1), lcp(ip))`
-    /// byte-identical to `find_boundary` followed by the two `lcp_at` probes, with
-    /// ZERO edge probes — the common case for a real model window. Only when `ip`
-    /// lands AT a window edge (boundary possibly outside) does it fall back to the
-    /// robust gallop. Model window only; hinted/seeded callers keep the gallop (a hint
-    /// is not a window the boundary is guaranteed to live in).
-    ///
-    /// `probe(mid)` returns `(ref_less, lcp)` at SA index `mid` in one keyed compare
-    /// (and bumps the probe counter exactly once, as `ref_less`/`lcp_at` do), so the
-    /// fast path's reused neighbor LCPs are byte-identical to the separate
-    /// `lcp_at(ip-1)`/`lcp_at(ip)` of the gallop path.
-    #[inline]
-    fn forward_boundary_windowed(
-        &self,
-        sa_num: u64,
-        win_lo: u64,
-        win_hi: u64,
-        mut probe: impl FnMut(u64) -> (bool, u32),
-    ) -> (u64, u32, u32) {
-        // Widest model window that still takes the windowed fast path; wider windows
-        // (uncertain model / high-occ repeats) fall back to the gallop (see below).
-        const WINDOW_FAST_PATH_CAP: u64 = 64;
-        let lo0 = win_lo.min(sa_num);
-        let hi0 = win_hi.clamp(lo0, sa_num);
-        // The windowed fast path is a win ONLY when the boundary actually falls inside
-        // the window. Two cases go straight to the robust gallop instead:
-        //   * window too small (`<= 2`) — no interior index for a strictly-inside hit;
-        //   * window too WIDE (`> WINDOW_FAST_PATH_CAP`) — an uncertain model (large
-        //     `err`, e.g. a high-occ repeat) frequently puts the boundary OUTSIDE the
-        //     window, and a full window bsearch (~log2(width) probes) is pure waste vs
-        //     `find_boundary`'s 2-probe edge-check that detects the miss immediately.
-        // The cap bounds the worst-case wasted bsearch; tight (confident) windows — the
-        // common unique-seed case — keep the fast path. Byte-identical either way: the
-        // cap only chooses which path computes the (identical) boundary.
-        // `hi0 >= lo0` after the clamp above, so `hi0 - lo0` cannot wrap; computing the
-        // width once also avoids `lo0 + 2` overflowing when `lo0` is near `u64::MAX`.
-        let width = hi0 - lo0;
-        if width <= 2 || width > WINDOW_FAST_PATH_CAP {
-            return self.forward_boundary_windowed_fallback(sa_num, win_lo, win_hi, probe);
-        }
-        let mut best_true: Option<(u64, u32)> = None; // (largest true index, lcp)
-        let mut best_false: Option<(u64, u32)> = None; // (smallest false index, lcp)
-        let (mut lo, mut hi) = (lo0, hi0);
-        while lo < hi {
-            self.prefetch_bsearch(lo, hi);
-            let mid = lo + (hi - lo) / 2;
-            let (lt, lcp) = probe(mid);
-            if lt {
-                // In a bisection `lo = mid+1`, so each successive true probe has a
-                // strictly larger `mid`; the most-recent true is always the largest.
-                best_true = Some((mid, lcp));
-                lo = mid + 1;
-            } else {
-                // Symmetrically, `hi = mid` means each successive false probe has a
-                // strictly smaller `mid`; the most-recent false is always the smallest.
-                best_false = Some((mid, lcp));
-                hi = mid;
-            }
-        }
-        let ip = lo;
-        // Strictly inside => `ip` is the global boundary (monotonicity), and the
-        // bsearch already probed `ip-1` (last true) and `ip` (last false). Fast path,
-        // byte-identical, no edge probes.
-        if ip > lo0 && ip < hi0 {
-            if let (Some((ti, lcp_lo)), Some((fi, lcp_hi))) = (best_true, best_false) {
-                if ti == ip - 1 && fi == ip {
-                    return (ip, lcp_lo, lcp_hi);
-                }
-            }
-        }
-        // Boundary at/past a window edge (or a neighbor unprobed): the window did not
-        // bracket it. Fall back to the robust gallop search, correct for any seed.
-        // Rare for a real model window; keeps byte-identity exact.
-        self.forward_boundary_windowed_fallback(sa_num, win_lo, win_hi, probe)
-    }
-
-    /// Robust fallback for [`forward_boundary_windowed`](Self::forward_boundary_windowed):
-    /// the galloping `find_boundary` over `[0, sa_num)` seeded at the window, then the
-    /// two neighbor LCP probes — reproducing exactly the cold gallop path in
-    /// [`forward_maximal_len_seeded`](Self::forward_maximal_len_seeded), including its
-    /// probe count (one `probe` per `find_boundary` step plus one at each neighbor).
+    /// Byte-identical for ANY seed: [`find_boundary`](Self::find_boundary) is
+    /// seed-independent (it expands on a miss to the true global boundary over
+    /// `[0, sa_num)`), so the returned `(ip, lcp_lo, lcp_hi)` never depends on the seed
+    /// — only the probe locality/count does. `probe(mid)` returns `(ref_less, lcp)` at
+    /// SA index `mid` in one keyed compare (bumping the probe counter once), so the
+    /// reused neighbor LCPs match separate `lcp_at(ip-1)`/`lcp_at(ip)` probes.
     #[inline]
     fn forward_boundary_windowed_fallback(
         &self,
@@ -4550,55 +4521,75 @@ impl LearnedIndex {
         if q.is_empty() {
             return (0, 0);
         }
-        // `trusted` == the window IS the model's `[pred-err, pred+err+1)`, whose `err`
-        // is a verified bound (the trainer's verify pass), so the insertion point is
-        // guaranteed in-window and we can skip `find_boundary`'s gallop edge-checks. A
-        // caller-supplied `seed_win` (a hint) is NOT a guaranteed bound, so it keeps
-        // the robust gallop path.
-        let (win_lo, win_hi, trusted) = match seed_win {
-            Some((lo, hi)) => (lo.min(sa_num), hi.min(sa_num), false),
+        // Model window `[win_lo, win_hi)` and its point prediction `center`, from the
+        // model (`None`) or a caller hint (`Some`). Both seed the SAME seed-independent
+        // `find_boundary`, so the result is byte-identical for ANY seed; the width only
+        // selects the CHEAPER seed:
+        //   * NARROW window (confident, ~unique — the common case): seed at the POINT
+        //     `center`, so `find_boundary` gallops outward with probes clustered near it
+        //     (cache-local — bwa-meme's `mem_search_tradeoff` access pattern). Measured
+        //     ~1.4x faster than a window-seeded search on x86 at genome scale.
+        //   * WIDE window (uncertain, high-occ repeat): seed at the whole `[win_lo,
+        //     win_hi)`. It already brackets the wide boundary, so the gallop reaches it
+        //     in fewer doubling steps than an outward gallop from a single point (which
+        //     galloping past a wide interval over-probes). Measured faster than the
+        //     point seed on the high-occ stress case.
+        // The cut is the confident-window cap already used elsewhere for "the model
+        // brackets the boundary": tight seeds keep the fast point path, loose seeds fall
+        // to the window-bracketed gallop.
+        const EXP_SEARCH_MAX_WINDOW: u64 = 64;
+        let (win_lo, win_hi, center) = match seed_win {
+            Some((lo, hi)) => {
+                let (l, h) = (lo.min(sa_num), hi.min(sa_num));
+                (l, h, (l + h) / 2)
+            }
             None => {
                 let (pred, err) = self.lookup(q_key);
                 (
                     pred.saturating_sub(err),
                     pred.saturating_add(err).saturating_add(1).min(sa_num),
-                    true,
+                    pred.min(sa_num),
                 )
             }
         };
+        // Narrow => point seed `[center, center+1)`; wide => the whole window.
+        let (seed_lo, seed_hi) = if win_hi.saturating_sub(win_lo) <= EXP_SEARCH_MAX_WINDOW {
+            (center, (center + 1).min(sa_num))
+        } else {
+            (win_lo, win_hi)
+        };
+        // Launch prefetch (bwa-meme prefetches sa_pos right after the model lookup):
+        // pull the point prediction into cache now to overlap its cold fetch with the
+        // mask/closure setup below (it is the first probe on the common narrow path).
+        self.prefetch_sa(center);
         let mut ml: u32 = 0;
         let (q_nbases, q_mask) = keyed_compare_mask(q.len());
-        let ip = if trusted {
-            // Trusted model window: bsearch the window first, skip the gallop
-            // edge-checks, and reuse the bsearch's `ip-1`/`ip` probes as the neighbor
-            // LCPs (byte-identical; see `forward_boundary_windowed`).
-            let (ip, lcp_lo, lcp_hi) =
-                self.forward_boundary_windowed(sa_num, win_lo, win_hi, |mid| {
-                    bump_probe();
-                    let (pos, key) = self.sa_entry(mid);
-                    compare_query_vs_suffix_2x_keyed_with_mask(
-                        q, q_key, key, pos, pac, enc, l_pac, q_nbases, q_mask,
-                    )
-                });
-            if ip > 0 {
-                ml = ml.max(lcp_lo);
-            }
-            if ip < sa_num {
-                ml = ml.max(lcp_hi);
-            }
-            ip
+        // Monomorphized keyed-fast (mode-2/3, no `Option` / no mode branch) vs generic
+        // (mode-1) probe closure; both drive the same seeded boundary gallop. The keyed
+        // read pairs `sa_entry_keyed` with `compare_..._keyed_with_mask_k`.
+        let (ip, lcp_lo, lcp_hi) = if self.has_stored_keys() {
+            self.forward_boundary_windowed_fallback(sa_num, seed_lo, seed_hi, |mid| {
+                bump_probe();
+                let (pos, key) = self.sa_entry_keyed(mid);
+                compare_query_vs_suffix_2x_keyed_with_mask_k(
+                    q, q_key, key, pos, pac, enc, l_pac, q_nbases, q_mask,
+                )
+            })
         } else {
-            let ip = self.find_boundary(0, sa_num, win_lo, win_hi, |mid| {
-                self.ref_less(q, q_key, mid, pac, enc, l_pac, q_nbases, q_mask)
-            });
-            if ip > 0 {
-                ml = ml.max(self.lcp_at(q, q_key, ip - 1, pac, enc, l_pac, q_nbases, q_mask));
-            }
-            if ip < sa_num {
-                ml = ml.max(self.lcp_at(q, q_key, ip, pac, enc, l_pac, q_nbases, q_mask));
-            }
-            ip
+            self.forward_boundary_windowed_fallback(sa_num, seed_lo, seed_hi, |mid| {
+                bump_probe();
+                let (pos, key) = self.sa_entry(mid);
+                compare_query_vs_suffix_2x_keyed_with_mask(
+                    q, q_key, key, pos, pac, enc, l_pac, q_nbases, q_mask,
+                )
+            })
         };
+        if ip > 0 {
+            ml = ml.max(lcp_lo);
+        }
+        if ip < sa_num {
+            ml = ml.max(lcp_hi);
+        }
         (u64::from(ml), ip)
     }
 
@@ -5428,6 +5419,7 @@ mod keyed_tests {
             // Deterministically sweep EVERY SA index to guarantee the
             // near-sentinel positions (pos + 32 > 2*l_pac) are covered — these are
             // exactly the entries where the stored (T-padded) key must NOT be used.
+            let (q_nbases, q_mask) = keyed_compare_mask(query.len());
             for mid in 0..sa_num {
                 let pos = idx.sa_position_for(mid);
                 let key = idx.key_at(mid);
@@ -5440,6 +5432,19 @@ mod keyed_tests {
                     "keyed != scalar (full sweep): mid={} pos={} near_sentinel={}",
                     mid, pos, pos + KMER_LEN as u64 > 2 * l_pac
                 );
+                // The `Option`-free hot-loop variant (`_k`) must match too — it is the
+                // production keyed probe for a mode-2/3 sidecar (`entry_keyed`), where
+                // the key is always present.
+                if let Some(k) = key {
+                    let got_k = compare_query_vs_suffix_2x_keyed_with_mask_k(
+                        &query, query_key, k, pos, &fwd, e, l_pac, q_nbases, q_mask,
+                    );
+                    prop_assert_eq!(
+                        got_k, want,
+                        "keyed_k != scalar (full sweep): mid={} pos={} near_sentinel={}",
+                        mid, pos, pos + KMER_LEN as u64 > 2 * l_pac
+                    );
+                }
             }
         }
 
@@ -6770,20 +6775,20 @@ mod keyed_tests {
             }
         }
 
-        /// Direct byte-identity gate for the windowed model-locate
-        /// (`forward_boundary_windowed`) against its galloping fallback
-        /// (`find_boundary` over `[0, sa_num)` plus the two neighbor LCP probes):
-        /// for ANY window the two MUST return the same `(ip, lcp_lo, lcp_hi)`. The
-        /// hand-placed windows below deterministically drive BOTH internal branches
-        /// of the fast path — the strictly-inside return that reuses the bsearch's
-        /// `ip-1`/`ip` probes as the neighbor LCPs, and the fallback for a boundary
-        /// AT a window edge, a `width <= 2` window, and a `width >
-        /// WINDOW_FAST_PATH_CAP` window. The top-level twin closes CodeRabbit's
-        /// trusted-vs-hinted ask: `forward_maximal_len` (trusted `seed_win = None`,
-        /// windowed fast path) == `forward_maximal_len_seeded(Some(model_window))`
-        /// (the SAME model window passed as a hint, which takes the gallop).
+        /// Direct byte-identity gate for the seeded boundary gallop
+        /// (`forward_boundary_windowed_fallback`) against a full-SA galloping oracle:
+        /// for ANY seed window the two MUST return the same `(ip, lcp_lo, lcp_hi)`.
+        /// This is the seed-independence contract that makes the hybrid seed choice in
+        /// `forward_maximal_len_seeded` safe — a narrow model window seeds at a POINT
+        /// (`[center, center+1)`, cache-local) and a wide one seeds at the WHOLE window,
+        /// but neither changes the result, only the probe locality/count. The seeds
+        /// below deterministically cover point seeds inside the interval / at both
+        /// edges / at both SA ends, plus a WIDE window bracketing the boundary. The
+        /// top-level twin closes the trusted-vs-hinted ask: `forward_maximal_len`
+        /// (model launch, `seed_win = None`) == `forward_maximal_len_seeded(Some(
+        /// model_window))` (the SAME window passed as a hint).
         #[test]
-        fn forward_boundary_windowed_equals_gallop(
+        fn forward_boundary_seed_independent(
             fwd in prop::collection::vec(0u8..=3, 40..200),
             queries in prop::collection::vec(prop::collection::vec(0u8..=3, 1..50), 1..6),
         ) {
@@ -6811,31 +6816,29 @@ mod keyed_tests {
                 let oracle =
                     idx.forward_boundary_windowed_fallback(sa_num, 0, sa_num, make_probe());
                 let (ip, _, _) = oracle;
-                // Windows chosen to drive each internal branch of the fast path.
-                let windows: [(u64, u64); 5] = [
-                    // strictly-inside: a (>2, <=cap)-wide window bracketing `ip`.
-                    (ip.saturating_sub(3), (ip + 3).min(sa_num)),
-                    // boundary AT the lower edge -> fallback.
-                    (ip, (ip + 5).min(sa_num)),
-                    // boundary AT the upper edge -> fallback.
-                    (ip.saturating_sub(5), ip),
-                    // width <= 2 -> width-guard fallback.
-                    (ip.saturating_sub(1), (ip + 1).min(sa_num)),
-                    // width > WINDOW_FAST_PATH_CAP -> cap fallback.
-                    (0, sa_num),
+                // Seeds: narrow point seeds (inside, both edges, both ends) as
+                // `[c, c+1)`, plus a WIDE window bracketing the boundary — the two
+                // regimes the hybrid picks between.
+                let seeds: [(u64, u64); 6] = [
+                    (ip.saturating_sub(3), ip.saturating_sub(2)),
+                    (ip, (ip + 1).min(sa_num)),
+                    ((ip + 3).min(sa_num), (ip + 4).min(sa_num)),
+                    (0, 1.min(sa_num)),
+                    (sa_num, sa_num),
+                    (ip.saturating_sub(40), (ip + 40).min(sa_num)),
                 ];
-                for (win_lo, win_hi) in windows {
+                for (seed_lo, seed_hi) in seeds {
                     let got =
-                        idx.forward_boundary_windowed(sa_num, win_lo, win_hi, make_probe());
+                        idx.forward_boundary_windowed_fallback(sa_num, seed_lo, seed_hi, make_probe());
                     prop_assert_eq!(
                         got, oracle,
-                        "windowed != gallop: q={:?} win=({}, {}) ip={}",
-                        q, win_lo, win_hi, ip
+                        "seeded != gallop: q={:?} seed=({}, {}) ip={}",
+                        q, seed_lo, seed_hi, ip
                     );
                 }
-                // Top-level parity: the trusted model window (`None`, windowed fast
-                // path) and the SAME model window passed as a hint (`Some`, gallop)
-                // must produce byte-identical `(match_len, ip)`.
+                // Top-level parity: the model launch (`None`, `center = pred`) and the
+                // SAME model window passed as a hint (`Some`, `center = midpoint`) must
+                // produce byte-identical `(match_len, ip)`.
                 let (pred, err) = idx.lookup(q_key);
                 let model_win = (
                     pred.saturating_sub(err),
@@ -6847,7 +6850,7 @@ mod keyed_tests {
                 );
                 prop_assert_eq!(
                     trusted, hinted,
-                    "trusted(None) != hinted(Some(model_win)): q={:?} win={:?}",
+                    "model-launch(None) != hinted(Some(model_win)): q={:?} win={:?}",
                     q, model_win
                 );
             }

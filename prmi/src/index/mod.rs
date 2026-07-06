@@ -285,6 +285,21 @@ impl LearnedIndex {
         self.sa.entry(i)
     }
 
+    /// `true` if the sidecar stores inline 32-mer keys (mode 2/3) — the hot
+    /// boundary search checks this ONCE, then uses [`Self::sa_entry_keyed`].
+    #[inline(always)]
+    pub(crate) fn has_stored_keys(&self) -> bool {
+        self.sa.has_keys()
+    }
+
+    /// Hot-loop `(position, key)` read for a keyed sidecar — no bounds assert,
+    /// no mode branch, no `Option` (see [`SaFileReader::entry_keyed`]). Caller
+    /// must have verified `has_stored_keys()` and `i < sa_num()`.
+    #[inline(always)]
+    pub(crate) fn sa_entry_keyed(&self, i: u64) -> (u64, u64) {
+        self.sa.entry_keyed(i)
+    }
+
     /// Software-prefetch SA entry `i` (position + key, one cache line) into L1.
     /// Advisory hint used by the boundary-search probe loops to overlap the next
     /// cold read with the current compare; never affects results. Out-of-range

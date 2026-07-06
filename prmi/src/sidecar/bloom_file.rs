@@ -245,7 +245,7 @@ pub fn write_bloom_file(
     // then reject). Fail closed here rather than emit an unloadable `.blm`. These
     // are writer-contract invariants on internally generated params, hence
     // `Error::Internal`; they mirror the reader's `validate_blm_header` checks.
-    if params.num_bits == 0 || params.num_bits % 64 != 0 {
+    if params.num_bits == 0 || !params.num_bits.is_multiple_of(64) {
         return Err(Error::Internal {
             detail: format!(
                 "bloom num_bits={} must be a positive multiple of 64",
@@ -670,7 +670,7 @@ mod tests {
             (9.0..11.0).contains(&bits_per_key),
             "1% bits/key = {bits_per_key}"
         );
-        assert!(p1.num_bits % 64 == 0);
+        assert!(p1.num_bits.is_multiple_of(64));
         // A tighter fp needs a bigger filter and more hashes.
         let p2 = BloomParams::for_keys(1_000_000, 0.001);
         assert!(p2.num_bits > p1.num_bits);
