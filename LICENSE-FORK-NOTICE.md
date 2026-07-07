@@ -29,8 +29,9 @@ Every source file carries one of three headers:
    ```
 
 The `LICENSE` and `COPYING` files at the repo root carry Marcus's MIT
-license text unchanged; MIT terms apply to the whole repo including all
-new files.
+license text; a `Copyright (c) 2026 Fulcrum Genomics LLC` line is added
+alongside Marcus's original notice to reflect Fulcrum's authorship of the
+new work. MIT terms apply to the whole repo including all new files.
 
 ## Acknowledgments
 
